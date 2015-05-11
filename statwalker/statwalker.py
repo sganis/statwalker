@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# File: statwalker.py
+# File: stat_walker.py
 # Author: Santiago Ganis
 #
 # Description:
@@ -10,10 +10,6 @@
 # It has several optimization features:
 # - Uses the os.lstat module, which is super fast.
 # - Symbolic links are not followed.
-# - Hard links are recorded, the device/inode/link count are also written
-#   to handle duplications in reports.
-# - Username resolution requires an extra call, but it's only done once
-#   per user, then it's cached 
 # - Run in parallel with the max number of processes in the machine (cores)
 #   it can be overriten with -n [processes]
 #
@@ -41,8 +37,7 @@
 #			 (default: None)
 #   --sort	sort results (default: False )
 #
-#
-# Version: 1.0.0
+# Version: 21.0
 #
 # Date: 07/26/2013
 #
@@ -51,10 +46,7 @@
 # - 07/28/2013, added caching
 # - 07/29/2013, added balanced task assignment
 # - 07/30/2013, added colors
-# - 08/02/2013, added plotting
 # - 08/10/2013, added skip option
-# - 04/05/2014, simplified, added resolved option
-# - 04/08/2014, added stat and ls option to run with sudo
  
 import os
 import sys
@@ -62,8 +54,13 @@ import time
 import datetime
 import stat
 import random
-import multiprocessing as mp
+from multiprocessing import Pool, freeze_support
 import subprocess
+
+is_windows = os.name == 'nt'
+
+if is_windows:
+	import getsid
 
 HEADER = "INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH"
 PATH=""
@@ -71,31 +68,46 @@ OUTPUT=""
 COLOR=True
 
 
+def listdir(path):
+	l = []
+	try:
+		l = os.listdir(path)
+	except Exception as ex:
+		print 'Cannot list dir %s: %s' % (path, ex)
+	return l
+
+
 def get_stats(path):
 	"""cvs line, see HEADER
 	returns tuple (is_dir, line, disk)
 	HEADER = "INODE,ATIME,MTIME,UID,GID,SIZE,DISK,PATH"
 	"""
-	f=()
+	f = ()
+	blocks = 0
+	uid = 0
 	try:
 		f = os.lstat(path)
 		# python stat struct:
 		# st_mode,st_ino,st_dev,st_nlink,st_uid,st_gid,st_size,st_atime,st_mtime,st_ctime
 		# return DEV,INODE,ATIME,MTIME,UID,GID,MODE,SIZE,BLOKKS
-		f = (f[2],f[1],f[7],f[8],f[4],f[5],f[0],f[6],f.st_blocks) 		
-	except:
-		print "Cannot get stats:", path
-	
+		if is_windows:
+			uid = getsid.get_sid(path)
+		else:
+			uid = f.st_uid
+			blocks = f.st_blocks
+	except Exception as ex:
+		print 'Cannot get stats %s: %s' % (path, ex)
+
 	if not f:
 		return False,"",0
 	line = ""
-	mode = f[6]
-	disk = f[8]*512
+	mode = f[0]
+	disk = blocks*512
 	# INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH"
 	line = "%s-%s,%s,%s,%s,%s,%s,%s,%s,%s" % (
-		f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],disk,'"' + path +'"')
-
+			f[2],f[1],f[7],f[8],uid,f[5],f[0],f[6],disk,'"' + path +'"')
 	return stat.S_ISDIR(mode), line, disk
+ 
  
 SKIP=[]
 def skipit(path):
@@ -121,12 +133,8 @@ def walk(path, output):
 		total_count=1
 	if not is_dir:
 		return total_count, size	
-	try:
-		dirs = os.listdir(path)	
-	except Exception as ex:
-		print 'Cannot list directory %s, %s' % (path,ex)
-		return total_count, size	
-	files = [os.path.join(path,f) for f in dirs]
+	dirs = listdir(path)		
+	files = [r'%s' % os.path.join(path,f) for f in dirs]
 	for path in files:
 		if skipit(path): continue
 		count, size = walk(path, output)
@@ -156,12 +164,13 @@ def worker(chunk):
 	start = time.time()
 	count_size = []
 	pid = os.getpid()
-	w = open(OUTPUT + '.' + str(pid),'w')
-	for f in chunk:
-		count, size = walk(f, w)
-		count_size.append([f, count, size])
-	w.close()
-	
+	if not 'TEMP' in os.environ:
+		return pid,0,0,0
+	temp = '%s.%s' % (os.environ['TEMP'], pid)
+	with open(temp,'w') as w:
+		for f in chunk:
+			count, size = walk(f, w)
+			count_size.append([f, count, size])	
 	seconds = time.time()-start
 	return (pid, seconds, chunk, count_size)
  
@@ -213,12 +222,8 @@ def report_parallel(procs, total_time):
 def get_directories(path, level=1):
 	dirs = []
 	rest=[]
-	try:
-		dirs = os.listdir(path)
-	except Exception as ex:
-		print 'Cannot list directory %s: %s' % (path, ex)
-		return dirs, rest
-	fulldirs = [os.path.join(path,f) for f in dirs]
+	dirs = listdir(path)
+	fulldirs = [r'%s' % os.path.join(path,f) for f in dirs]
 	files=[]
 	for f in fulldirs:
 		if skipit(f): continue   
@@ -259,25 +264,24 @@ def blue(string):
 	if not COLOR: return string
 	return '\x1b[34;1m%s\x1b[0m' % string
 			
-def stat_root(root, output):
-	dirs = {}
-	for r in root.split(','):
-		path = "/"
-		for p in r.split('/'):
-			if not p: continue
-			if p not in dirs:
-				dirs[p]=p
-				path += p
-				is_dir, line, bytes = get_stats(path)
-				output.write(line+'\n')
-			path += '/'
-
+# def stat_root(root, output):
+# 	dirs = {}
+# 	for r in root:
+# 		path = "/"	
+# 		for p in r.split('/'):
+# 			if not p: continue
+# 			path += p
+# 			if path not in dirs:
+# 				dirs[path]=path
+# 				is_dir, line, bytes = get_stats(path)
+# 				output.write(line+'\n')
+# 			path += '/'
 
 def get_param():
 	"""handle command line parameters, test using -h parameter...
 	"""
 	import argparse
-	parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+	parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 	parser.add_argument('PATH', help='path to walk and get stats')
 	parser.add_argument('-b', '--balance', default=3, help='balance workload in task assignment')
    	parser.add_argument('-c', '--color', action='store_false', default=True, help='cancel colors')
@@ -295,19 +299,28 @@ def get_param():
 	SORT = args.sort
 	return (PATH,BALANCE,COLOR,NP,OUTPUT,SKIP,SORT)
  
-
+ 
 def main():
 	# parse parameters
+	global COLOR,SKIP
 	PATH,BALANCE,COLOR,NP,OUTPUT,SKIP,SORT = get_param()			
-	PATH = os.path.abspath(PATH)
+	PATH = [os.path.abspath(p) for p in PATH.split(',')]
 	if not OUTPUT:
-		OUTPUT = os.path.realpath(PATH).replace('/','-')[1:] + '.csv'
+		if is_windows:
+			OUTPUT = os.path.realpath(PATH[0]).replace('\\','-').replace(':','')[2:] + '.csv'
+		else:
+			OUTPUT = os.path.realpath(PATH[0]).replace('/','-')[1:] + '.csv'
 	OUTPUT = os.path.realpath(OUTPUT)
+	if is_windows:
+		assert 'TEMP' in os.environ
+	else:
+		os.environ['TEMP'] = OUTPUT
+
 	BALANCE = int(BALANCE)
 	if NP != 'MAX': NP = int(NP)	   
 	if SKIP: SKIP=SKIP.split(',')
 	assert BALANCE in range(1,10)
-			   
+	
 	# don't overwrite files  
 	# if os.path.isdir(OUTPUT):
 	# 	print 'OUTPUT is a folder: %s' % OUTPUT
@@ -321,9 +334,10 @@ def main():
 	#	 		sys.exit()
 	
 	# start  
-	print blue("/*************** statwalker.py *************************************/")
+	print blue("/*************** stat_walker.py *************************************/")
 	print "Command: %s" % " ".join(sys.argv[:])
-	print "Input: %s" % PATH
+	for p in PATH:
+		print "Input:  %s" % p
 	print "Output: %s" % OUTPUT
 	print "Balance: %s" % BALANCE
 	if SORT: 	print "Sort: %s" % SORT
@@ -336,9 +350,9 @@ def main():
 	lines = []
 
 	if NP=='MAX':	
-		pool = mp.Pool()
+		pool = Pool()
 	else:			  
-		pool = mp.Pool(int(NP))
+		pool = Pool(int(NP))
 	N = len(pool._pool)
 	print "Running with %s processes..." % N
  
@@ -348,7 +362,7 @@ def main():
 	#dirs = [os.path.join(PATH,f) for f in os.listdir(PATH)]
 	dirs = []
 	rest = []
-	for p in PATH.split(','):
+	for p in PATH:
 		d, r = get_directories(p, BALANCE)
 		dirs.extend(d)
 		rest.extend(r)
@@ -366,8 +380,7 @@ def main():
  
 	# run workers in parallel, wait until all workers finish
 	start = time.time()
-	# procs = pool.map(worker, chunks)
-	procs = pool.map_async(worker, chunks).get(timeout=999999)
+	procs = pool.map_async(worker, chunks).get(999999)
 	seconds_parallel = time.time()-start
 			   
 	# serial postprocessing
@@ -379,7 +392,7 @@ def main():
 	w.write(header + '\n')
 			   
 	# stat root, we need this for effective permissions post-processing tool
-	stat_root(PATH, w)
+	# stat_root(PATH, w)
  
 	# stat dir, and merge result from workers
 	post_total = 0
@@ -387,7 +400,8 @@ def main():
 		w.write(line+'\n')
 		post_total+=1
 	for p in procs:
-		fname = OUTPUT +'.'+str(p[0])
+		fname = '%s.%s' % (os.environ['TEMP'], p[0])
+		# fname = OUTPUT +'.'+str(p[0])
 		if not os.path.exists(fname): continue
 		infile = open(fname)
 		for line in infile:
@@ -422,8 +436,8 @@ def main():
 		import stat_sort
 		stat_sort.sort(OUTPUT, has_header=True, inplace=True)
 	print "Done.\n"
-
 	
- 
+
 if __name__ == '__main__':
+	freeze_support()
 	main()
