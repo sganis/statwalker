@@ -79,5 +79,6 @@ Clone the github repository:
 TODO
 ====
 
-Add documentation with analysis tools, resolution, agregation, benchmark with c++ and mpi versions.
+* Add documentation with analysis tools, resolution, agregation, benchmark with c++ and mpi versions.
+* Add notes for windows users
 
