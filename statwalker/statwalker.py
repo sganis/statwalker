@@ -137,16 +137,10 @@ def walk(path, output):
 	total_size=0
 	is_dir, line, size = get_stats(path)
 	if line:
-		if not isinstance(line, str):
-			print('path is not string, converting {}...'.format(type(line)))
-			line = line.decode('utf8', errors='surrogatepass')
 		try:
 			output.write('{}\n'.format(line))
 		except Exception as ex:
-			print(ex)
-			print(type(line))
-			print(line.encode('utf8', errors='surrogatepass'))
-			assert False
+			print('Cannot write file: {}. {}'.format(repr(path), ex))
 		total_count=1
 	if not is_dir:
 		return total_count, size	
