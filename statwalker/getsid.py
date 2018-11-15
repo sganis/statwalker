@@ -72,7 +72,7 @@ def get_sid(filename):
     ssid = ctypes.create_string_buffer(SIZE)
     pssid = ctypes.c_char_p(ctypes.addressof(ssid))
     if _ConvertSidToStringSid(sid, ctypes.byref(pssid)):
-        return pssid.value
+        return pssid.value.decode('utf-8')
     return None
 
 

@@ -73,7 +73,7 @@ def listdir(path):
 	try:
 		l = os.listdir(path)
 	except Exception as ex:
-		print 'Cannot list dir %s: %s' % (path, ex)
+		print('Cannot list dir {}: {}'.format(path, ex))
 	return l
 
 
@@ -96,17 +96,25 @@ def get_stats(path):
 			uid = f.st_uid
 			blocks = f.st_blocks
 	except Exception as ex:
-		print 'Cannot get stats %s: %s' % (path, ex)
+		print('Cannot get stats {}: {}'.format(path, ex))
 
 	if not f:
-		return False,"",0
-	line = ""
+		return False,'',0
+	# path = path.encode('utf-8', errors='surrogatepass')
 	mode = f[0]
 	disk = blocks*512
+	size = f[6]
 	# INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH"
-	line = "%s-%s,%s,%s,%s,%s,%s,%s,%s,%s" % (
+	line = '%s-%s,%s,%s,%s,%s,%s,%s,%s,%s' % (
 			f[2],f[1],f[7],f[8],uid,f[5],f[0],f[6],disk,'"' + path +'"')
-	return stat.S_ISDIR(mode), line, disk
+	# try:
+	# 	print(line)
+	# except Exception as ex:
+	# 	for i,e in enumerate(f):
+	# 		print(i, e)
+	# 	print(f)
+	# 	print(path.encode('utf-8', errors='surrogatepass'))
+	return stat.S_ISDIR(mode), line, size
  
  
 SKIP=[]
@@ -129,7 +137,16 @@ def walk(path, output):
 	total_size=0
 	is_dir, line, size = get_stats(path)
 	if line:
-		output.write(line + '\n')
+		if not isinstance(line, str):
+			print('path is not string, converting {}...'.format(type(line)))
+			line = line.decode('utf8', errors='surrogatepass')
+		try:
+			output.write('{}\n'.format(line))
+		except Exception as ex:
+			print(ex)
+			print(type(line))
+			print(line.encode('utf8', errors='surrogatepass'))
+			assert False
 		total_count=1
 	if not is_dir:
 		return total_count, size	
@@ -166,8 +183,8 @@ def worker(chunk):
 	pid = os.getpid()
 	if not 'TEMP' in os.environ:
 		return pid,0,0,0
-	temp = '%s.%s' % (os.environ['TEMP'], pid)
-	with open(temp,'w') as w:
+	temp = '{}.{}'.format(os.environ['TEMP'], pid)
+	with open(temp,'w', encoding="utf8") as w:
 		for f in chunk:
 			count, size = walk(f, w)
 			count_size.append([f, count, size])	
@@ -187,9 +204,6 @@ def report_parallel(procs, total_time):
 		percent = p[1]/float(total_time)
 		percents.append(percent)
 		bar = ('=' * int(percent * 10)).ljust(10)
-		if percent<0.75:	bar=green(bar)
-		elif percent <0.9:			  bar=yellow(bar)
-		else:	  bar=red(bar)
 		perc = "%.2f" % round(percent*100,2)
 		files_chunk=0
 		for c in p[3]:
@@ -201,22 +215,22 @@ def report_parallel(procs, total_time):
 			if c[2] > max_bytes:
 				max_bytes = c[2]
 				folder_max_bytes = c[0]
-		print "PID: %s\t\t%s sec" % (p[0], round(p[1],1)),
-		print "[%s] %s%% [%s files]" % (bar,perc.rjust(5),files_chunk)
+		print("PID: %s\t\t%s sec [%s] %s%% [%s files]" % (p[0], round(p[1],1), bar,perc.rjust(5),files_chunk))
+
 		#pprint.pprint(p[2])
 	times = [p[1] for p in procs]
 	files = [p[3] for p in procs]
 	avg = sum(times)/float(len(times))
 	diff = max(percents)-min(percents)
-	print "Total files by workers: %s" % (total_files)
-	print "Folder with max files: \t%s [%s files]" % (folder_max_count, max_files)
-	print "Folder with max size: \t%s [%s]" % (folder_max_bytes, bytes_human(max_bytes))
-	print "Avg time by workers: \t%s sec" % round(avg,2)
-	print "Difference (Max-Min): \t%s%%" % round(diff*100,2)
+	print("Total files by workers: %s" % (total_files))
+	print("Folder with max files: \t%s [%s files]" % (folder_max_count, max_files))
+	print("Folder with max size: \t%s [%s]" % (folder_max_bytes, bytes_human(max_bytes)))
+	print("Avg time by workers: \t%s sec" % round(avg,2))
+	print("Difference (Max-Min): \t%s%%" % round(diff*100,2))
 	if diff > 0.3:
-		print "Task division unbalanced. Use the -b parameter to fix it."
+		print("Task division unbalanced. Use the -b parameter to fix it.")
 	else:
-		print "Work balance Ok."
+		print("Work balance Ok.")
 	return total_files
  
 def get_directories(path, level=1):
@@ -247,23 +261,7 @@ def bytes_human(num):
 			return "%3.1f%s" % (num, x)
 		num /= 1024.0
 	return "%3.1f%s" % (num, 'TB')
- 
-def red(string):
-	if not COLOR: return string
-	return '\x1b[31;1m%s\x1b[0m' % string
- 
-def green(string):
-	if not COLOR: return string
-	return '\x1b[32;1m%s\x1b[0m' % string
- 
-def yellow(string):
-	if not COLOR: return string
-	return '\x1b[33;1m%s\x1b[0m' % string
- 
-def blue(string):
-	if not COLOR: return string
-	return '\x1b[34;1m%s\x1b[0m' % string
-			
+		
 # def stat_root(root, output):
 # 	dirs = {}
 # 	for r in root:
@@ -284,7 +282,7 @@ def get_param():
 	parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 	parser.add_argument('PATH', help='path to walk and get stats')
 	parser.add_argument('-b', '--balance', default=3, help='balance workload in task assignment')
-   	parser.add_argument('-c', '--color', action='store_false', default=True, help='cancel colors')
+	parser.add_argument('-c', '--color', action='store_false', default=True, help='cancel colors')
 	parser.add_argument('-n', '--processes', default='MAX', help='number of processes to run in parallel')
 	parser.add_argument('-o', '--output', help='csv file to write stats')
 	parser.add_argument('--skip', default=None, help='skip file name pattern list, separated by comma')
@@ -334,14 +332,14 @@ def main():
 	#	 		sys.exit()
 	
 	# start  
-	print blue("/*************** stat_walker.py *************************************/")
-	print "Command: %s" % " ".join(sys.argv[:])
+	print("/*************** stat_walker.py *************************************/")
+	print("Command: %s" % " ".join(sys.argv[:]))
 	for p in PATH:
-		print "Input:  %s" % p
-	print "Output: %s" % OUTPUT
-	print "Balance: %s" % BALANCE
-	if SORT: 	print "Sort: %s" % SORT
-	if SKIP:	print "Skip: %s" % SKIP
+		print("Input:  %s" % p)
+	print("Output: %s" % OUTPUT)
+	print("Balance: %s" % BALANCE)
+	if SORT: 	print("Sort: %s" % SORT)
+	if SKIP:	print("Skip: %s" % SKIP)
 	
 	start = 0
 	end = 0
@@ -354,7 +352,7 @@ def main():
 	else:			  
 		pool = Pool(int(NP))
 	N = len(pool._pool)
-	print "Running with %s processes..." % N
+	print("Running with %s processes..." % N)
  
 	# serial preprocessing
 	start = time.time()
@@ -386,7 +384,7 @@ def main():
 	# serial postprocessing
 	start = time.time()			  
 	# write output
-	w = open(OUTPUT, 'w')
+	w = open(OUTPUT, 'w', encoding="utf8")
 	# csv header
 	header = HEADER
 	w.write(header + '\n')
@@ -415,27 +413,27 @@ def main():
 	seconds_post = end-start
 	total_seconds = seconds_pre + seconds_parallel + seconds_post
 
-	print "Pre-process:  \t\t%s sec" % (round(seconds_pre,2))
+	print("Pre-process:  \t\t%s sec" % (round(seconds_pre,2)))
 	worker_total  = report_parallel(procs, seconds_parallel)
-	print "Post-process: \t\t%s sec [%s files]" % (round(seconds_post,2), post_total)
+	print("Post-process: \t\t%s sec [%s files]" % (round(seconds_post,2), post_total))
 	total += post_total
 	# change permission in output
-	os.chmod(OUTPUT,0666)
+	os.chmod(OUTPUT,0o666)
 
 	# finish, show some summary
-	report = "Total files: \t\t%s\n" % (green(total))
-	report += "Total time spent: \t%s sec " % green(round(total_seconds,2))
+	report = "Total files: \t\t%s\n" % (total)
+	report += "Total time spent: \t%s sec " % round(total_seconds,2)
 	report += "[%s]\n" % datetime.timedelta(seconds=total_seconds)
-	report += "Rate: \t\t\t%s files/sec\n" % green(int(total/total_seconds))
-	report += "Output: %s [%s]\n" % (OUTPUT, green(bytes_human(os.lstat(OUTPUT).st_size)))
-	report += blue("/*******************************************************************/")
-	print report
+	report += "Rate: \t\t\t%s files/sec\n" % int(total/total_seconds)
+	report += "Output: %s [%s]\n" % (OUTPUT, bytes_human(os.lstat(OUTPUT).st_size))
+	report += "/*******************************************************************/"
+	print(report)
 
 	# sort results to compare easily
 	if SORT:
 		import stat_sort
 		stat_sort.sort(OUTPUT, has_header=True, inplace=True)
-	print "Done.\n"
+	print("Done.\n")
 	
 
 if __name__ == '__main__':
