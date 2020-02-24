@@ -63,7 +63,7 @@ def get_sid(filename):
     if not _GetFileSecurity(filename, _OWNER_SECURITY_INFORMATION, sd, length, ctypes.byref(length)):
         return None
     if not sd:
-        print('Error: %s security descriptor is null, does not fit in %s bytes' % (filename, length.value))
+        print('Error: {} security descriptor is null, does not fit in {} bytes'.format(filename, length.value))
         return None
     sid = _PSID()
     sid_defaulted = wintypes.BOOL()
