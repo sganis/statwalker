@@ -109,13 +109,12 @@ def get_permissions(mode):
     """get permissions from file mode
     """
     # return str(int(oct(stat.S_IMODE(mode)))).zfill(3) # mode & 07777
-    return int(oct(stat.S_IMODE(mode)))
+    return oct(stat.S_IMODE(mode))[-3:]
 
 
 def run(input, output):
     init = time.time()
-    print
-    "Resolving file %s" % input
+    print("Resolving file {}".format(input))
     inodes = {}
     with open(input) as f, open(output, 'w') as w:
         reader = csv.reader(f)
@@ -136,11 +135,9 @@ def run(input, output):
                 path = r[8]
                 w.write("%s,%s,%s,%s,%s,%s,%s,%s,%s,\"%s\"\n" % (
                     inode, accessed, modified, user, group, filetype, permissions, size, disk, path))
-            except Exception, ex:
-                print
-                ex
-    print
-    "Total resolve time: %s sec." % (time.time() - init)
+            except Exception as ex:
+                raise ex
+    print("Total resolve time: {} sec.".format(time.time() - init))
 
 
 if __name__ == '__main__':
