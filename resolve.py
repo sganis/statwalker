@@ -133,7 +133,7 @@ def run(input, output):
                 size = int(r[6]) / 1073741824.0  # GB
                 disk = int(r[7]) / 1073741824.0  # GB
                 path = r[8]
-                w.write("%s,%s,%s,%s,%s,%s,%s,%s,%s,\"%s\"\n" % (
+                w.write("{},{},{},{},{},{},{},{},{},\"{}\"\n".format(
                     inode, accessed, modified, user, group, filetype, permissions, size, disk, path))
             except Exception as ex:
                 raise ex
