@@ -395,7 +395,7 @@ def main():
 		fname = '%s.%s' % (os.environ['TEMP'], p[0])
 		# fname = OUTPUT +'.'+str(p[0])
 		if not os.path.exists(fname): continue
-		infile = open(fname)
+		infile = open(fname, encoding='utf-8')
 		for line in infile:
 			w.write(line)
 			total+=1
