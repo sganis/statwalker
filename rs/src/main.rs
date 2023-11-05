@@ -5,20 +5,23 @@ use chrono::DateTime;
 use std::env;
 use std::fs;
 use std::io::{BufWriter, Read, Write};
-use std::path::Path;
-//use std::process::Command;
-use std::thread;
-use std::time::Instant;
-//use std::time::SystemTime;
-//use std::time::UNIX_EPOCH;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Instant;
 use walkdir::WalkDir;
 
 //fn work(index: i32, chunk: &[String]) -> Result<()> {
-fn work(index: i32, chunk: Vec<String>) -> Result<()> {
-    let f = fs::File::create(format!("file-{index}.csv")).expect("Unable to open file");
-    let mut writer = BufWriter::new(f);
+fn work<T: Write>(
+    index: i32,
+    chunk: Vec<String>,
+    global_writer: Arc<Mutex<BufWriter<T>>>,
+) -> Result<()> {
+    let local_path = format!("file-{index}.csv");
+    let f = fs::File::create(&local_path).expect("Unable to open file");
+    let mut local_writer = BufWriter::new(f);
 
     for path in chunk.iter() {
         let metadata = fs::symlink_metadata(path)?;
@@ -33,7 +36,7 @@ fn work(index: i32, chunk: Vec<String>) -> Result<()> {
         let mode = 0;
         //let filetype = if metadata.is_dir() { "DIR" } else { "REG" };
         writeln!(
-            writer,
+            local_writer,
             "{},{},{},{},\"{}\"",
             accessed.format("%Y-%m-%d"),
             modified.format("%Y-%m-%d"),
@@ -45,35 +48,63 @@ fn work(index: i32, chunk: Vec<String>) -> Result<()> {
             path
         )?;
     }
+    let _ = local_writer.flush();
+
+    // append local file to global file
+    let mut input = fs::File::open(&local_path)?;
+    let mut s = String::new();
+    input.read_to_string(&mut s)?;
+    write!(global_writer.lock().unwrap(), "{}", s)?;
+    fs::remove_file(&local_path).expect("could not remove file");
+
     Ok(())
 }
 
 fn main() -> Result<()> {
     let now = Instant::now();
     let args: Vec<String> = env::args().collect();
-    let folder = &args[1];
+    let fullpath = fs::canonicalize(&args[1])?
+        .into_os_string()
+        .into_string()
+        .unwrap();
 
-    // println!("folder: {folder}");
-    // let metadata = fs::metadata(folder).unwrap();
-    // println!("{:?}", metadata.file_type());
+    #[cfg(unix)]
+    let name = fullpath[1..].replace("/", "-");
+    #[cfg(windows)]
+    let name = fullpath[3..].replace('\\', "-");
 
-    //let mut count = 0;
+    let path = format!("{name}.csv");
+    let final_path = Path::new(&path);
+
+    if final_path.exists() {
+        fs::remove_file(final_path)?;
+    }
+
+    let file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .append(true)
+        .open(final_path)?;
+    let writer = Arc::new(Mutex::new(BufWriter::new(file)));
+    let header = "ACCESSED,MODIFIED,MODE,SIZE,PATH\n";
+    write!(writer.lock().unwrap(), "{header}").expect("cannot create final file");
+
     let mut files = Vec::<String>::new();
-
-    for entry in WalkDir::new(folder).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(&fullpath).into_iter().filter_map(|e| e.ok()) {
         let path = String::from(entry.path().to_string_lossy());
         files.push(path);
     }
     let total_files = files.len();
     let nprocs = num_cpus::get();
-    let n = (total_files + nprocs - 1) / nprocs;
+    let chunk_size = (total_files + nprocs - 1) / nprocs;
+
     //let chunks: Vec<&[String]> = files.chunks(n).collect();
-    let chunks: Vec<Vec<String>> = files.chunks(n).map(|s| s.into()).collect();
+    let chunks: Vec<Vec<String>> = files.chunks(chunk_size).map(|s| s.into()).collect();
     println!(
         "files: {}, nprocs: {}, chunk size: {}, rest: {}",
         total_files,
         nprocs,
-        n,
+        chunk_size,
         chunks[chunks.len() - 1].len()
     );
 
@@ -83,37 +114,24 @@ fn main() -> Result<()> {
     // }
 
     let mut handles = Vec::new();
+
     for (index, chunk) in chunks.into_iter().enumerate() {
-        let handle = thread::spawn(move || work(index as i32, chunk));
+        let writer = Arc::clone(&writer);
+        let handle = thread::spawn(move || work(index as i32, chunk, writer));
         handles.push(handle);
     }
     for handle in handles {
         let _ = handle.join().expect("Could not join thread");
     }
 
-    // collect files
-    let final_path = Path::new("file.csv");
-    let header = "ACCESSED,MODIFIED,MODE,SIZE,PATH\n";
-    if final_path.exists() {
-        fs::remove_file(final_path)?;
-    }
-    let file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .append(true)
-        .open(final_path)?;
-    let mut buf = BufWriter::new(file);
-    write!(buf, "{header}").expect("cannot create final file");
-
-    //fs::write(final_path, header).expect("Unable to write final file");
-    for index in 0..nprocs {
-        let path = format!("file-{index}.csv");
-        let mut input = fs::File::open(&path)?;
-        let mut s = String::new();
-        input.read_to_string(&mut s)?;
-        write!(buf, "{}", s)?;
-        fs::remove_file(&path).expect("could not remove file");
-    }
+    // for index in 0..nprocs {
+    //     let path = format!("file-{index}.csv");
+    //     let mut input = fs::File::open(&path)?;
+    //     let mut s = String::new();
+    //     input.read_to_string(&mut s)?;
+    //     write!(writer.lock().unwrap(), "{}", s)?;
+    //     fs::remove_file(&path).expect("could not remove file");
+    // }
 
     let elapsed = now.elapsed();
     println!("Elapsed: {:.2?}", elapsed);
