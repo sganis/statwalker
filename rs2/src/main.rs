@@ -207,10 +207,10 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize) -> u64 {
         }
         entry_count += 1;
 
-        let is_dir = dent
+       let is_dir = dent
             .file_type()
             .map(|t| t.is_dir())
-            .unwrap_or_else(|_| fs::symlink_metadata(dent.path()).map(|m| m.is_dir()).unwrap_or(false));
+            .unwrap_or_else(|_| dent.path().is_dir());
 
         if is_dir {
             inflight.fetch_add(1, SeqCst);
@@ -243,15 +243,15 @@ struct Row<'a> {
     dev: u64,
     ino: u64,
     mode: u32,
-    nlink: u64,
+    //nlink: u64,
     uid: u32,
     gid: u32,
     size: u64,
-    blksize: u64,
+    //blksize: u64,
     blocks: u64,
     atime: i64,
     mtime: i64,
-    ctime: i64,
+    //ctime: i64,
 }
 
 fn stat_row(path: &Path) -> Option<Row<'_>> {
@@ -263,15 +263,15 @@ fn stat_row(path: &Path) -> Option<Row<'_>> {
             dev: md.dev(),
             ino: md.ino(),
             mode: md.mode(),
-            nlink: md.nlink() as u64,
+            //nlink: md.nlink() as u64,
             uid: md.uid(),
             gid: md.gid(),
             size: md.size(),
-            blksize: md.blksize() as u64,
+            //blksize: md.blksize() as u64,
             blocks: md.blocks() as u64,
             atime: md.atime(),
             mtime: md.mtime(),
-            ctime: md.ctime(),
+            //ctime: md.ctime(),
         })
     }
     #[cfg(not(unix))]
@@ -281,15 +281,15 @@ fn stat_row(path: &Path) -> Option<Row<'_>> {
             dev: 0,
             ino: 0,
             mode: 0,
-            nlink: 0,
+            //nlink: 0,
             uid: 0,
             gid: 0,
             size: md.len(),
-            blksize: 0,
+            //blksize: 0,
             blocks: 0,
             atime: 0,
             mtime: 0,
-            ctime: 0,
+            //ctime: 0,
         })
     }
 }
@@ -358,24 +358,7 @@ fn merge_shards(out_dir: &Path, threads: usize) -> std::io::Result<()> {
     Ok(())
 }
 
-// ---------- tiny CSV helpers ----------
-fn csv_push_path(buf: &mut Vec<u8>, p: &Path) {
-    let s = p.to_string_lossy();
-    let needs_quote = s.bytes().any(|c| c == b',' || c == b'"' || c == b'\n');
-    if !needs_quote {
-        buf.extend_from_slice(s.as_bytes());
-    } else {
-        buf.push(b'"');
-        for b in s.bytes() {
-            if b == b'"' {
-                buf.extend_from_slice(br#""""#); // escape quote
-            } else {
-                buf.push(b);
-            }
-        }
-        buf.push(b'"');
-    }
-}
+
 #[inline] fn push_comma(buf: &mut Vec<u8>) { buf.push(b','); }
 #[inline]
 fn push_u32(out: &mut Vec<u8>, v: u32) { let mut b = Buffer::new(); out.extend_from_slice(b.format(v).as_bytes()); }
