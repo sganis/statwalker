@@ -87,12 +87,13 @@ PERMS={}
 def get_permissions(mode):
 	"""get permissions from file mode
 	"""
-	#return str(int(oct(stat.S_IMODE(mode)))).zfill(3) # mode & 07777
-	return int(oct(stat.S_IMODE(mode)))
+	perm = int(format(stat.S_IMODE(mode), 'o'))
+	# print(mode, perm)
+	return perm
 
 def run(input, output):
 	init = time.time()
-	print "Resolving file %s" % input
+	print("Resolving file %s" % input)
 	inodes = {}
 	with open(input) as f, open(output,'w') as w:
 		reader = csv.reader(f)
@@ -100,22 +101,23 @@ def run(input, output):
 		w.write(HEADER+'\n')
 		for r in reader:
 			if not r: continue
-			try:
-				inode = r[0]
-				accessed = format_time(int(r[1]))
-				modified = format_time(int(r[2]))
-				user = get_username(int(r[3]))
-				group = get_groupname(int(r[4]))
-				permissions = get_permissions(int(r[5]))
-				filetype = get_filetype(int(r[5]))
-				size = int(r[6])/1073741824.0 # GB
-				disk = int(r[7])/1073741824.0 # GB
-				path = r[8]
-				w.write("%s,%s,%s,%s,%s,%s,%s,%s,%s,\"%s\"\n" % (
-					inode,accessed,modified,user,group,filetype,permissions,size,disk,path))
-			except Exception, ex:
-				print ex
-	print "Total resolve time: %s sec." % (time.time()-init)
+			# try:
+			inode = r[0]
+			accessed = format_time(int(r[1]))
+			modified = format_time(int(r[2]))
+			user = get_username(int(r[3]))
+			group = get_groupname(int(r[4]))
+			permissions = get_permissions(int(r[5]))
+			filetype = get_filetype(int(r[5]))
+			size = int(r[6])/1073741824.0 # GB
+			disk = int(r[7])/1073741824.0 # GB
+			path = r[8]
+			w.write("%s,%s,%s,%s,%s,%s,%s,%s,%s,\"%s\"\n" % (
+				inode,accessed,modified,user,group,filetype,permissions,size,disk,path))
+			# except Exception as ex:
+				# print(ex)
+			# break
+	print("Total resolve time: %s sec." % (time.time()-init))
 
 
 if __name__ == '__main__':

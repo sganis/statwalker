@@ -108,8 +108,13 @@ fn main() -> std::io::Result<()> {
         );
     }
 
+ 
     let elapsed = start_time.elapsed();
-    println!("Elapsed time: {:.3} seconds", elapsed.as_secs_f64());
+    let secs = elapsed.as_secs_f64();
+    println!("Elapsed time: {:.3} seconds", secs);
+
+    // This uses your current counter (files + dirs)
+    println!("Files per second: {:.2}", (total.files as f64) / secs);
 
     Ok(())
 }
