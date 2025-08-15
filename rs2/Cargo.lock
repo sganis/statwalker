@@ -87,7 +87,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rs2"
+name = "statwalker"
 version = "0.1.0"
 dependencies = [
  "crossbeam",

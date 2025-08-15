@@ -42,20 +42,30 @@ fn main() -> std::io::Result<()> {
     if roots.is_empty() {
         roots.push(".".into());
     }
+    let folder = roots[0].clone();
+    let fullpath = fs::canonicalize(&folder)?
+        .into_os_string()
+        .into_string()
+        .unwrap();
+
+    #[cfg(unix)]
+    let name = fullpath[1..].replace("/", "-");
+    #[cfg(windows)]
+    let name = fullpath[3..].replace('\\', "-");
+
+    let final_path = PathBuf::from(&format!("{name}.csv"));
 
     let threads = num_cpus::get().max(1);
-    let out_dir = PathBuf::from("out");
-    fs::create_dir_all(&out_dir)?;
+    let out_dir = PathBuf::from(".");
+    //fs::create_dir_all(&out_dir)?;
 
     // ---- work queue + inflight counter ----
     let (tx, rx) = unbounded::<Task>();
     let inflight = Arc::new(AtomicUsize::new(0));
 
     // seed roots
-    for r in &roots {
-        inflight.fetch_add(1, SeqCst);
-        tx.send(Task::Dir(PathBuf::from(r))).expect("enqueue root");
-    }
+    inflight.fetch_add(1, SeqCst);
+    tx.send(Task::Dir(PathBuf::from(folder))).expect("enqueue root");
 
     // shutdown notifier: when inflight hits 0, broadcast Shutdown
     {
@@ -96,7 +106,7 @@ fn main() -> std::io::Result<()> {
     }
 
     // ---- merge shards and print summary ----
-    merge_shards(&out_dir, threads)?;
+    merge_shards(&out_dir, &final_path, threads)?;
 
     println!("Total entries (files + dirs): {}", total.files);
 
@@ -340,9 +350,11 @@ fn csv_push_path_always_quoted(buf: &mut Vec<u8>, p: &Path) {
     buf.push(b'"');
 }
 
-
-fn merge_shards(out_dir: &Path, threads: usize) -> std::io::Result<()> {
-    let final_path = out_dir.join("final.csv");
+fn merge_shards(out_dir: &Path, final_path: &Path, threads: usize) -> std::io::Result<()> {
+    //let final_path = out_dir.join("final.csv");
+    // if final_path.exists() {
+    //     fs::remove_file(final_path)?;
+    // }
     let mut out = BufWriter::new(File::create(&final_path)?);
     out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n")?;
 
