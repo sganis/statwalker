@@ -1,69 +1,49 @@
-#[allow(unused)]
-use anyhow::{Error, Result};
-use chrono::offset::Utc;
-use chrono::DateTime;
-use std::env;
-use std::fs;
-use std::io::{BufWriter, Read, Write};
+use std::{
+    env,
+    ffi::{OsStr, OsString},
+    fs::{self, File},
+    io::{BufWriter, Write},
+    path::{Path, PathBuf},
+};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering::SeqCst},
+    Arc,
+};
+use std::{thread, time::Instant};
+
+use crossbeam::channel::{unbounded, Receiver, Sender};
+use num_cpus;
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Instant;
-use walkdir::WalkDir;
+use std::os::unix::fs::MetadataExt;
+use itoa::Buffer;
 
-//fn work(index: i32, chunk: &[String]) -> Result<()> {
-fn work<T: Write>(
-    index: i32,
-    chunk: Vec<String>,
-    global_writer: Arc<Mutex<BufWriter<T>>>,
-) -> Result<()> {
-    let local_path = format!("file-{index}.csv");
-    let f = fs::File::create(&local_path).expect("Unable to open file");
-    let mut local_writer = BufWriter::new(f);
+const FILE_CHUNK: usize = 4096;      // entries per work unit
+const FLUSH_BYTES: usize = 2 * 1024 * 1024;
 
-    for path in chunk.iter() {
-        let metadata = fs::symlink_metadata(path)?;
-        let size = metadata.len();
-        //let accessed = metadata.accessed().unwrap();
-        //let modified = metadata.modified().unwrap();
-        let accessed: DateTime<Utc> = metadata.modified()?.into();
-        let modified: DateTime<Utc> = metadata.modified()?.into();
-        #[cfg(unix)]
-        let mode = metadata.permissions().mode();
-        #[cfg(windows)]
-        let mode = 0;
-        //let filetype = if metadata.is_dir() { "DIR" } else { "REG" };
-        writeln!(
-            local_writer,
-            "{},{},{},{},\"{}\"",
-            accessed.format("%Y-%m-%d"),
-            modified.format("%Y-%m-%d"),
-            //accessed.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            //modified.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            //filetype,
-            mode,
-            size,
-            path
-        )?;
-    }
-    let _ = local_writer.flush();
-
-    // append local file to global file
-    let mut input = fs::File::open(&local_path)?;
-    let mut s = String::new();
-    input.read_to_string(&mut s)?;
-    write!(global_writer.lock().unwrap(), "{}", s)?;
-    fs::remove_file(&local_path).expect("could not remove file");
-
-    Ok(())
+#[derive(Debug)]
+enum Task {
+    Dir(PathBuf),
+    Files { base: PathBuf, names: Vec<OsString> },
+    Shutdown,
 }
 
-fn main() -> Result<()> {
-    let now = Instant::now();
-    let args: Vec<String> = env::args().collect();
-    let fullpath = fs::canonicalize(&args[1])?
+#[derive(Default)]
+struct Stats {
+    files: u64,
+    largest_file_count: u64,
+    largest_file_count_dir: PathBuf,
+}
+
+fn main() -> std::io::Result<()> {
+    let start_time = Instant::now();
+
+    // ---- parse args / defaults ----
+    let mut roots = env::args_os().skip(1).collect::<Vec<_>>();
+    if roots.is_empty() {
+        roots.push(".".into());
+    }
+    let folder = roots[0].clone();
+    let fullpath = fs::canonicalize(&folder)?
         .into_os_string()
         .into_string()
         .unwrap();
@@ -73,68 +53,333 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     let name = fullpath[3..].replace('\\', "-");
 
-    let path = format!("{name}.csv");
-    let final_path = Path::new(&path);
+    let final_path = PathBuf::from(&format!("{name}.csv"));
 
-    if final_path.exists() {
-        fs::remove_file(final_path)?;
+    let threads = num_cpus::get().max(1);
+    let out_dir = PathBuf::from(".");
+    //fs::create_dir_all(&out_dir)?;
+
+    // ---- work queue + inflight counter ----
+    let (tx, rx) = unbounded::<Task>();
+    let inflight = Arc::new(AtomicUsize::new(0));
+
+    // seed roots
+    inflight.fetch_add(1, SeqCst);
+    tx.send(Task::Dir(PathBuf::from(folder))).expect("enqueue root");
+
+    // shutdown notifier: when inflight hits 0, broadcast Shutdown
+    {
+        let tx = tx.clone();
+        let inflight = inflight.clone();
+        thread::spawn(move || loop {
+            if inflight.load(SeqCst) == 0 {
+                for _ in 0..threads {
+                    let _ = tx.send(Task::Shutdown);
+                }
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        });
     }
 
-    let file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .append(true)
-        .open(final_path)?;
-    let writer = Arc::new(Mutex::new(BufWriter::new(file)));
-    let header = "ACCESSED,MODIFIED,MODE,SIZE,PATH\n";
-    write!(writer.lock().unwrap(), "{header}").expect("cannot create final file");
-
-    let mut files = Vec::<String>::new();
-    for entry in WalkDir::new(&fullpath).into_iter().filter_map(|e| e.ok()) {
-        let path = String::from(entry.path().to_string_lossy());
-        files.push(path);
+    // ---- spawn workers (each returns its local Stats) ----
+    let mut joins = Vec::with_capacity(threads);
+    for tid in 0..threads {
+        let rx = rx.clone();
+        let tx = tx.clone();
+        let inflight = inflight.clone();
+        let out_dir = out_dir.clone();
+        joins.push(thread::spawn(move || worker(tid, rx, tx, inflight, out_dir)));
     }
-    let total_files = files.len();
-    let nprocs = num_cpus::get();
-    let chunk_size = (total_files + nprocs - 1) / nprocs;
+    drop(tx); // main thread no longer sends tasks
 
-    //let chunks: Vec<&[String]> = files.chunks(n).collect();
-    let chunks: Vec<Vec<String>> = files.chunks(chunk_size).map(|s| s.into()).collect();
-    println!(
-        "files: {}, nprocs: {}, chunk size: {}, rest: {}",
-        total_files,
-        nprocs,
-        chunk_size,
-        chunks[chunks.len() - 1].len()
-    );
+    // ---- gather stats from workers ----
+    let mut total = Stats::default();
+    for j in joins {
+        let s = j.join().expect("worker panicked");
+        total.files += s.files;
 
-    // todo: parallelize this
-    // for (index, chunk) in chunks.iter().enumerate() {
-    //     work(index as i32, chunk)?;
-    // }
-
-    let mut handles = Vec::new();
-
-    for (index, chunk) in chunks.into_iter().enumerate() {
-        let writer = Arc::clone(&writer);
-        let handle = thread::spawn(move || work(index as i32, chunk, writer));
-        handles.push(handle);
-    }
-    for handle in handles {
-        let _ = handle.join().expect("Could not join thread");
+        if s.largest_file_count > total.largest_file_count {
+            total.largest_file_count = s.largest_file_count;
+            total.largest_file_count_dir = s.largest_file_count_dir;
+        }
     }
 
-    // for index in 0..nprocs {
-    //     let path = format!("file-{index}.csv");
-    //     let mut input = fs::File::open(&path)?;
-    //     let mut s = String::new();
-    //     input.read_to_string(&mut s)?;
-    //     write!(writer.lock().unwrap(), "{}", s)?;
-    //     fs::remove_file(&path).expect("could not remove file");
-    // }
+    // ---- merge shards and print summary ----
+    merge_shards(&out_dir, &final_path, threads)?;
 
-    let elapsed = now.elapsed();
-    println!("Elapsed: {:.2?}", elapsed);
+    println!("Total entries (files + dirs): {}", total.files);
+
+    if total.largest_file_count > 0 {
+        println!(
+            "Largest folder by entry count: {} ({} entries)",
+            total.largest_file_count_dir.display(),
+            total.largest_file_count
+        );
+    }
+
+ 
+    let elapsed = start_time.elapsed();
+    let secs = elapsed.as_secs_f64();
+    println!("Elapsed time: {:.3} seconds", secs);
+
+    // This uses your current counter (files + dirs)
+    println!("Files per second: {:.2}", (total.files as f64) / secs);
 
     Ok(())
 }
+
+fn worker(
+    tid: usize,
+    rx: Receiver<Task>,
+    tx: Sender<Task>,
+    inflight: Arc<AtomicUsize>,
+    out_dir: PathBuf,
+) -> Stats {
+    let shard_path = out_dir.join(format!("shard_{tid}.csv.tmp"));
+    let mut shard =
+        BufWriter::with_capacity(8 * 1024 * 1024, File::create(&shard_path).expect("open shard"));
+    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024 * 1024);
+
+    let mut stats = Stats {
+        files: 0,
+        largest_file_count: 0,
+        largest_file_count_dir: PathBuf::new(),
+    };
+
+    while let Ok(task) = rx.recv() {
+        match task {
+            Task::Shutdown => break,
+
+            Task::Dir(dir) => {
+                // emit one row for the directory itself (counts as an entry)
+                if let Some(row) = stat_row(&dir) {
+                    write_row(&mut buf, row);
+                    stats.files += 1;
+
+                    if buf.len() >= FLUSH_BYTES {
+                        let _ = shard.write_all(&buf);
+                        buf.clear();
+                    }
+                }
+
+                // enumerate children and push work; get child entry count
+                let child_entries = enum_dir(&dir, &tx, &inflight);
+
+                // update "largest by entry count" (children only, like ls count)
+                if child_entries > stats.largest_file_count {
+                    stats.largest_file_count = child_entries;
+                    stats.largest_file_count_dir = dir.clone();
+                }
+
+                inflight.fetch_sub(1, SeqCst);
+            }
+
+            Task::Files { base, names } => {
+                for name in names {
+                    let full = base.join(&name);
+                    if let Some(row) = stat_row(&full) {
+                        write_row(&mut buf, row);
+                        stats.files += 1;
+
+                        if buf.len() >= FLUSH_BYTES {
+                            let _ = shard.write_all(&buf);
+                            buf.clear();
+                        }
+                    }
+                }
+                inflight.fetch_sub(1, SeqCst);
+            }
+        }
+    }
+
+    if !buf.is_empty() {
+        let _ = shard.write_all(&buf);
+    }
+    let _ = shard.flush();
+
+    stats
+}
+
+fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize) -> u64 {
+    let rd = match fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(_) => return 0,
+    };
+
+    let mut page: Vec<OsString> = Vec::with_capacity(FILE_CHUNK);
+    let mut entry_count: u64 = 0;
+
+    for dent in rd {
+        let dent = match dent {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let name = dent.file_name();
+        if name == OsStr::new(".") || name == OsStr::new("..") {
+            continue;
+        }
+        entry_count += 1;
+
+       let is_dir = dent
+            .file_type()
+            .map(|t| t.is_dir())
+            .unwrap_or_else(|_| dent.path().is_dir());
+
+        if is_dir {
+            inflight.fetch_add(1, SeqCst);
+            let _ = tx.send(Task::Dir(dent.path()));
+        } else {
+            page.push(name);
+            if page.len() == FILE_CHUNK {
+                inflight.fetch_add(1, SeqCst);
+                let _ = tx.send(Task::Files {
+                    base: dir.to_path_buf(),
+                    names: std::mem::take(&mut page),
+                });
+            }
+        }
+    }
+
+    if !page.is_empty() {
+        inflight.fetch_add(1, SeqCst);
+        let _ = tx.send(Task::Files {
+            base: dir.to_path_buf(),
+            names: page,
+        });
+    }
+
+    entry_count
+}
+
+struct Row<'a> {
+    path: &'a Path,
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    //nlink: u64,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    //blksize: u64,
+    blocks: u64,
+    atime: i64,
+    mtime: i64,
+    //ctime: i64,
+}
+
+fn stat_row(path: &Path) -> Option<Row<'_>> {
+    let md = fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        Some(Row {
+            path,
+            dev: md.dev(),
+            ino: md.ino(),
+            mode: md.mode(),
+            //nlink: md.nlink() as u64,
+            uid: md.uid(),
+            gid: md.gid(),
+            size: md.size(),
+            //blksize: md.blksize() as u64,
+            blocks: md.blocks() as u64,
+            atime: md.atime(),
+            mtime: md.mtime(),
+            //ctime: md.ctime(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Some(Row {
+            path,
+            dev: 0,
+            ino: 0,
+            mode: 0,
+            //nlink: 0,
+            uid: 0,
+            gid: 0,
+            size: md.len(),
+            //blksize: 0,
+            blocks: 0,
+            atime: 0,
+            mtime: 0,
+            //ctime: 0,
+        })
+    }
+}
+
+fn write_row(buf: &mut Vec<u8>, r: Row<'_>) {
+    // INODE: "<dev>-<ino>"
+    push_u64(buf, r.dev);
+    buf.push(b'-');
+    push_u64(buf, r.ino);
+    push_comma(buf);
+
+    // ATIME, MTIME
+    push_i64(buf, r.atime); push_comma(buf);
+    push_i64(buf, r.mtime); push_comma(buf);
+
+    // UID, GID, MODE
+    push_u32(buf, r.uid);   push_comma(buf);
+    push_u32(buf, r.gid);   push_comma(buf);
+    push_u32(buf, r.mode);  push_comma(buf);
+
+    // SIZE (logical), DISK (allocated bytes = blocks * 512)
+    push_u64(buf, r.size);  push_comma(buf);
+    //let disk = if (r.mode & 0o170000) == 0o040000 { 0 } else { r.blocks * 512 };
+    let disk = r.blocks * 512;
+    push_u64(buf, disk); push_comma(buf);
+    
+    // PATH (always quoted)
+    csv_push_path_always_quoted(buf, r.path);
+
+    buf.push(b'\n');
+}
+
+fn csv_push_path_always_quoted(buf: &mut Vec<u8>, p: &Path) {
+    let s = p.to_string_lossy();
+    buf.push(b'"');
+    for b in s.bytes() {
+        if b == b'"' {
+            buf.extend_from_slice(br#""""#); // escape quotes
+        } else {
+            buf.push(b);
+        }
+    }
+    buf.push(b'"');
+}
+
+fn merge_shards(out_dir: &Path, final_path: &Path, threads: usize) -> std::io::Result<()> {
+    //let final_path = out_dir.join("final.csv");
+    // if final_path.exists() {
+    //     fs::remove_file(final_path)?;
+    // }
+    let mut out = BufWriter::new(File::create(&final_path)?);
+    out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n")?;
+
+    let mut buf = Vec::with_capacity(FLUSH_BYTES);
+    for tid in 0..threads {
+        let shard = out_dir.join(format!("shard_{tid}.csv.tmp"));
+        if !shard.exists() {
+            continue;
+        }
+        let mut f = File::open(&shard)?;
+        use std::io::Read;
+        buf.clear();
+        f.read_to_end(&mut buf)?;
+        out.write_all(&buf)?; // shards have no header
+        let _ = fs::remove_file(shard);
+    }
+    out.flush()?;
+    Ok(())
+}
+
+
+#[inline] fn push_comma(buf: &mut Vec<u8>) { buf.push(b','); }
+#[inline]
+fn push_u32(out: &mut Vec<u8>, v: u32) { let mut b = Buffer::new(); out.extend_from_slice(b.format(v).as_bytes()); }
+#[inline]
+fn push_u64(out: &mut Vec<u8>, v: u64) { let mut b = Buffer::new(); out.extend_from_slice(b.format(v).as_bytes()); }
+#[inline]
+fn push_i64(out: &mut Vec<u8>, v: i64) { let mut b = Buffer::new(); out.extend_from_slice(b.format(v).as_bytes()); }
