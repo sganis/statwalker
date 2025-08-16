@@ -1,5 +1,4 @@
 use std::{
-    env,
     ffi::{OsStr, OsString},
     fs::{self, File},
     io::{BufWriter, Write},
@@ -9,16 +8,28 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering::SeqCst},
     Arc,
 };
-use std::{thread, time::Instant};
-
+use std::{thread, time::Instant, io::Read};
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use num_cpus;
+
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use itoa::Buffer;
+use clap::Parser;
 
 const FILE_CHUNK: usize = 4096;      // entries per work unit
 const FLUSH_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about = "Super Fast FS Scanner")]
+struct Args {
+    /// Root folder to scan
+    #[arg(default_value = ".")]
+    root: String,
+    /// Detect file category (text/binary/image/video/etc)
+    #[arg(long)]
+    category: bool,
+}
 
 #[derive(Debug)]
 enum Task {
@@ -34,15 +45,21 @@ struct Stats {
     largest_file_count_dir: PathBuf,
 }
 
+#[derive(Debug)]
+enum Category { Jpeg, Png, Gif, Pdf, Zip, Gzip, Mp3, Elf, PE, Tar, Text, Binary, Unknown }
+
+#[derive(Clone)]
+struct Config {
+    want_category: bool,
+}
+
+
 fn main() -> std::io::Result<()> {
     let start_time = Instant::now();
 
-    // ---- parse args / defaults ----
-    let mut roots = env::args_os().skip(1).collect::<Vec<_>>();
-    if roots.is_empty() {
-        roots.push(".".into());
-    }
-    let folder = roots[0].clone();
+    let args = Args::parse();
+    
+    let folder = PathBuf::from(args.root.clone());
     let fullpath = fs::canonicalize(&folder)?
         .into_os_string()
         .into_string()
@@ -51,9 +68,11 @@ fn main() -> std::io::Result<()> {
     #[cfg(unix)]
     let name = fullpath[1..].replace("/", "-");
     #[cfg(windows)]
-    let name = fullpath[3..].replace('\\', "-");
+    let name = fullpath[7..].replace('\\', "-");
 
     let final_path = PathBuf::from(&format!("{name}.csv"));
+    //println!("fullpath: {}", &fullpath);
+    println!("output: {}", &final_path.display());
 
     let threads = num_cpus::get().max(1);
     let out_dir = PathBuf::from(".");
@@ -82,6 +101,8 @@ fn main() -> std::io::Result<()> {
         });
     }
 
+    let cfg = Config { want_category: args.category };
+
     // ---- spawn workers (each returns its local Stats) ----
     let mut joins = Vec::with_capacity(threads);
     for tid in 0..threads {
@@ -89,7 +110,8 @@ fn main() -> std::io::Result<()> {
         let tx = tx.clone();
         let inflight = inflight.clone();
         let out_dir = out_dir.clone();
-        joins.push(thread::spawn(move || worker(tid, rx, tx, inflight, out_dir)));
+        let cfg = cfg.clone();
+        joins.push(thread::spawn(move || worker(tid, rx, tx, inflight, out_dir, cfg)));
     }
     drop(tx); // main thread no longer sends tasks
 
@@ -135,6 +157,7 @@ fn worker(
     tx: Sender<Task>,
     inflight: Arc<AtomicUsize>,
     out_dir: PathBuf,
+    cfg: Config,
 ) -> Stats {
     let shard_path = out_dir.join(format!("shard_{tid}.csv.tmp"));
     let mut shard =
@@ -153,7 +176,7 @@ fn worker(
 
             Task::Dir(dir) => {
                 // emit one row for the directory itself (counts as an entry)
-                if let Some(row) = stat_row(&dir) {
+                if let Some(row) = stat_row(&dir, &cfg) {
                     write_row(&mut buf, row);
                     stats.files += 1;
 
@@ -178,7 +201,7 @@ fn worker(
             Task::Files { base, names } => {
                 for name in names {
                     let full = base.join(&name);
-                    if let Some(row) = stat_row(&full) {
+                    if let Some(row) = stat_row(&full, &cfg) {
                         write_row(&mut buf, row);
                         stats.files += 1;
 
@@ -253,8 +276,38 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize) -> u64 {
     entry_count
 }
 
+fn detect_category(path: &Path) -> Category {
+    let mut f = match File::open(path) { Ok(f) => f, Err(_) => return Category::Unknown };
+    let mut hdr = [0u8; 32];
+    let n = match f.read(&mut hdr) { Ok(n) => n, Err(_) => 0 };
+    let h = &hdr[..n];
+
+    if h.starts_with(&[0xFF,0xD8,0xFF]) { return Category::Jpeg }
+    if h.starts_with(&[0x89, b'P', b'N', b'G']) { return Category::Png }
+    if h.starts_with(b"GIF8") { return Category::Gif }
+    if h.starts_with(b"%PDF") { return Category::Pdf }
+    if h.starts_with(&[0x50,0x4B,0x03,0x04]) { return Category::Zip }
+    if h.starts_with(&[0x1F,0x8B]) { return Category::Gzip }
+    if h.starts_with(&[0x49,0x44,0x33]) { return Category::Mp3 }
+    if h.starts_with(&[0x7F,b'E',b'L',b'F']) { return Category::Elf }
+    if h.starts_with(&[0x4D,0x5A]) { return Category::PE }
+    if n>265 && &hdr[257..262]==b"ustar" { return Category::Tar }
+
+    // fallback
+    let mut printable=0usize; let mut ctrl=0usize;
+    for &b in h {
+        match b {
+            0x20..=0x7E | b'\t'|b'\n'|b'\r' => printable+=1,
+            0 => { ctrl+=1; break; }
+            _ => ctrl+=1
+        }
+    }
+    if ctrl == 0 || printable > ctrl { Category::Text } else { Category::Binary }
+}
+
 struct Row<'a> {
     path: &'a Path,
+    category: Option<Category>,
     dev: u64,
     ino: u64,
     mode: u32,
@@ -269,12 +322,13 @@ struct Row<'a> {
     //ctime: i64,
 }
 
-fn stat_row(path: &Path) -> Option<Row<'_>> {
+fn stat_row<'a>(path: &'a Path, cfg: &'a Config) -> Option<Row<'a>> {
     let md = fs::symlink_metadata(path).ok()?;
     #[cfg(unix)]
     {
         Some(Row {
             path,
+            category: if cfg.want_category { Some(detect_category(path)) } else { None },
             dev: md.dev(),
             ino: md.ino(),
             mode: md.mode(),
@@ -293,6 +347,7 @@ fn stat_row(path: &Path) -> Option<Row<'_>> {
     {
         Some(Row {
             path,
+            category: if cfg.want_category { Some(detect_category(path)) } else { None },
             dev: 0,
             ino: 0,
             mode: 0,
@@ -317,23 +372,42 @@ fn write_row(buf: &mut Vec<u8>, r: Row<'_>) {
     push_comma(buf);
 
     // ATIME, MTIME
-    push_i64(buf, r.atime); push_comma(buf);
-    push_i64(buf, r.mtime); push_comma(buf);
+    push_i64(buf, r.atime); 
+    push_comma(buf);
+    push_i64(buf, r.mtime); 
+    push_comma(buf);
 
     // UID, GID, MODE
-    push_u32(buf, r.uid);   push_comma(buf);
-    push_u32(buf, r.gid);   push_comma(buf);
-    push_u32(buf, r.mode);  push_comma(buf);
+    push_u32(buf, r.uid);   
+    push_comma(buf);
+    push_u32(buf, r.gid);   
+    push_comma(buf);
+    push_u32(buf, r.mode);  
+    push_comma(buf);
 
     // SIZE (logical), DISK (allocated bytes = blocks * 512)
-    push_u64(buf, r.size);  push_comma(buf);
+    push_u64(buf, r.size);  
+    push_comma(buf);
     //let disk = if (r.mode & 0o170000) == 0o040000 { 0 } else { r.blocks * 512 };
     let disk = r.blocks * 512;
-    push_u64(buf, disk); push_comma(buf);
+    push_u64(buf, disk); 
+    push_comma(buf);
     
+    // CAT
+    if let Some(cat) = r.category {
+        let s = match cat {
+            Category::Jpeg=>"jpeg", Category::Png=>"png", Category::Gif=>"gif",
+            Category::Pdf=>"pdf", Category::Zip=>"zip", Category::Gzip=>"gzip",
+            Category::Mp3=>"mp3", Category::Elf=>"elf", Category::PE=>"pe",
+            Category::Tar=>"tar", Category::Text=>"text", Category::Binary=>"binary",
+            Category::Unknown=>"",
+        };
+        buf.extend_from_slice(s.as_bytes());
+    }
+    push_comma(buf);
+
     // PATH (always quoted)
     csv_push_path_always_quoted(buf, r.path);
-
     buf.push(b'\n');
 }
 
@@ -356,7 +430,7 @@ fn merge_shards(out_dir: &Path, final_path: &Path, threads: usize) -> std::io::R
     //     fs::remove_file(final_path)?;
     // }
     let mut out = BufWriter::new(File::create(&final_path)?);
-    out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n")?;
+    out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,CAT,PATH\n")?;
 
     let mut buf = Vec::with_capacity(FLUSH_BYTES);
     for tid in 0..threads {
@@ -374,7 +448,6 @@ fn merge_shards(out_dir: &Path, final_path: &Path, threads: usize) -> std::io::R
     out.flush()?;
     Ok(())
 }
-
 
 #[inline] fn push_comma(buf: &mut Vec<u8>) { buf.push(b','); }
 #[inline]

@@ -23,6 +23,9 @@ struct Args {
     /// Read a single aggregation row by folder PATH from <stem>.agg.redb and exit
     #[arg(long, value_name = "PATH")]
     read_agg: Option<String>,
+    /// List the immediate children of DIR from <stem>.agg.redb and exit
+    #[arg(long, value_name = "DIR")]
+    ls: Option<String>,
 }
 
 const OUT_HEADER: &[&str] = &[
@@ -74,6 +77,12 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from(format!("{}.res.csv", stem)));
     let agg_csv = PathBuf::from(format!("{}.agg.csv", stem));
     let agg_redb = PathBuf::from(format!("{}.agg.redb", stem));
+
+    // Fast path: --ls => scan agg.redb and list children
+    if let Some(dir) = args.ls.as_deref() {
+        list_children(&agg_redb, dir)?;
+        return Ok(());
+    }
 
     // Fast path: --read-agg => open DB, print row, exit
     if let Some(key) = args.read_agg.as_deref() {
@@ -273,6 +282,41 @@ fn save_aggregation_to_redb(db_path: &Path, agg_data: &HashMap<String, FolderSta
         }
     }
     write.commit().context("commit redb txn")?;
+    Ok(())
+}
+
+fn list_children(db_path: &Path, dir: &str) -> Result<()> {
+    let db = Database::open(db_path)?;
+    let read = db.begin_read()?;
+    let table = read.open_table(AGG)?;
+
+    let mut children = std::collections::BTreeSet::new();
+    let prefix = if dir == "/" {
+        "/".to_string()
+    } else {
+        format!("{}/", dir.trim_end_matches('/'))
+    };
+
+    for entry in table.range(prefix.as_str()..)? {
+        let (key_guard, _value) = entry?;
+        let key = key_guard.value();
+        
+        // Check prefix match and break when we've passed our target range
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        
+        let remainder = &key[prefix.len()..];
+        if let Some(child) = remainder.split('/').next() {
+            if !child.is_empty() {
+                children.insert(child.to_string());
+            }
+        }
+    }
+
+    for c in &children {
+        println!("{c}");
+    }
     Ok(())
 }
 
