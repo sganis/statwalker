@@ -8,7 +8,6 @@ use redb::{Database, TableDefinition, ReadableDatabase};
 use bincode::{config, decode_from_slice, encode_to_vec, Decode, Encode};
 use serde::Serialize;
 
-
 #[cfg(unix)]
 use std::ffi::CStr;
 
@@ -20,16 +19,16 @@ struct Args {
     /// Output CSV (defaults to <stem>.res.csv in the current directory)
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// Read a single aggregation row by folder PATH from <stem>.agg.redb and exit
-    #[arg(long, value_name = "PATH")]
-    read_agg: Option<String>,
-    /// List the immediate children of DIR from <stem>.agg.redb and exit
-    #[arg(long, value_name = "DIR")]
-    ls: Option<String>,
+    //// Read a single aggregation row by folder PATH from <stem>.agg.redb and exit
+    //// #[arg(long, value_name = "PATH")]
+    //// read_agg: Option<String>,
+    //// / List the immediate children of DIR from <stem>.agg.redb and exit
+    //// #[arg(long, value_name = "DIR")]
+    //// ls: Option<String>,
 }
 
 const OUT_HEADER: &[&str] = &[
-    "INODE","ACCESSED","MODIFIED","USER","GROUP","TYPE","PERM","SIZE","DISK","PATH"
+    "INODE","ACCESSED","MODIFIED","USER","GROUP","TYPE","PERM","SIZE","DISK","PATH","CATEGORY","HASH"
 ];
 
 #[derive(Debug, Clone)]
@@ -51,16 +50,15 @@ impl FolderStats {
     }
 }
 
-#[derive(Encode, Decode, Serialize, Debug)]
-struct AggRowBin {
-    file_count: u64,
-    disk_usage: u128,
-    latest_mtime: i64,
-    users: Vec<String>,
-}
+// #[derive(Encode, Decode, Serialize, Debug)]
+// struct AggRowBin {
+//     file_count: u64,
+//     disk_usage: u128,
+//     latest_mtime: i64,
+//     users: Vec<String>,
+// }
 
-const AGG: TableDefinition<&str, &[u8]> = TableDefinition::new("agg");
-
+// const AGG: TableDefinition<&str, &[u8]> = TableDefinition::new("agg");
 
 fn main() -> Result<()> {
     let start = std::time::Instant::now();
@@ -79,26 +77,26 @@ fn main() -> Result<()> {
     let agg_redb = PathBuf::from(format!("{}.agg.redb", stem));
 
     // Fast path: --ls => scan agg.redb and list children
-    if let Some(dir) = args.ls.as_deref() {
-        list_children(&agg_redb, dir)?;
-        return Ok(());
-    }
+    // if let Some(dir) = args.ls.as_deref() {
+    //     list_children(&agg_redb, dir)?;
+    //     return Ok(());
+    // }
 
-    // Fast path: --read-agg => open DB, print row, exit
-    if let Some(key) = args.read_agg.as_deref() {
-        match read_one(&agg_redb, key) {
-            Ok(Some(row)) => {
-                println!("{}", serde_json::to_string_pretty(&row)?);
-            }
-            Ok(None) => {
-                eprintln!("Key not found: {}", key);
-            }
-            Err(e) => {
-                eprintln!("Error reading key {}: {:#}", key, e);
-            }
-        }
-        return Ok(());
-    }
+    // // Fast path: --read-agg => open DB, print row, exit
+    // if let Some(key) = args.read_agg.as_deref() {
+    //     match read_one(&agg_redb, key) {
+    //         Ok(Some(row)) => {
+    //             println!("{}", serde_json::to_string_pretty(&row)?);
+    //         }
+    //         Ok(None) => {
+    //             eprintln!("Key not found: {}", key);
+    //         }
+    //         Err(e) => {
+    //             eprintln!("Error reading key {}: {:#}", key, e);
+    //         }
+    //     }
+    //     return Ok(());
+    // }
 
     println!("Resolving file {}", input.display());
 
@@ -144,7 +142,13 @@ fn main() -> Result<()> {
         let mode_raw = parse_u32(r.get(5), "MODE", line_no)?;
         let size_b = parse_u128(r.get(6), "SIZE", line_no)?;
         let mut disk_b = parse_u128(r.get(7), "DISK", line_no)?;
-        let path = r.get(8).unwrap_or("");
+        let path_raw = r.get(8).unwrap_or("");
+        
+        // Unquote the path if it's already quoted (from input CSV)
+        let path = unquote_csv_field(path_raw);
+
+        let category = r.get(9).unwrap_or("").to_string();
+        let hash = r.get(10).unwrap_or("").to_string();
 
         let accessed = fmt_day(atime, &mut time_cache, local_off);
         let modified = fmt_day(mtime, &mut time_cache, local_off);
@@ -162,13 +166,15 @@ fn main() -> Result<()> {
             inodes_seen.insert(inode.clone());
         }
 
-        // aggregation
-        aggregate_folder_stats(path, disk_b, mtime, &user, &mut agg_data);
+        // aggregation - use unquoted path
+        aggregate_folder_stats(&path, disk_b, mtime, &user, &mut agg_data);
 
         let size_gb = bytes_to_gb(size_b);
         let disk_gb = bytes_to_gb(disk_b);
 
-        let quoted_path = format!("\"{}\"", path.replace('"', "\"\""));
+        // Smart quoting - only quote if needed
+        let quoted_path = csv_quote_if_needed(&path);
+
         wtr.write_record(&[
             &inode,
             &accessed,
@@ -180,6 +186,8 @@ fn main() -> Result<()> {
             &size_gb,
             &disk_gb,
             &quoted_path,
+            &category,
+            &hash,
         ])
         .with_context(|| format!("writing output csv line {} (path: {})", line_no, path))?;
     }
@@ -192,11 +200,48 @@ fn main() -> Result<()> {
     println!("Aggregation (csv)  -> {}", agg_csv.display());
 
     // write agg redb (current dir, redb v3)
-    save_aggregation_to_redb(&agg_redb, &agg_data)?;
-    println!("Aggregation (redb) -> {}", agg_redb.display());
+    //save_aggregation_to_redb(&agg_redb, &agg_data)?;
+    //println!("Aggregation (redb) -> {}", agg_redb.display());
 
     println!("Total resolve time: {:.3} sec.", start.elapsed().as_secs_f64());
     Ok(())
+}
+
+// Unquote CSV field if it's wrapped in quotes
+fn unquote_csv_field(field: &str) -> String {
+    let trimmed = field.trim();
+    
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        // Remove outer quotes and unescape inner quotes
+        let inner = &trimmed[1..trimmed.len()-1];
+        inner.replace("\"\"", "\"")
+    } else {
+        // Not quoted, return as-is
+        trimmed.to_string()
+    }
+}
+
+// Smart CSV quoting function - only quote when necessary
+fn csv_quote_if_needed(s: &str) -> String {
+    // Check if we need quoting at all
+    let needs_quoting = s.chars().any(|c| c == '"' || c == ',' || c == '\n' || c == '\r');
+    
+    if !needs_quoting {
+        // Fast path - no quoting needed at all
+        s.to_string()
+    } else {
+        // println!("needs quotes: {}", s);
+        // assert!(false);
+
+        // Need quoting - check if we also need escaping
+        if !s.contains('"') {
+            // Quotes needed but no escaping required
+            format!("{}", s)
+        } else {
+            // Need both quoting and escaping
+            format!("{}", s.replace('"', "\"\""))
+        }
+    }
 }
 
 fn aggregate_folder_stats(
@@ -242,14 +287,16 @@ fn write_aggregation_file(
 
     for (path, stats) in agg_data {
         let users_str = stats.users.iter().cloned().collect::<Vec<_>>().join("|");
-        let latest_time = fmt_day(stats.latest_mtime, time_cache, local_off);
-        let quoted_path = format!("\"{}\"", path.replace('"', "\"\""));
+        // let latest_time = fmt_day(stats.latest_mtime, time_cache, local_off);
+        
+        // Smart quoting for aggregation paths too
+        let quoted_path = csv_quote_if_needed(path);
 
         wtr.write_record(&[
             &quoted_path,
             &stats.file_count.to_string(),
             &stats.disk_usage.to_string(),
-            &latest_time,
+            &stats.latest_mtime.to_string(),
             &users_str,
         ])
         .with_context(|| format!("writing aggregation row for {}", path))?;
@@ -259,81 +306,80 @@ fn write_aggregation_file(
     Ok(())
 }
 
-// -------- redb v3 persistence --------
-fn save_aggregation_to_redb(db_path: &Path, agg_data: &HashMap<String, FolderStats>) -> Result<()> {
-    let db = Database::create(db_path)
-        .with_context(|| format!("opening/creating redb at {}", db_path.display()))?;
-    let write = db.begin_write().context("begin redb write txn")?;
-    {
-        let mut table = write.open_table(AGG).context("open redb table")?;
-        let cfg = config::standard().with_fixed_int_encoding(); // v2: choose fixed int encoding
+// // -------- redb v3 persistence --------
+// fn save_aggregation_to_redb(db_path: &Path, agg_data: &HashMap<String, FolderStats>) -> Result<()> {
+//     let db = Database::create(db_path)
+//         .with_context(|| format!("opening/creating redb at {}", db_path.display()))?;
+//     let write = db.begin_write().context("begin redb write txn")?;
+//     {
+//         let mut table = write.open_table(AGG).context("open redb table")?;
+//         let cfg = config::standard().with_fixed_int_encoding(); // v2: choose fixed int encoding
 
-        for (path, stats) in agg_data {
-            let row = AggRowBin {
-                file_count: stats.file_count,
-                disk_usage: stats.disk_usage,
-                latest_mtime: stats.latest_mtime,
-                users: stats.users.iter().cloned().collect(),
-            };
-            let bytes = encode_to_vec(&row, cfg).context("bincode encode")?;
-            table
-                .insert(path.as_str(), bytes.as_slice())
-                .with_context(|| format!("redb insert key {}", path))?;
-        }
-    }
-    write.commit().context("commit redb txn")?;
-    Ok(())
-}
+//         for (path, stats) in agg_data {
+//             let row = AggRowBin {
+//                 file_count: stats.file_count,
+//                 disk_usage: stats.disk_usage,
+//                 latest_mtime: stats.latest_mtime,
+//                 users: stats.users.iter().cloned().collect(),
+//             };
+//             let bytes = encode_to_vec(&row, cfg).context("bincode encode")?;
+//             table
+//                 .insert(path.as_str(), bytes.as_slice())
+//                 .with_context(|| format!("redb insert key {}", path))?;
+//         }
+//     }
+//     write.commit().context("commit redb txn")?;
+//     Ok(())
+// }
 
-fn list_children(db_path: &Path, dir: &str) -> Result<()> {
-    let db = Database::open(db_path)?;
-    let read = db.begin_read()?;
-    let table = read.open_table(AGG)?;
+// fn list_children(db_path: &Path, dir: &str) -> Result<()> {
+//     let db = Database::open(db_path)?;
+//     let read = db.begin_read()?;
+//     let table = read.open_table(AGG)?;
 
-    let mut children = std::collections::BTreeSet::new();
-    let prefix = if dir == "/" {
-        "/".to_string()
-    } else {
-        format!("{}/", dir.trim_end_matches('/'))
-    };
+//     let mut children = std::collections::BTreeSet::new();
+//     let prefix = if dir == "/" {
+//         "/".to_string()
+//     } else {
+//         format!("{}/", dir.trim_end_matches('/'))
+//     };
 
-    for entry in table.range(prefix.as_str()..)? {
-        let (key_guard, _value) = entry?;
-        let key = key_guard.value();
+//     for entry in table.range(prefix.as_str()..)? {
+//         let (key_guard, _value) = entry?;
+//         let key = key_guard.value();
         
-        // Check prefix match and break when we've passed our target range
-        if !key.starts_with(&prefix) {
-            break;
-        }
+//         // Check prefix match and break when we've passed our target range
+//         if !key.starts_with(&prefix) {
+//             break;
+//         }
         
-        let remainder = &key[prefix.len()..];
-        if let Some(child) = remainder.split('/').next() {
-            if !child.is_empty() {
-                children.insert(child.to_string());
-            }
-        }
-    }
+//         let remainder = &key[prefix.len()..];
+//         if let Some(child) = remainder.split('/').next() {
+//             if !child.is_empty() {
+//                 children.insert(child.to_string());
+//             }
+//         }
+//     }
 
-    for c in &children {
-        println!("{c}");
-    }
-    Ok(())
-}
+//     for c in &children {
+//         println!("{c}");
+//     }
+//     Ok(())
+// }
 
-fn read_one(db_path: &std::path::Path, key: &str) -> Result<Option<AggRowBin>> {
-    let db = Database::open(db_path)?;
-    let read = db.begin_read()?;                      // needs ReadableDatabase in scope
-    let table = read.open_table(AGG)?;
-    if let Some(val) = table.get(key)? {
-        let cfg = bincode::config::standard().with_fixed_int_encoding();
-        // supply the 2nd generic, or let it be inferred with `_`
-        let (row, _consumed): (AggRowBin, usize) = decode_from_slice::<AggRowBin, _>(val.value(), cfg)?;
-        Ok(Some(row))
-    } else {
-        Ok(None)
-    }
-}
-
+// fn read_one(db_path: &std::path::Path, key: &str) -> Result<Option<AggRowBin>> {
+//     let db = Database::open(db_path)?;
+//     let read = db.begin_read()?;                      // needs ReadableDatabase in scope
+//     let table = read.open_table(AGG)?;
+//     if let Some(val) = table.get(key)? {
+//         let cfg = bincode::config::standard().with_fixed_int_encoding();
+//         // supply the 2nd generic, or let it be inferred with `_`
+//         let (row, _consumed): (AggRowBin, usize) = decode_from_slice::<AggRowBin, _>(val.value(), cfg)?;
+//         Ok(Some(row))
+//     } else {
+//         Ok(None)
+//     }
+// }
 
 // ---------- helpers ----------
 fn parse_i64(s: Option<&str>, field: &str, line: usize) -> Result<i64> {
@@ -399,15 +445,15 @@ fn get_username_from_uid(uid: u32) -> String {
     unsafe {
         let passwd = libc::getpwuid(uid);
         if passwd.is_null() {
-            return "UNKNOWN".to_string();
+            return "UNK".to_string();
         }
         let name_ptr = (*passwd).pw_name;
         if name_ptr.is_null() {
-            return "UNKNOWN".to_string();
+            return "UNK".to_string();
         }
         match CStr::from_ptr(name_ptr).to_str() {
             Ok(name) => name.to_string(),
-            Err(_) => "UNKNOWN".to_string(),
+            Err(_) => "UNK".to_string(),
         }
     }
 }
@@ -417,15 +463,15 @@ fn get_groupname_from_gid(gid: u32) -> String {
     unsafe {
         let group = libc::getgrgid(gid);
         if group.is_null() {
-            return "UNKNOWN".to_string();
+            return "UNK".to_string();
         }
         let name_ptr = (*group).gr_name;
         if name_ptr.is_null() {
-            return "UNKNOWN".to_string();
+            return "UNK".to_string();
         }
         match CStr::from_ptr(name_ptr).to_str() {
             Ok(name) => name.to_string(),
-            Err(_) => "UNKNOWN".to_string(),
+            Err(_) => "UNK".to_string(),
         }
     }
 }
@@ -465,7 +511,7 @@ fn detect_file_type(mode: u32) -> String {
             S_IFIFO => "PIPE".to_string(),
             S_IFBLK => "BDEV".to_string(),
             S_IFCHR => "CDEV".to_string(),
-            _ => "UNKNOWN".to_string(),
+            _ => "UNK".to_string(),
         }
     }
     #[cfg(not(unix))]
@@ -478,7 +524,7 @@ fn detect_file_type(mode: u32) -> String {
             0o010000 => "PIPE".to_string(),
             0o060000 => "BDEV".to_string(),
             0o020000 => "CDEV".to_string(),
-            _ => "UNKNOWN".to_string(),
+            _ => "UNK".to_string(),
         }
     }
 }
@@ -488,8 +534,7 @@ fn octal_perm(mode: u32, cache: &mut HashMap<u32, String>) -> String {
         return p.clone();
     }
     let imode = mode & 0o7777;
-    let perm = format!("{}", imode); // decimal like Python's int()
+    let perm = format!("{:o}", imode);  // <-- octal formatting
     cache.insert(mode, perm.clone());
     perm
 }
-
