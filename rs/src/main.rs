@@ -572,7 +572,7 @@ fn merge_shards(out_dir: &Path, final_path: &Path, threads: usize) -> std::io::R
         16 * 1024 * 1024, // Larger output buffer
         File::create(&final_path)?
     );
-    out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH,CATEGORY,HASH\n")?;
+    out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH,CAT,HASH\n")?;
 
     let mut buf = Vec::with_capacity(READ_BUF_SIZE);
     for tid in 0..threads {

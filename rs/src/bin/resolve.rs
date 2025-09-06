@@ -2,11 +2,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use csv::{ReaderBuilder, WriterBuilder};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use time::{OffsetDateTime, UtcOffset};
 use redb::{Database, TableDefinition, ReadableDatabase};
 use bincode::{config, decode_from_slice, encode_to_vec, Decode, Encode};
 use serde::Serialize;
+
 
 #[cfg(unix)]
 use std::ffi::CStr;
@@ -19,12 +20,12 @@ struct Args {
     /// Output CSV (defaults to <stem>.res.csv in the current directory)
     #[arg(short, long)]
     output: Option<PathBuf>,
-    //// Read a single aggregation row by folder PATH from <stem>.agg.redb and exit
-    //// #[arg(long, value_name = "PATH")]
-    //// read_agg: Option<String>,
-    //// / List the immediate children of DIR from <stem>.agg.redb and exit
-    //// #[arg(long, value_name = "DIR")]
-    //// ls: Option<String>,
+    // Read a single aggregation row by folder PATH from <stem>.rdb and exit
+    #[arg(long, value_name = "DIR")]
+    read_agg: Option<String>,
+    // List the immediate children of DIR from <stem>.rdb and exit
+    #[arg(long, value_name = "DIR")]
+    ls: Option<String>,
 }
 
 const OUT_HEADER: &[&str] = &[
@@ -50,15 +51,15 @@ impl FolderStats {
     }
 }
 
-// #[derive(Encode, Decode, Serialize, Debug)]
-// struct AggRowBin {
-//     file_count: u64,
-//     disk_usage: u128,
-//     latest_mtime: i64,
-//     users: Vec<String>,
-// }
+#[derive(Encode, Decode, Serialize, Debug)]
+struct AggRowBin {
+    file_count: u64,
+    disk_usage: u128,
+    latest_mtime: i64,
+    users: Vec<String>,
+}
 
-// const AGG: TableDefinition<&str, &[u8]> = TableDefinition::new("agg");
+const AGG: TableDefinition<&str, &[u8]> = TableDefinition::new("agg");
 
 fn main() -> Result<()> {
     let start = std::time::Instant::now();
@@ -74,29 +75,29 @@ fn main() -> Result<()> {
         .output
         .unwrap_or_else(|| PathBuf::from(format!("{}.res.csv", stem)));
     let agg_csv = PathBuf::from(format!("{}.agg.csv", stem));
-    let agg_redb = PathBuf::from(format!("{}.agg.redb", stem));
+    let agg_rdb = PathBuf::from(format!("{}.agg.rdb", stem));
 
     // Fast path: --ls => scan agg.redb and list children
-    // if let Some(dir) = args.ls.as_deref() {
-    //     list_children(&agg_redb, dir)?;
-    //     return Ok(());
-    // }
+    if let Some(dir) = args.ls.as_deref() {
+        list_children(&agg_rdb, dir)?;
+        return Ok(());
+    }
 
-    // // Fast path: --read-agg => open DB, print row, exit
-    // if let Some(key) = args.read_agg.as_deref() {
-    //     match read_one(&agg_redb, key) {
-    //         Ok(Some(row)) => {
-    //             println!("{}", serde_json::to_string_pretty(&row)?);
-    //         }
-    //         Ok(None) => {
-    //             eprintln!("Key not found: {}", key);
-    //         }
-    //         Err(e) => {
-    //             eprintln!("Error reading key {}: {:#}", key, e);
-    //         }
-    //     }
-    //     return Ok(());
-    // }
+    // Fast path: --read-agg => open DB, print row, exit
+    if let Some(key) = args.read_agg.as_deref() {
+        match read_one(&agg_rdb, key) {
+            Ok(Some(row)) => {
+                println!("{}", serde_json::to_string_pretty(&row)?);
+            }
+            Ok(None) => {
+                eprintln!("Key not found: {}", key);
+            }
+            Err(e) => {
+                eprintln!("Error reading key {}: {:#}", key, e);
+            }
+        }
+        return Ok(());
+    }
 
     println!("Resolving file {}", input.display());
 
@@ -167,7 +168,7 @@ fn main() -> Result<()> {
         }
 
         // aggregation - use unquoted path
-        aggregate_folder_stats(&path, disk_b, mtime, &user, &mut agg_data);
+        aggregate_folder_stats(&path, size_b, mtime, &user, &mut agg_data);
 
         let size_gb = bytes_to_gb(size_b);
         let disk_gb = bytes_to_gb(disk_b);
@@ -193,15 +194,15 @@ fn main() -> Result<()> {
     }
 
     wtr.flush().context("flushing output csv")?;
-    println!("Resolved -> {}", output.display());
+    println!("Resolved          -> {}", output.display());
 
     // write agg CSV (current dir)
     write_aggregation_file(&agg_csv.to_string_lossy(), &agg_data, &mut time_cache, local_off)?;
-    println!("Aggregation (csv)  -> {}", agg_csv.display());
+    println!("Aggregation (csv) -> {}", agg_csv.display());
 
     // write agg redb (current dir, redb v3)
-    //save_aggregation_to_redb(&agg_redb, &agg_data)?;
-    //println!("Aggregation (redb) -> {}", agg_redb.display());
+    save_aggregation_to_redb(&agg_rdb, &agg_data)?;
+    println!("Aggregation (rdb) -> {}", agg_rdb.display());
 
     println!("Total resolve time: {:.3} sec.", start.elapsed().as_secs_f64());
     Ok(())
@@ -244,6 +245,7 @@ fn csv_quote_if_needed(s: &str) -> String {
     }
 }
 
+
 fn aggregate_folder_stats(
     path: &str,
     disk: u128,
@@ -251,34 +253,60 @@ fn aggregate_folder_stats(
     user: &str,
     agg_data: &mut HashMap<String, FolderStats>,
 ) {
-    let folder = std::path::Path::new(path)
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| ".".to_string());
+    let folder_path = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
 
-    let parts: Vec<&str> = folder.split('/').filter(|p| !p.is_empty()).collect();
-    let mut key = String::new();
+    // let folder_str = if folder_path.as_os_str().is_empty() {
+    //     ".".to_string()
+    // } else {
+    //     folder_path.to_string_lossy().to_string()
+    // };
 
-    for part in parts {
-        key = if key.is_empty() {
-            format!("/{}", part)
-        } else {
-            format!("{}/{}", key, part)
-        };
+    //println!("Aggregating path: {} -> folder: {}", path, folder_str);
 
-        let stats = agg_data.entry(key.clone()).or_insert_with(FolderStats::new);
-        stats.file_count += 1;
-        stats.disk_usage += disk;
-        stats.latest_mtime = stats.latest_mtime.max(mtime);
-        stats.users.insert(user.to_string());
+    // Build a progressive key path, preserving drive/UNC + root when present.
+    let mut comps = folder_path.components();
+    let mut key_path = PathBuf::new();
+
+    // Handle optional prefix (e.g. "C:" or "\\server\share") and root ("\")
+    if let Some(first) = comps.clone().next() {
+        match first {
+            Component::Prefix(p) => {
+                key_path.push(p.as_os_str());
+                comps.next(); // consume prefix
+                if let Some(Component::RootDir) = comps.clone().next() {
+                    key_path.push(MAIN_SEPARATOR.to_string());
+                    comps.next(); // consume root
+                }
+            }
+            Component::RootDir => {
+                key_path.push(MAIN_SEPARATOR.to_string());
+                comps.next(); // consume root
+            }
+            _ => {}
+        }
+    }
+
+    // For each normal component, extend the path and update stats at that level.
+    for comp in comps {
+        if let Component::Normal(seg) = comp {
+            key_path.push(seg);
+
+            let key = key_path.to_string_lossy().to_string();
+            let stats = agg_data.entry(key).or_insert_with(FolderStats::new);
+            stats.file_count += 1;
+            stats.disk_usage += disk;
+            stats.latest_mtime = stats.latest_mtime.max(mtime);
+            stats.users.insert(user.to_string());
+        }
+        // We intentionally skip CurDir ("." ) and ParentDir ("..") here.
     }
 }
 
 fn write_aggregation_file(
     filename: &str,
     agg_data: &HashMap<String, FolderStats>,
-    time_cache: &mut HashMap<i64, String>,
-    local_off: UtcOffset,
+    _time_cache: &mut HashMap<i64, String>,
+    _local_off: UtcOffset,
 ) -> Result<()> {
     let mut wtr = WriterBuilder::new()
         .has_headers(false)
@@ -306,80 +334,118 @@ fn write_aggregation_file(
     Ok(())
 }
 
-// // -------- redb v3 persistence --------
-// fn save_aggregation_to_redb(db_path: &Path, agg_data: &HashMap<String, FolderStats>) -> Result<()> {
-//     let db = Database::create(db_path)
-//         .with_context(|| format!("opening/creating redb at {}", db_path.display()))?;
-//     let write = db.begin_write().context("begin redb write txn")?;
-//     {
-//         let mut table = write.open_table(AGG).context("open redb table")?;
-//         let cfg = config::standard().with_fixed_int_encoding(); // v2: choose fixed int encoding
+// -------- redb v3 persistence --------
+fn save_aggregation_to_redb(db_path: &Path, agg_data: &HashMap<String, FolderStats>) -> Result<()> {
+    let db = Database::create(db_path)
+        .with_context(|| format!("opening/creating redb at {}", db_path.display()))?;
+    let write = db.begin_write().context("begin redb write txn")?;
+    {
+        let mut table = write.open_table(AGG).context("open redb table")?;
+        let cfg = config::standard().with_fixed_int_encoding(); // v2: choose fixed int encoding
 
-//         for (path, stats) in agg_data {
-//             let row = AggRowBin {
-//                 file_count: stats.file_count,
-//                 disk_usage: stats.disk_usage,
-//                 latest_mtime: stats.latest_mtime,
-//                 users: stats.users.iter().cloned().collect(),
-//             };
-//             let bytes = encode_to_vec(&row, cfg).context("bincode encode")?;
-//             table
-//                 .insert(path.as_str(), bytes.as_slice())
-//                 .with_context(|| format!("redb insert key {}", path))?;
-//         }
-//     }
-//     write.commit().context("commit redb txn")?;
-//     Ok(())
-// }
+        for (path, stats) in agg_data {
+            let row = AggRowBin {
+                file_count: stats.file_count,
+                disk_usage: stats.disk_usage,
+                latest_mtime: stats.latest_mtime,
+                users: stats.users.iter().cloned().collect(),
+            };
+            let bytes = encode_to_vec(&row, cfg).context("bincode encode")?;
+            table
+                .insert(path.as_str(), bytes.as_slice())
+                .with_context(|| format!("redb insert key {}", path))?;
+        }
+    }
+    write.commit().context("commit redb txn")?;
+    Ok(())
+}
 
-// fn list_children(db_path: &Path, dir: &str) -> Result<()> {
-//     let db = Database::open(db_path)?;
-//     let read = db.begin_read()?;
-//     let table = read.open_table(AGG)?;
+fn normalize_seps(s: &str) -> String {
+    if MAIN_SEPARATOR == '/' { s.replace('\\', "/") } else { s.replace('/', "\\") }
+}
 
-//     let mut children = std::collections::BTreeSet::new();
-//     let prefix = if dir == "/" {
-//         "/".to_string()
-//     } else {
-//         format!("{}/", dir.trim_end_matches('/'))
-//     };
+fn ensure_trailing_sep(mut s: String) -> String {
+    if !s.ends_with(MAIN_SEPARATOR) { s.push(MAIN_SEPARATOR); }
+    s
+}
 
-//     for entry in table.range(prefix.as_str()..)? {
-//         let (key_guard, _value) = entry?;
-//         let key = key_guard.value();
-        
-//         // Check prefix match and break when we've passed our target range
-//         if !key.starts_with(&prefix) {
-//             break;
-//         }
-        
-//         let remainder = &key[prefix.len()..];
-//         if let Some(child) = remainder.split('/').next() {
-//             if !child.is_empty() {
-//                 children.insert(child.to_string());
-//             }
-//         }
-//     }
+fn is_root_dir(p: &str) -> bool {
+    use std::path::Component;
+    let mut comps = Path::new(p).components();
+    match comps.next() {
+        Some(Component::Prefix(_)) => matches!(comps.next(), Some(Component::RootDir)) && comps.next().is_none(),
+        Some(Component::RootDir) => comps.next().is_none(),
+        _ => false,
+    }
+}
 
-//     for c in &children {
-//         println!("{c}");
-//     }
-//     Ok(())
-// }
+fn first_segment(s: &str) -> &str {
+    for (i, ch) in s.char_indices() {
+        if ch == '/' || ch == '\\' {
+            return &s[..i];
+        }
+    }
+    s
+}
 
-// fn read_one(db_path: &std::path::Path, key: &str) -> Result<Option<AggRowBin>> {
-//     let db = Database::open(db_path)?;
-//     let read = db.begin_read()?;                      // needs ReadableDatabase in scope
-//     let table = read.open_table(AGG)?;
-//     if let Some(val) = table.get(key)? {
-//         let cfg = bincode::config::standard().with_fixed_int_encoding();
-//         // supply the 2nd generic, or let it be inferred with `_`
-//         let (row, _consumed): (AggRowBin, usize) = decode_from_slice::<AggRowBin, _>(val.value(), cfg)?;
-//         Ok(Some(row))
-//     } else {
-//         Ok(None)
-//     }
-// }
+fn list_children(db_path: &Path, dir: &str) -> Result<()> {
+    let db = Database::open(db_path)?;
+    let read = db.begin_read()?;
+    let table = read.open_table(AGG)?;
+
+    let mut children = std::collections::BTreeSet::new();
+
+    // Normalize the incoming dir to the platform’s separator.
+    let mut dir_norm = normalize_seps(dir.trim());
+    // Accept "C:" as root and turn it into "C:\".
+    if cfg!(windows) && dir_norm.ends_with(':') {
+        dir_norm.push(MAIN_SEPARATOR);
+    }
+
+    // Build the scan prefix (always ending with a separator).
+    let prefix = if is_root_dir(&dir_norm) {
+        ensure_trailing_sep(dir_norm)
+    } else {
+        let trimmed = dir_norm.trim_end_matches(|c| c == '/' || c == '\\').to_string();
+        ensure_trailing_sep(trimmed)
+    };
+
+    for entry in table.range(prefix.as_str()..)? {
+        let (key_guard, _value) = entry?;
+        let key = key_guard.value();
+
+        // Stop once we’ve passed the prefix range.
+        if !key.starts_with(&prefix) {
+            break;
+        }
+
+        let remainder = &key[prefix.len()..];
+        let child = first_segment(remainder);
+        if !child.is_empty() {
+            children.insert(child.to_string());
+        }
+    }
+
+    for c in &children {
+        println!("{c}");
+    }
+    Ok(())
+}
+
+
+fn read_one(db_path: &std::path::Path, key: &str) -> Result<Option<AggRowBin>> {
+    let db = Database::open(db_path)?;
+    let read = db.begin_read()?;                      // needs ReadableDatabase in scope
+    let table = read.open_table(AGG)?;
+    if let Some(val) = table.get(key)? {
+        let cfg = bincode::config::standard().with_fixed_int_encoding();
+        // supply the 2nd generic, or let it be inferred with `_`
+        let (row, _consumed): (AggRowBin, usize) = decode_from_slice::<AggRowBin, _>(val.value(), cfg)?;
+        Ok(Some(row))
+    } else {
+        Ok(None)
+    }
+}
 
 // ---------- helpers ----------
 fn parse_i64(s: Option<&str>, field: &str, line: usize) -> Result<i64> {
@@ -477,10 +543,14 @@ fn get_groupname_from_gid(gid: u32) -> String {
 }
 
 #[cfg(not(unix))]
-fn get_username_from_uid(uid: u32) -> String { uid.to_string() }
+fn get_username_from_uid(uid: u32) -> String { 
+    uid.to_string() 
+}
 
 #[cfg(not(unix))]
-fn get_groupname_from_gid(gid: u32) -> String { gid.to_string() }
+fn get_groupname_from_gid(gid: u32) -> String { 
+    gid.to_string() 
+}
 
 fn filetype_from_mode(mode: u32, cache: &mut HashMap<u32, String>) -> String {
     if let Some(t) = cache.get(&mode) {
