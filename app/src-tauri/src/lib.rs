@@ -14,7 +14,6 @@ use std::io::{self, BufRead, BufReader};
 #[cfg(unix)]
 use std::ffi::CStr;
 
-
 #[cfg(unix)]
 fn get_username_from_uid(uid: u32) -> String {
     unsafe {
@@ -33,33 +32,37 @@ fn get_username_from_uid(uid: u32) -> String {
     }
 }
 
+#[cfg(unix)]
 fn resolve_usernames(all_users: &HashSet<i32>) -> HashMap<i32, String> {
     let mut uid_name_map = HashMap::new();
-
     for &uid in all_users {
-        // Convert i32 → u32, skip negatives
         if uid < 0 {
             continue;
         }
         let uname = get_username_from_uid(uid as u32);
         uid_name_map.insert(uid, uname);
     }
-
     uid_name_map
 }
 
+#[cfg(not(unix))]
+fn resolve_usernames(all_users: &HashSet<i32>) -> HashMap<i32, String> {
+    let mut uid_name_map = HashMap::new();
+    for &uid in all_users {
+        uid_name_map.insert(uid, "UNK".to_string());
+    }
+    uid_name_map
+}
 
 fn count_lines<P: AsRef<Path>>(path: P) -> io::Result<usize> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
-    // Count by iterating over lines
     let mut count = 0;
     for line in reader.lines() {
-        line?; // consume error if any
+        line?;
         count += 1;
     }
-
     Ok(count)
 }
 
@@ -91,6 +94,14 @@ struct AggRowBin {
     disk_usage: u128,
     latest_mtime: i64,
     users: HashSet<i32>,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+struct UserStats {
+    file_count: u64,
+    file_size: u128,
+    disk_usage: u128,
+    latest_mtime: i64,
 }
 
 // ----- JSON output types -----
@@ -143,6 +154,8 @@ impl TrieNode {
 pub struct InMemoryFSIndex {
     root: TrieNode,
     total_entries: usize,
+    // exact per-(path, uid) data for fast user filtering
+    per_user: HashMap<(String, i32), UserStats>,
 }
 
 impl InMemoryFSIndex {
@@ -150,13 +163,17 @@ impl InMemoryFSIndex {
         Self {
             root: TrieNode::new(),
             total_entries: 0,
+            per_user: HashMap::new(),
         }
     }
 
+    /// Loads normalized CSV with columns:
+    /// 0:path, 1:uid, 2:file_count, 3:file_size, 4:disk_usage, 5:latest_mtime
+    /// Merges rows per path (sum counts/sizes, max mtime, union users).
     pub fn load_from_csv(&mut self, path: &Path, app: AppHandle) -> AResult<HashMap<i32, String>> {
         let total = count_lines(&path)?;
         app.emit("progress", Progress{current: 0, total})?;
-    
+
         println!("Loading filesystem index from CSV: {}", path.display());
         let start = std::time::Instant::now();
 
@@ -167,57 +184,57 @@ impl InMemoryFSIndex {
 
         let mut all_users: HashSet<i32> = HashSet::new();
         let mut loaded_count = 0;
-        
+
         for (line_no, record) in rdr.records().enumerate() {
             let record = record.with_context(|| format!("Failed to read CSV line {}", line_no + 1))?;
 
-            // We access indices 0..=5 → need at least 6 fields
             if record.len() < 6 {
                 eprintln!("Warning: Skipping line {} - not enough fields", line_no + 1);
                 continue;
             }
 
-            // CSV: path,file_count,file_size,disk_usage,latest_mtime,users_pipe_separated
-            let path = unquote_csv_field(record.get(0).unwrap_or(""));
-            let file_count: u64 = record.get(1).unwrap_or("0").parse().unwrap_or(0);
-            let file_size: u128 = record.get(2).unwrap_or("0").parse().unwrap_or(0);
-            let disk_usage: u128 = record.get(3).unwrap_or("0").parse().unwrap_or(0);
-            let latest_mtime: i64 = record.get(4).unwrap_or("0").parse().unwrap_or(0);
-            let users_str = record.get(5).unwrap_or("");
+            // CSV: path,uid,file_count,file_size,disk_usage,latest_mtime
+            let path_str = unquote_csv_field(record.get(0).unwrap_or(""));
+            let uid: i32 = record.get(1).unwrap_or("0").parse().unwrap_or(0);
+            let file_count: u64 = record.get(2).unwrap_or("0").parse().unwrap_or(0);
+            let file_size: u128 = record.get(3).unwrap_or("0").parse().unwrap_or(0);
+            let disk_usage: u128 = record.get(4).unwrap_or("0").parse().unwrap_or(0);
+            let latest_mtime: i64 = record.get(5).unwrap_or("0").parse().unwrap_or(0);
 
-            let users: HashSet<i32> = users_str
-                .split('|')
-                .filter_map(|s| s.trim().parse::<i32>().ok())
-                .collect();
-                    
-            all_users.extend(&users);
-            
-            let agg_row = AggRowBin {
+            all_users.insert(uid);
+
+            // 1) Merge into trie totals for this path (across users)
+            self.insert_merge(
+                &path_str,
                 file_count,
                 file_size,
                 disk_usage,
                 latest_mtime,
-                users,
-            };
+                uid,
+            );
 
-            self.insert(&path, agg_row);
+            // 2) Record exact per-user stats for this path
+            let key = (Self::normalize_path(&path_str), uid);
+            let entry = self.per_user.entry(key).or_insert(UserStats {
+                file_count: 0, file_size: 0, disk_usage: 0, latest_mtime: 0
+            });
+            entry.file_count = entry.file_count.saturating_add(file_count);
+            entry.file_size  = entry.file_size.saturating_add(file_size);
+            entry.disk_usage = entry.disk_usage.saturating_add(disk_usage);
+            if latest_mtime > entry.latest_mtime { entry.latest_mtime = latest_mtime; }
+
             loaded_count += 1;
-
-            if loaded_count % 10_000 == 0 {
+            if loaded_count % 100_000 == 0 {
                 app.emit("progress", Progress{current: loaded_count, total})?;
             }
         }
-        println!("Unique users: {:?}", all_users);
-        let uid_name_map = resolve_usernames(&all_users);
 
-        for (uid, uname) in &uid_name_map {
-            println!("uid: {}, username: {}", uid, uname);
-        }
+        let uid_name_map = resolve_usernames(&all_users);
 
         self.total_entries = loaded_count;
         let elapsed = start.elapsed();
         println!(
-            "Loaded {} entries in {:.2}s ({:.0} entries/sec)",
+            "Loaded {} rows in {:.2}s ({:.0} rows/sec)",
             loaded_count,
             elapsed.as_secs_f64(),
             loaded_count as f64 / elapsed.as_secs_f64()
@@ -225,7 +242,16 @@ impl InMemoryFSIndex {
         Ok(uid_name_map)
     }
 
-    pub fn insert(&mut self, path: &str, data: AggRowBin) {
+    /// Insert-or-merge a normalized row into the trie.
+    fn insert_merge(
+        &mut self,
+        path: &str,
+        file_count: u64,
+        file_size: u128,
+        disk_usage: u128,
+        latest_mtime: i64,
+        uid: i32,
+    ) {
         let components = Self::path_to_components(path);
         let mut current = &mut self.root;
         for component in components {
@@ -233,7 +259,29 @@ impl InMemoryFSIndex {
                 .entry(component)
                 .or_insert_with(|| Box::new(TrieNode::new()));
         }
-        current.data = Some(data);
+
+        match &mut current.data {
+            Some(data) => {
+                data.file_count = data.file_count.saturating_add(file_count);
+                data.file_size  = data.file_size.saturating_add(file_size);
+                data.disk_usage = data.disk_usage.saturating_add(disk_usage);
+                if latest_mtime > data.latest_mtime {
+                    data.latest_mtime = latest_mtime;
+                }
+                data.users.insert(uid);
+            }
+            None => {
+                let mut users = HashSet::new();
+                users.insert(uid);
+                current.data = Some(AggRowBin {
+                    file_count,
+                    file_size,
+                    disk_usage,
+                    latest_mtime,
+                    users,
+                });
+            }
+        }
     }
 
     pub fn get(&self, path: &str) -> Option<&AggRowBin> {
@@ -270,6 +318,51 @@ impl InMemoryFSIndex {
                 item.path = full_path;
                 items.push(item);
             }
+        }
+
+        items.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(items)
+    }
+
+    /// Like list_children, but returns stats **only for a single user** (uid).
+    pub fn list_children_for_user(&self, dir_path: &str, uid: i32) -> AResult<Vec<FileItem>> {
+        let components = Self::path_to_components(dir_path);
+        let mut current = &self.root;
+
+        for component in components {
+            current = current.children.get(&component)
+                .ok_or_else(|| anyhow::anyhow!("Directory not found: {}", dir_path))?
+                .as_ref();
+        }
+
+        let mut items = Vec::new();
+        let base_path = Self::normalize_path(dir_path);
+
+        for (child_name, child_node) in &current.children {
+            // Build full child path
+            let full_path = if base_path.is_empty() || base_path == "/" {
+                format!("/{}", child_name)
+            } else {
+                format!("{}/{}", base_path.trim_end_matches('/'), child_name)
+            };
+
+            // Lookup exact per-user stats for that path
+            let key = (Self::normalize_path(&full_path), uid);
+            if let Some(stats) = self.per_user.get(&key) {
+                // Fill FileItem using per-user stats; set users = {uid}
+                let mut users = HashSet::new();
+                users.insert(uid);
+
+                items.push(FileItem {
+                    path: full_path,
+                    count: stats.file_count,
+                    size: stats.file_size,
+                    disk: stats.disk_usage,
+                    modified: stats.latest_mtime,
+                    users,
+                });
+            }
+            // If user has no data for that child path, we skip it (no row).
         }
 
         items.sort_by(|a, b| a.path.cmp(&b.path));
@@ -362,6 +455,21 @@ async fn get_files_memory(path: String) -> Result<String, String> {
         Ok(items) => serde_json::to_string(&items).map_err(|e| format!("JSON serialization error: {}", e)),
         Err(e) => {
             eprintln!("Error listing children for '{}': {:?}", path, e);
+            Ok("[]".to_string())
+        }
+    }
+}
+
+/// Same as get_files_memory, but filtered by a specific user (uid).
+#[tauri::command]
+async fn get_files_memory_user(path: String, uid: i32) -> Result<String, String> {
+    let index = get_fs_index().map_err(|e| format!("Index not available: {}", e))?;
+    let index = index.read().map_err(|e| format!("Failed to read index: {}", e))?;
+
+    match index.list_children_for_user(&path, uid) {
+        Ok(items) => serde_json::to_string(&items).map_err(|e| format!("JSON serialization error: {}", e)),
+        Err(e) => {
+            eprintln!("Error listing children for '{}', uid {}: {:?}", path, uid, e);
             Ok("[]".to_string())
         }
     }
@@ -557,6 +665,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_files,
             get_files_memory,
+            get_files_memory_user, 
             get_file_info_memory,
             search_prefix_memory,
             load_db,
@@ -564,4 +673,3 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-

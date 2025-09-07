@@ -92,8 +92,14 @@
   const fetchFiles = createDoItAgain(async (p: string) => {
     loading = true;
     try {
-      const raw: string = await invoke("get_files_memory", { path: p });
-      files = JSON.parse(raw);               // keep raw; we sort in derived
+      let data = ''
+      if (selectedUser > -1) {
+        data = await invoke<string>("get_files_memory_user", { path: p, uid: Number(selectedUser) });
+      } else {
+        data = await invoke<string>("get_files_memory", { path: p });
+      }
+      console.log(data)
+      files = JSON.parse(data)
     } finally {
       loading = false;
     }
@@ -113,8 +119,7 @@
   function goBack() { if (histIdx > 0) { histIdx -= 1; path = history[histIdx]; fetchFiles(path); } }
   function goForward() { if (histIdx < history.length - 1) { histIdx += 1; path = history[histIdx]; fetchFiles(path); } }
   function onPathKeydown(e: KeyboardEvent) { if (e.key === "Enter") navigateTo(path); }
-
-  onMount(async () => { 
+  async function scan() { 
     let db = "/Users/san/dev/statwalker/rs/mac.agg.csv"
     try{
       initializing = true
@@ -124,13 +129,27 @@
     } catch(e) {
       console.log(e)
     }
-    fetchFiles(path); 
+    fetchFiles(path);   
+  }
+  
+
+  onMount(async () => { 
+    // let db = "/Users/san/dev/statwalker/rs/mac.agg.csv"
+    // try{
+    //   initializing = true
+    //   users = await invoke("load_db", { path: db });
+    //   console.log(users)
+    //   initializing = false
+    // } catch(e) {
+    //   console.log(e)
+    // }
+    // fetchFiles(path); 
   })
 
 </script>
 
 
-<div class="flex flex-col h-screen min-h-0 gap-2">
+<div class="flex flex-col h-screen min-h-0 gap-2 p-2">
   <div class="flex gap-2 items-center relative">
     <button class="btn" onclick={goBack} disabled={histIdx === 0}>
       <span class="material-symbols-outlined">arrow_back_ios</span>
@@ -173,22 +192,25 @@
         </div>
       {/if}
     </div>
-    <select bind:value={selectedUser}>
+    <select bind:value={selectedUser} onchange={refresh}>
       <option value={-1}>All Users</option>
       {#each Object.entries(users) as [uid, username]}
       <option value={uid}>{username}</option>
       {/each}
-    </select>
-
-    <input
+    </select>    
+    <button class="btn" onclick={scan}>
+      <div class="flex items-center gap-2">
+        <span class="material-symbols-outlined">scan</span>
+      </div>
+    </button>
+  </div>
+  <input
       bind:value={path}
       placeholder="Path..."
       class="grow"
       onkeydown={onPathKeydown}
       aria-busy={loading}
     />
-  </div>
-
   {#if initializing}
     <div class="flex flex-col w-full h-full items-center justify-between font-mono">
       <div class="w-full bg-gray-700 rounded-full h-1">
@@ -215,7 +237,7 @@
     </div>
   {:else if loading}
     <!-- Skeleton Loader (UI stays interactive) -->
-    <div class="flex flex-col gap-2 overflow-y-auto p-4">
+    <div class="flex flex-col gap-2 overflow-y-auto">
       {#each Array(6) as _, i}
         <div class="relative p-3 bg-gray-800 border border-gray-600 rounded-lg animate-pulse min-h-16 h-16">
           <div class="flex items-center justify-between gap-4">
