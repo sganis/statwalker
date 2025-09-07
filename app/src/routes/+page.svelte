@@ -15,6 +15,24 @@
   let maxSize = $derived(files?.length ? Math.max(...files.map(i => i.disk || 0)) : 1);
   const pct = (n: number) => Math.max(0, Math.min(100, Math.round((+n / maxSize) * 1000) / 10));
 
+  // ---- sorting ----
+  type SortKey = "disk" | "size" | "count";
+  let sortBy = $state<SortKey>("disk");
+  let sortDir = $state<"asc" | "desc">("desc");
+  let sortOpen = $state(false);
+
+  const sortedFiles = $derived.by(() => {
+    const arr = files ? [...files] : [];
+    const key: SortKey = sortBy;
+    let sf = arr.sort((a: any, b: any) => {
+      const av = Number(a?.[key] ?? 0);
+      const bv = Number(b?.[key] ?? 0);
+      return (av - bv) * -1; // always desc
+    })
+    console.log("Sorted files", sf);
+    return sf;
+  });
+
   // -------- Single-flight "do-it-again" ----------
   function createDoItAgain<T extends any[]>(fn: (...args: T) => Promise<void>) {
     let running = false;
@@ -96,24 +114,58 @@
     if (e.key === "Enter") navigateTo(path);
   }
 
+  // ---- sort UI helpers ----
+  function chooseSort(key: SortKey) {
+    sortBy = key;
+    sortOpen = false;
+  }
+
+  // right-side formatter based on current sort
+  function rightValue(file: any) {
+    switch (sortBy) {
+      case "disk": return formatBytes(Number(file?.disk ?? 0));
+      case "size": return formatBytes(Number(file?.size ?? 0));
+      case "count": return (Number(file?.count ?? 0)).toLocaleString();
+    }
+  }
+
   onMount(() => {
     fetchFiles(path); // initial load
   });
 </script>
 
 <div class="flex flex-col h-screen min-h-0 gap-2">
-  <div class="flex gap-2 items-center">
-    <button on:click={goBack} title="Back">◀ Back</button>
-    <button on:click={goForward} title="Forward">Forward ▶</button>
-    <button on:click={goUp} title="Up">Up</button>
-    <button on:click={refresh} title="Refresh">Refresh</button>
+  <div class="flex gap-2 items-center relative">
+    <button on:click={goBack} disabled={histIdx === 0}>◀ Back</button>
+    <button on:click={goForward} disabled={histIdx >= history.length - 1}>Forward ▶</button>
+    <button on:click={goUp} disabled={getParent(path) === path}>Up</button>
+    <button on:click={refresh}>Refresh</button>
+
+    <!-- Sort dropdown -->
+    <div class="relative">
+      <button on:click={() => (sortOpen = !sortOpen)}>
+        Sort: {sortBy.toUpperCase()} ▾
+      </button>
+      {#if sortOpen}
+        <div class="absolute mt-1 w-40 rounded-md border border-gray-600 bg-gray-800 shadow-lg z-20">
+          <button class="block w-full text-left px-3 py-2 hover:bg-gray-700" on:click={() => chooseSort("disk")}>
+            Disk
+          </button>
+          <button class="block w-full text-left px-3 py-2 hover:bg-gray-700" on:click={() => chooseSort("size")}>
+            Size
+          </button>
+          <button class="block w-full text-left px-3 py-2 hover:bg-gray-700" on:click={() => chooseSort("count")}>
+            Files
+          </button>
+        </div>
+      {/if}
+    </div>
     <input
       bind:value={path}
       placeholder="Path..."
       class="grow"
       on:keydown={onPathKeydown}
       aria-busy={loading}
-      title="Type a path and press Enter"
     />
   </div>
 
@@ -136,7 +188,7 @@
     </div>
   {:else}
     <div class="flex flex-col gap-2 overflow-y-auto transition-opacity duration-200 p-4">
-      {#each files as file}
+      {#each sortedFiles as file}
         <div
           class="relative p-3 cursor-pointer hover:opacity-95 bg-gray-700 border border-gray-600 rounded-lg overflow-hidden min-h-16 h-16"
           on:click={() => navigateTo(file.path)}
@@ -146,11 +198,12 @@
           <div class="relative z-10">
             <div class="flex items-center justify-between gap-4">
               <p class="font-medium truncate text-white">{file.path}</p>
-              <span class="text-xs text-gray-300 tabular-nums">{formatBytes(file.disk)}</span>
+              <span class="text-xs text-gray-300 tabular-nums">{rightValue(file)}</span>
             </div>
             <p class="text-xs text-gray-300 mt-1">
-              Files: {file.count} • Size: {file.disk.toLocaleString()} bytes •
-              Modified: {new Date(file.modified * 1000).toLocaleString()}
+              Files: {file.count} • 
+              Disk Usage: {formatBytes(file.disk)} •
+              Last Modified: {new Date(file.modified * 1000).toLocaleString()}
             </p>
           </div>
         </div>
