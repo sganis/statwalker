@@ -1,11 +1,30 @@
-use anyhow::{Context, Result};
-use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
+use anyhow::{Context, Result as AResult};
+use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 use redb::{Database, TableDefinition, ReadableDatabase};
-use bincode::{config, decode_from_slice, encode_to_vec, Decode, Encode};
+use bincode::{decode_from_slice, Decode, Encode};
 use serde::Serialize;
 use std::collections::{HashSet, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock, OnceLock};
 use csv::ReaderBuilder;
+use tauri::{AppHandle, Emitter};
+
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
+
+
+fn count_lines<P: AsRef<Path>>(path: P) -> io::Result<usize> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    // Count by iterating over lines
+    let mut count = 0;
+    for line in reader.lines() {
+        line?; // consume error if any
+        count += 1;
+    }
+
+    Ok(count)
+}
 
 #[derive(Debug, Clone)]
 struct FolderStats {
@@ -62,12 +81,15 @@ impl From<AggRowBin> for FileItem {
 }
 
 // ----- IN-MEMORY TRIE IMPLEMENTATION -----
+#[derive(Clone, Serialize)]
+struct Progress {
+  current: usize,
+  total: usize,
+}
 
 #[derive(Debug, Clone)]
 struct TrieNode {
-    // Children map: path component -> child node
     children: HashMap<String, Box<TrieNode>>,
-    // Data for this exact path (if it exists in the aggregation)
     data: Option<AggRowBin>,
 }
 
@@ -94,25 +116,29 @@ impl InMemoryFSIndex {
         }
     }
 
-    pub fn load_from_csv(&mut self, csv_path: &Path) -> Result<()> {
-        println!("Loading filesystem index from CSV: {}", csv_path.display());
+    pub fn load_from_csv(&mut self, path: &Path, app: AppHandle) -> AResult<()> {
+        let total = count_lines(&path)?;
+        app.emit("progress", Progress{current: 0, total})?;
+    
+        println!("Loading filesystem index from CSV: {}", path.display());
         let start = std::time::Instant::now();
 
         let mut rdr = ReaderBuilder::new()
-            .has_headers(false)  // Your CSV format doesn't seem to have headers
-            .from_path(csv_path)
-            .with_context(|| format!("Failed to open CSV file: {}", csv_path.display()))?;
+            .has_headers(false)
+            .from_path(path)
+            .with_context(|| format!("Failed to open CSV file: {}", path.display()))?;
 
         let mut loaded_count = 0;
         for (line_no, record) in rdr.records().enumerate() {
             let record = record.with_context(|| format!("Failed to read CSV line {}", line_no + 1))?;
-            
-            if record.len() < 5 {
+
+            // We access indices 0..=5 → need at least 6 fields
+            if record.len() < 6 {
                 eprintln!("Warning: Skipping line {} - not enough fields", line_no + 1);
                 continue;
             }
 
-            // Parse CSV format: path,file_count,disk_usage,latest_mtime,users_pipe_separated
+            // CSV: path,file_count,file_size,disk_usage,latest_mtime,users_pipe_separated
             let path = unquote_csv_field(record.get(0).unwrap_or(""));
             let file_count: u64 = record.get(1).unwrap_or("0").parse().unwrap_or(0);
             let file_size: u128 = record.get(2).unwrap_or("0").parse().unwrap_or(0);
@@ -128,7 +154,7 @@ impl InMemoryFSIndex {
 
             let agg_row = AggRowBin {
                 file_count,
-                file_size, 
+                file_size,
                 disk_usage,
                 latest_mtime,
                 users,
@@ -137,55 +163,52 @@ impl InMemoryFSIndex {
             self.insert(&path, agg_row);
             loaded_count += 1;
 
-            if loaded_count % 100000 == 0 {
-                println!("Loaded {} entries...", loaded_count);
+            if loaded_count % 10_000 == 0 {
+                app.emit("progress", Progress{current: loaded_count, total})?;
             }
         }
 
         self.total_entries = loaded_count;
         let elapsed = start.elapsed();
-        println!("Loaded {} entries in {:.2}s ({:.0} entries/sec)", 
-                loaded_count, elapsed.as_secs_f64(), loaded_count as f64 / elapsed.as_secs_f64());
+        println!(
+            "Loaded {} entries in {:.2}s ({:.0} entries/sec)",
+            loaded_count,
+            elapsed.as_secs_f64(),
+            loaded_count as f64 / elapsed.as_secs_f64()
+        );
         Ok(())
     }
 
     pub fn insert(&mut self, path: &str, data: AggRowBin) {
         let components = Self::path_to_components(path);
         let mut current = &mut self.root;
-
-        // Navigate/create path in trie
         for component in components {
             current = current.children
                 .entry(component)
                 .or_insert_with(|| Box::new(TrieNode::new()));
         }
-
         current.data = Some(data);
     }
 
     pub fn get(&self, path: &str) -> Option<&AggRowBin> {
         let components = Self::path_to_components(path);
         let mut current = &self.root;
-
         for component in components {
             current = current.children.get(&component)?.as_ref();
         }
-
         current.data.as_ref()
     }
 
-    pub fn list_children(&self, dir_path: &str) -> Result<Vec<FileItem>> {
+    pub fn list_children(&self, dir_path: &str) -> AResult<Vec<FileItem>> {
         let components = Self::path_to_components(dir_path);
         let mut current = &self.root;
 
-        // Navigate to the directory node
         for component in components {
             current = current.children.get(&component)
                 .ok_or_else(|| anyhow::anyhow!("Directory not found: {}", dir_path))?
                 .as_ref();
         }
 
-        // Collect immediate children
         let mut items = Vec::new();
         let base_path = Self::normalize_path(dir_path);
 
@@ -203,41 +226,35 @@ impl InMemoryFSIndex {
             }
         }
 
-        // Sort by path for consistent ordering
         items.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(items)
     }
 
-    // Get all descendants with a given prefix (recursive directory listing)
-    pub fn get_all_with_prefix(&self, prefix: &str) -> Result<Vec<FileItem>> {
+    pub fn get_all_with_prefix(&self, prefix: &str) -> AResult<Vec<FileItem>> {
         let components = Self::path_to_components(prefix);
         let mut current = &self.root;
 
-        // Navigate to the prefix node
         for component in components {
             current = current.children.get(&component)
                 .ok_or_else(|| anyhow::anyhow!("Path not found: {}", prefix))?
                 .as_ref();
         }
 
-        // Recursively collect all descendants
         let mut items = Vec::new();
         let base_path = Self::normalize_path(prefix);
         self.collect_all_descendants(current, &base_path, &mut items);
-        
+
         items.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(items)
     }
 
     fn collect_all_descendants(&self, node: &TrieNode, current_path: &str, items: &mut Vec<FileItem>) {
-        // If this node has data, add it
         if let Some(data) = &node.data {
             let mut item: FileItem = data.clone().into();
             item.path = current_path.to_string();
             items.push(item);
         }
 
-        // Recurse through children
         for (child_name, child_node) in &node.children {
             let child_path = if current_path.is_empty() || current_path == "/" {
                 format!("/{}", child_name)
@@ -258,10 +275,7 @@ impl InMemoryFSIndex {
     }
 
     fn normalize_path(path: &str) -> String {
-        // Normalize path separators to forward slashes for consistent handling
         let mut normalized = path.replace('\\', "/");
-        
-        // Handle Windows drive letters (e.g., "C:" -> "/C")
         if cfg!(windows) && normalized.len() >= 2 && normalized.chars().nth(1) == Some(':') {
             if !normalized.starts_with('/') {
                 normalized = format!("/{}", normalized);
@@ -269,7 +283,6 @@ impl InMemoryFSIndex {
         } else if !normalized.starts_with('/') && !normalized.is_empty() {
             normalized = format!("/{}", normalized);
         }
-        
         normalized
     }
 
@@ -286,18 +299,7 @@ impl InMemoryFSIndex {
 // Global instance - loaded once at startup
 static FS_INDEX: OnceLock<Arc<RwLock<InMemoryFSIndex>>> = OnceLock::new();
 
-pub fn initialize_fs_index(csv_path: &Path) -> Result<()> {
-    let mut index = InMemoryFSIndex::new();
-    index.load_from_csv(csv_path)?;
-    let (entries, nodes) = index.stats();
-    println!("Index initialized: {} entries, {} trie nodes", entries, nodes);
-    
-    FS_INDEX.set(Arc::new(RwLock::new(index)))
-        .map_err(|_| anyhow::anyhow!("Failed to initialize global FS index"))?;
-    Ok(())
-}
-
-pub fn get_fs_index() -> Result<Arc<RwLock<InMemoryFSIndex>>> {
+pub fn get_fs_index() -> AResult<Arc<RwLock<InMemoryFSIndex>>> {
     FS_INDEX.get()
         .ok_or_else(|| anyhow::anyhow!("FS index not initialized"))
         .map(|arc| arc.clone())
@@ -309,14 +311,12 @@ pub fn get_fs_index() -> Result<Arc<RwLock<InMemoryFSIndex>>> {
 async fn get_files_memory(path: String) -> Result<String, String> {
     let index = get_fs_index().map_err(|e| format!("Index not available: {}", e))?;
     let index = index.read().map_err(|e| format!("Failed to read index: {}", e))?;
-    
+
     match index.list_children(&path) {
-        Ok(items) => {
-            serde_json::to_string(&items).map_err(|e| format!("JSON serialization error: {}", e))
-        },
+        Ok(items) => serde_json::to_string(&items).map_err(|e| format!("JSON serialization error: {}", e)),
         Err(e) => {
             eprintln!("Error listing children for '{}': {:?}", path, e);
-            Ok("[]".to_string()) // Return empty array instead of error
+            Ok("[]".to_string())
         }
     }
 }
@@ -325,7 +325,7 @@ async fn get_files_memory(path: String) -> Result<String, String> {
 async fn get_file_info_memory(path: String) -> Result<String, String> {
     let index = get_fs_index().map_err(|e| format!("Index not available: {}", e))?;
     let index = index.read().map_err(|e| format!("Failed to read index: {}", e))?;
-    
+
     match index.get(&path) {
         Some(data) => {
             let mut item: FileItem = data.clone().into();
@@ -340,11 +340,9 @@ async fn get_file_info_memory(path: String) -> Result<String, String> {
 async fn search_prefix_memory(prefix: String) -> Result<String, String> {
     let index = get_fs_index().map_err(|e| format!("Index not available: {}", e))?;
     let index = index.read().map_err(|e| format!("Failed to read index: {}", e))?;
-    
+
     match index.get_all_with_prefix(&prefix) {
-        Ok(items) => {
-            serde_json::to_string(&items).map_err(|e| format!("JSON serialization error: {}", e))
-        },
+        Ok(items) => serde_json::to_string(&items).map_err(|e| format!("JSON serialization error: {}", e)),
         Err(e) => {
             eprintln!("Error searching prefix '{}': {:?}", prefix, e);
             Ok("[]".to_string())
@@ -352,14 +350,28 @@ async fn search_prefix_memory(prefix: String) -> Result<String, String> {
     }
 }
 
-// ----- EXISTING REDB FUNCTIONS (unchanged) -----
+#[tauri::command]
+async fn load_db(app: AppHandle, path: String) -> Result<String, String> {
+    let mut index = InMemoryFSIndex::new();
+    let path = Path::new(&path);
+    index.load_from_csv(path, app).map_err(|e| e.to_string())?;
+    let (entries, nodes) = index.stats();
+    println!("Index initialized: {} entries, {} trie nodes", entries, nodes);
+
+    FS_INDEX
+        .set(Arc::new(RwLock::new(index)))
+        .map_err(|_| "Failed to initialize global FS index".to_string())?;
+    Ok("OK".to_string())
+}
+
+// ----- EXISTING REDB FUNCTIONS -----
 
 const AGG: TableDefinition<&str, &[u8]> = TableDefinition::new("agg");
 
 #[tauri::command]
 async fn get_files(path: String) -> Result<String, String> {
     let db_path = PathBuf::from("/Users/san/dev/statwalker/rs/mac.agg.rdb");
-    let json = match list_children(&db_path, &path) {
+    let json = match list_children_db(&db_path, &path) {
         Ok(json) => json,
         Err(e) => {
             eprintln!("Error listing children for '{}': {:?}", path, e);
@@ -369,13 +381,10 @@ async fn get_files(path: String) -> Result<String, String> {
     Ok(json)
 }
 
-// ----- UTILITY FUNCTIONS -----
-
 fn unquote_csv_field(field: &str) -> String {
     let trimmed = field.trim();
-    
     if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        let inner = &trimmed[1..trimmed.len()-1];
+        let inner = &trimmed[1..trimmed.len() - 1];
         inner.replace("\"\"", "\"")
     } else {
         trimmed.to_string()
@@ -410,7 +419,7 @@ fn first_segment(s: &str) -> &str {
     s
 }
 
-fn read_one(db_path: &Path, key: &str) -> Result<Option<AggRowBin>> {
+fn read_one(db_path: &Path, key: &str) -> AResult<Option<AggRowBin>> {
     let db = Database::open(db_path)?;
     let read = db.begin_read()?;
     let table = read.open_table(AGG)?;
@@ -423,7 +432,7 @@ fn read_one(db_path: &Path, key: &str) -> Result<Option<AggRowBin>> {
     }
 }
 
-fn list_children(db_path: &Path, dir: &str) -> Result<String> {
+fn list_children_db(db_path: &Path, dir: &str) -> AResult<String> {
     let db = Database::open(db_path)?;
     let read = db.begin_read()?;
     let table = read.open_table(AGG)?;
@@ -497,14 +506,6 @@ fn list_children(db_path: &Path, dir: &str) -> Result<String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize the filesystem index at startup
-    let csv_path = PathBuf::from("/Users/san/dev/statwalker/rs/mac.agg.csv");
-    
-    if let Err(e) = initialize_fs_index(&csv_path) {
-        eprintln!("Failed to initialize filesystem index: {}", e);
-        eprintln!("Memory-based commands will not be available");
-    }
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -512,7 +513,9 @@ pub fn run() {
             get_files_memory,
             get_file_info_memory,
             search_prefix_memory,
+            load_db,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+

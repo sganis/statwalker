@@ -3,15 +3,29 @@
   import { onMount } from "svelte";
   import { getParent, formatBytes } from "../js/util";
 
+  import { listen } from '@tauri-apps/api/event';
+
+  type Progress = {
+    current: number;
+    total: number;
+  };
+
+  listen<Progress>('progress', (event) => {
+    progress_current = event.payload.current
+    progress_total = event.payload.total
+    if (progress_total > 0)
+      progress_percent = Math.round(progress_current/progress_total * 100)
+  })
+
   let path = $state("/");
   let files = $state<any[]>([]);
   let loading = $state(false);
-
-  // History
+  let initializing = $state(true)
+  let progress_current = $state(0)
+  let progress_total = $state(0)
+  let progress_percent = $state(0)
   let history = $state<string[]>([path]);
   let histIdx = $state(0);
-
-  // --- Sorting (declare BEFORE maxMetric) ---
   type SortKey = "disk" | "size" | "count";
   let sortBy = $state<SortKey>("disk");
   let sortOpen = $state(false);
@@ -98,7 +112,18 @@
   function goForward() { if (histIdx < history.length - 1) { histIdx += 1; path = history[histIdx]; fetchFiles(path); } }
   function onPathKeydown(e: KeyboardEvent) { if (e.key === "Enter") navigateTo(path); }
 
-  onMount(() => { fetchFiles(path); });
+  onMount(async () => { 
+    let db = "/Users/san/dev/statwalker/rs/mac.agg.csv"
+    try{
+      initializing = true
+      await invoke("load_db", { path: db });
+      initializing = false
+    } catch(e) {
+      console.log(e)
+    }
+    fetchFiles(path); 
+  })
+
 </script>
 
 
@@ -137,7 +162,31 @@
     />
   </div>
 
-  {#if loading}
+  {#if initializing}
+    <div class="flex flex-col w-full h-full items-center justify-between font-mono">
+      <div class="w-full bg-gray-700 rounded-full h-1">
+        <div 
+          class="bg-orange-500 h-1 rounded-full transition-all duration-300"
+          style="width: {progress_percent}%">
+        </div>        
+      </div>
+      <div class="flex flex-col justify-center grow  items-center w-64">
+          <div class="flex w-full justify-between">
+            <div class="">Progress:</div>
+            <div class="">{progress_percent}%</div>
+          </div>   
+          <div class="flex w-full justify-between">
+            <div class="">Loaded files:</div>
+            <div class="">{progress_current}</div>
+          </div>   
+          <div class="flex w-full justify-between">
+            <div class="">Total:</div>
+            <div class="">{progress_total}</div>
+          </div>   
+      
+        </div>
+    </div>
+  {:else if loading}
     <!-- Skeleton Loader (UI stays interactive) -->
     <div class="flex flex-col gap-2 overflow-y-auto p-4">
       {#each Array(6) as _, i}

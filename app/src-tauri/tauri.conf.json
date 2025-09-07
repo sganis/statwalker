@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "app",
+  "productName": "statwalker",
   "version": "0.1.0",
   "identifier": "com.statwalker.app",
   "build": {
@@ -12,9 +12,9 @@
   "app": {
     "windows": [
       {
-        "title": "app",
-        "width": 800,
-        "height": 600
+        "title": "Statwalker",
+        "width": 1200,
+        "height": 800
       }
     ],
     "security": {
