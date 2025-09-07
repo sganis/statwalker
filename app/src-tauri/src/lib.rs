@@ -8,6 +8,7 @@ use std::collections::{HashSet, BTreeSet};
 #[derive(Debug, Clone)]
 struct FolderStats {
     file_count: u64,
+    file_size: u128,
     disk_usage: u128,
     latest_mtime: i64,
     users: HashSet<String>,
@@ -17,6 +18,7 @@ impl FolderStats {
     fn new() -> Self {
         Self {
             file_count: 0,
+            file_size: 0,
             disk_usage: 0,
             latest_mtime: 0,
             users: HashSet::new(),
@@ -27,6 +29,7 @@ impl FolderStats {
 #[derive(Encode, Decode, Serialize, Debug)]
 struct AggRowBin {
     file_count: u64,
+    file_size: u128,
     disk_usage: u128,
     latest_mtime: i64,
     users: Vec<String>,
@@ -38,6 +41,7 @@ struct FileItem {
     path: String,
     count: u64,
     size: u128,
+    disk: u128,
     modified: i64,
     users: Vec<String>,
 }
@@ -50,7 +54,8 @@ impl From<AggRowBin> for FileItem {
         FileItem {
             path: String::new(), // filled later
             count: row.file_count as u64,
-            size: row.disk_usage as u128,
+            size: row.file_size as u128,
+            disk: row.disk_usage as u128,
             modified: row.latest_mtime,
             users,
         }
@@ -60,15 +65,17 @@ const AGG: TableDefinition<&str, &[u8]> = TableDefinition::new("agg");
 
 
 #[tauri::command]
-fn get_files(path: &str) -> String {
-    let db_path = PathBuf::from("c:\\Dev\\statwalker\\Dev.rdb");
-    match list_children(&db_path, path) {
+async fn get_files(path: String) -> Result<String, String> {
+    //let db_path = PathBuf::from("c:\\Dev\\statwalker\\Dev.rdb");
+    let db_path = PathBuf::from("/Users/san/dev/statwalker/rs/mac.agg.rdb");
+    let json = match list_children(&db_path, &path) {
         Ok(json) => json,
         Err(e) => {
             eprintln!("Error listing children for '{}': {:?}", path, e);
             "[]".to_string() // Return empty JSON array on error
         }
-    }
+    };
+    Ok(json)
 }
 
 fn normalize_seps(s: &str) -> String {
@@ -193,6 +200,7 @@ fn list_children(db_path: &Path, dir: &str) -> Result<String> {
                 path: full_path.clone(),
                 count: 0,
                 size: 0,
+                disk: 0,
                 modified: 0,
                 users: Vec::new(),
             }

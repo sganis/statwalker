@@ -35,6 +35,7 @@ const OUT_HEADER: &[&str] = &[
 #[derive(Debug, Clone)]
 struct FolderStats {
     file_count: u64,
+    file_size: u128,
     disk_usage: u128,
     latest_mtime: i64,
     users: HashSet<String>,
@@ -44,6 +45,7 @@ impl FolderStats {
     fn new() -> Self {
         Self {
             file_count: 0,
+            file_size: 0,
             disk_usage: 0,
             latest_mtime: 0,
             users: HashSet::new(),
@@ -54,6 +56,7 @@ impl FolderStats {
 #[derive(Encode, Decode, Serialize, Debug)]
 struct AggRowBin {
     file_count: u64,
+    file_size: u128,
     disk_usage: u128,
     latest_mtime: i64,
     users: Vec<String>,
@@ -161,14 +164,14 @@ fn main() -> Result<()> {
         let perm = octal_perm(mode_raw, &mut perm_cache);
 
         // dedup disk by inode
-        if inodes_seen.contains(&inode) {
-            disk_b = 0;
-        } else {
-            inodes_seen.insert(inode.clone());
-        }
+        // if inodes_seen.contains(&inode) {
+        //     disk_b = 0;
+        // } else {
+        //     inodes_seen.insert(inode.clone());
+        // }
 
         // aggregation - use unquoted path
-        aggregate_folder_stats(&path, size_b, mtime, &user, &mut agg_data);
+        aggregate_folder_stats(&path, size_b, disk_b, mtime, &user, &mut agg_data);
 
         let size_gb = bytes_to_gb(size_b);
         let disk_gb = bytes_to_gb(disk_b);
@@ -248,6 +251,7 @@ fn csv_quote_if_needed(s: &str) -> String {
 
 fn aggregate_folder_stats(
     path: &str,
+    size: u128,
     disk: u128,
     mtime: i64,
     user: &str,
@@ -294,6 +298,7 @@ fn aggregate_folder_stats(
             let key = key_path.to_string_lossy().to_string();
             let stats = agg_data.entry(key).or_insert_with(FolderStats::new);
             stats.file_count += 1;
+            stats.file_size += size;
             stats.disk_usage += disk;
             stats.latest_mtime = stats.latest_mtime.max(mtime);
             stats.users.insert(user.to_string());
@@ -346,6 +351,7 @@ fn save_aggregation_to_redb(db_path: &Path, agg_data: &HashMap<String, FolderSta
         for (path, stats) in agg_data {
             let row = AggRowBin {
                 file_count: stats.file_count,
+                file_size: stats.file_size,
                 disk_usage: stats.disk_usage,
                 latest_mtime: stats.latest_mtime,
                 users: stats.users.iter().cloned().collect(),
