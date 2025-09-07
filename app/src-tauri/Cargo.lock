@@ -69,6 +69,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "csv",
+ "libc",
  "redb",
  "serde",
  "serde_json",

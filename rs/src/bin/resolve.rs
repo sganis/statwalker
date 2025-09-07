@@ -171,7 +171,7 @@ fn main() -> Result<()> {
         // }
 
         // aggregation - use unquoted path
-        aggregate_folder_stats(&path, size_b, disk_b, mtime, &user, &mut agg_data);
+        aggregate_folder_stats(&path, size_b, disk_b, mtime, uid, &mut agg_data);
 
         let size_gb = bytes_to_gb(size_b);
         let disk_gb = bytes_to_gb(disk_b);
@@ -254,7 +254,7 @@ fn aggregate_folder_stats(
     size: u128,
     disk: u128,
     mtime: i64,
-    user: &str,
+    user: u32,
     agg_data: &mut HashMap<String, FolderStats>,
 ) {
     let folder_path = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
@@ -301,7 +301,7 @@ fn aggregate_folder_stats(
             stats.file_size += size;
             stats.disk_usage += disk;
             stats.latest_mtime = stats.latest_mtime.max(mtime);
-            stats.users.insert(user.to_string());
+            stats.users.insert(user);
         }
         // We intentionally skip CurDir ("." ) and ParentDir ("..") here.
     }

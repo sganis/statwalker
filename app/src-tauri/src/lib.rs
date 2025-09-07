@@ -11,6 +11,43 @@ use tauri::{AppHandle, Emitter};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 
+#[cfg(unix)]
+use std::ffi::CStr;
+
+
+#[cfg(unix)]
+fn get_username_from_uid(uid: u32) -> String {
+    unsafe {
+        let passwd = libc::getpwuid(uid);
+        if passwd.is_null() {
+            return "UNK".to_string();
+        }
+        let name_ptr = (*passwd).pw_name;
+        if name_ptr.is_null() {
+            return "UNK".to_string();
+        }
+        match CStr::from_ptr(name_ptr).to_str() {
+            Ok(name) => name.to_string(),
+            Err(_) => "UNK".to_string(),
+        }
+    }
+}
+
+fn resolve_usernames(all_users: &HashSet<i32>) -> HashMap<i32, String> {
+    let mut uid_name_map = HashMap::new();
+
+    for &uid in all_users {
+        // Convert i32 → u32, skip negatives
+        if uid < 0 {
+            continue;
+        }
+        let uname = get_username_from_uid(uid as u32);
+        uid_name_map.insert(uid, uname);
+    }
+
+    uid_name_map
+}
+
 
 fn count_lines<P: AsRef<Path>>(path: P) -> io::Result<usize> {
     let file = File::open(path)?;
@@ -32,7 +69,7 @@ struct FolderStats {
     file_size: u128,
     disk_usage: u128,
     latest_mtime: i64,
-    users: HashSet<String>,
+    users: HashSet<i32>,
 }
 
 impl FolderStats {
@@ -53,7 +90,7 @@ struct AggRowBin {
     file_size: u128,
     disk_usage: u128,
     latest_mtime: i64,
-    users: Vec<String>,
+    users: HashSet<i32>,
 }
 
 // ----- JSON output types -----
@@ -64,7 +101,7 @@ struct FileItem {
     size: u128,
     disk: u128,
     modified: i64,
-    users: Vec<String>,
+    users: HashSet<i32>,
 }
 
 impl From<AggRowBin> for FileItem {
@@ -116,7 +153,7 @@ impl InMemoryFSIndex {
         }
     }
 
-    pub fn load_from_csv(&mut self, path: &Path, app: AppHandle) -> AResult<()> {
+    pub fn load_from_csv(&mut self, path: &Path, app: AppHandle) -> AResult<HashMap<i32, String>> {
         let total = count_lines(&path)?;
         app.emit("progress", Progress{current: 0, total})?;
     
@@ -128,7 +165,9 @@ impl InMemoryFSIndex {
             .from_path(path)
             .with_context(|| format!("Failed to open CSV file: {}", path.display()))?;
 
+        let mut all_users: HashSet<i32> = HashSet::new();
         let mut loaded_count = 0;
+        
         for (line_no, record) in rdr.records().enumerate() {
             let record = record.with_context(|| format!("Failed to read CSV line {}", line_no + 1))?;
 
@@ -146,12 +185,13 @@ impl InMemoryFSIndex {
             let latest_mtime: i64 = record.get(4).unwrap_or("0").parse().unwrap_or(0);
             let users_str = record.get(5).unwrap_or("");
 
-            let users: Vec<String> = if users_str.is_empty() {
-                Vec::new()
-            } else {
-                users_str.split('|').map(|s| s.to_string()).collect()
-            };
-
+            let users: HashSet<i32> = users_str
+                .split('|')
+                .filter_map(|s| s.trim().parse::<i32>().ok())
+                .collect();
+                    
+            all_users.extend(&users);
+            
             let agg_row = AggRowBin {
                 file_count,
                 file_size,
@@ -167,6 +207,12 @@ impl InMemoryFSIndex {
                 app.emit("progress", Progress{current: loaded_count, total})?;
             }
         }
+        println!("Unique users: {:?}", all_users);
+        let uid_name_map = resolve_usernames(&all_users);
+
+        for (uid, uname) in &uid_name_map {
+            println!("uid: {}, username: {}", uid, uname);
+        }
 
         self.total_entries = loaded_count;
         let elapsed = start.elapsed();
@@ -176,7 +222,7 @@ impl InMemoryFSIndex {
             elapsed.as_secs_f64(),
             loaded_count as f64 / elapsed.as_secs_f64()
         );
-        Ok(())
+        Ok(uid_name_map)
     }
 
     pub fn insert(&mut self, path: &str, data: AggRowBin) {
@@ -351,17 +397,17 @@ async fn search_prefix_memory(prefix: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn load_db(app: AppHandle, path: String) -> Result<String, String> {
+async fn load_db(app: AppHandle, path: String) -> Result<HashMap<i32, String>, String> {
     let mut index = InMemoryFSIndex::new();
     let path = Path::new(&path);
-    index.load_from_csv(path, app).map_err(|e| e.to_string())?;
+    let users = index.load_from_csv(path, app).map_err(|e| e.to_string())?;
     let (entries, nodes) = index.stats();
     println!("Index initialized: {} entries, {} trie nodes", entries, nodes);
 
     FS_INDEX
         .set(Arc::new(RwLock::new(index)))
         .map_err(|_| "Failed to initialize global FS index".to_string())?;
-    Ok("OK".to_string())
+    Ok(users)
 }
 
 // ----- EXISTING REDB FUNCTIONS -----
@@ -494,7 +540,7 @@ fn list_children_db(db_path: &Path, dir: &str) -> AResult<String> {
                 size: 0,
                 disk: 0,
                 modified: 0,
-                users: Vec::new(),
+                users: HashSet::new(),
             }
         };
 

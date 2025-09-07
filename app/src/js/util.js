@@ -83,3 +83,7 @@ export function getParent(inputPath) {
   return parent;
 }
 
+export function capitalize(str) {
+  if (!str) return "";
+  return str.charAt(0).toUpperCase() + str.slice(1);
+}

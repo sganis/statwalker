@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import { getParent, formatBytes } from "../js/util";
+  import { getParent, formatBytes, capitalize } from "../js/util";
 
   import { listen } from '@tauri-apps/api/event';
 
@@ -29,6 +29,8 @@
   type SortKey = "disk" | "size" | "count";
   let sortBy = $state<SortKey>("disk");
   let sortOpen = $state(false);
+  let selectedUser = $state(-1)
+  let users = $state([])
 
   // robust number coercion
   const toNum = (v: any) => {
@@ -116,7 +118,8 @@
     let db = "/Users/san/dev/statwalker/rs/mac.agg.csv"
     try{
       initializing = true
-      await invoke("load_db", { path: db });
+      users = await invoke("load_db", { path: db });
+      console.log(users)
       initializing = false
     } catch(e) {
       console.log(e)
@@ -129,30 +132,54 @@
 
 <div class="flex flex-col h-screen min-h-0 gap-2">
   <div class="flex gap-2 items-center relative">
-    <button onclick={goBack} disabled={histIdx === 0}>◀ Back</button>
-    <button onclick={goForward} disabled={histIdx >= history.length - 1}>Forward ▶</button>
-    <button onclick={goUp} disabled={getParent(path) === path}>Up</button>
-    <button onclick={refresh}>Refresh</button>
+    <button class="btn" onclick={goBack} disabled={histIdx === 0}>
+      <span class="material-symbols-outlined">arrow_back_ios</span>
+    </button>
+    <button class="btn" onclick={goForward} disabled={histIdx >= history.length - 1}>
+      <span class="material-symbols-outlined">arrow_forward_ios</span>
+    </button>
+    <button class="btn" onclick={goUp} disabled={getParent(path) === path}>
+      <span class="material-symbols-outlined">arrow_upward</span>
+    </button>
+    <button class="btn" onclick={refresh}>
+      <div class="flex items-center gap-2">
+        <span class="material-symbols-outlined">refresh</span>
+      </div>
+    </button>
 
     <!-- Sort dropdown -->
     <div class="relative">
-      <button onclick={() => (sortOpen = !sortOpen)}>
-        Sort: {sortBy.toUpperCase()} ▾
+      <button class="btn w-24" onclick={() => (sortOpen = !sortOpen)}>
+        <div class="flex items-center gap-2">
+          <span class="material-symbols-outlined">sort</span>
+          {capitalize(sortBy)}
+        </div>
       </button>
       {#if sortOpen}
-        <div class="absolute mt-1 w-40 rounded-md border border-gray-600 bg-gray-800 shadow-lg z-20">
-          <button class="block w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseSort("disk")}>
-            Disk
+        <div class="flex flex-col divide-y divide-gray-500 absolute w-24 rounded border
+           border-gray-500  bg-gray-800 shadow-lg z-20 overflow-hidden mt-1">
+          <button class="w-full text-left px-3 py-2 hover:bg-gray-700" 
+            onclick={() => chooseSort("disk")}>
+            By Disk
           </button>
-          <button class="block w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseSort("size")}>
-            Size
+          <button class="w-full text-left px-3 py-2 hover:bg-gray-700 border-trasparent" 
+            onclick={() => chooseSort("size")}>
+            By Size
           </button>
-          <button class="block w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseSort("count")}>
-            Files
+          <button class="w-full text-left px-3 py-2 hover:bg-gray-700" 
+            onclick={() => chooseSort("count")}>
+            By Count
           </button>
         </div>
       {/if}
     </div>
+    <select bind:value={selectedUser}>
+      <option value={-1}>All Users</option>
+      {#each Object.entries(users) as [uid, username]}
+      <option value={uid}>{username}</option>
+      {/each}
+    </select>
+
     <input
       bind:value={path}
       placeholder="Path..."
