@@ -7,41 +7,61 @@
   let files = $state<any[]>([]);
   let loading = $state(false);
 
-  // History state
+  // History
   let history = $state<string[]>([path]);
   let histIdx = $state(0);
 
-  // For progress bars
-  let maxSize = $derived(files?.length ? Math.max(...files.map(i => i.disk || 0)) : 1);
-  const pct = (n: number) => Math.max(0, Math.min(100, Math.round((+n / maxSize) * 1000) / 10));
-
-  // ---- sorting ----
+  // --- Sorting (declare BEFORE maxMetric) ---
   type SortKey = "disk" | "size" | "count";
   let sortBy = $state<SortKey>("disk");
-  let sortDir = $state<"asc" | "desc">("desc");
   let sortOpen = $state(false);
 
+  // robust number coercion
+  const toNum = (v: any) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  };
+
+  // Always DESC sort
   const sortedFiles = $derived.by(() => {
+    const key = sortBy;
     const arr = files ? [...files] : [];
-    const key: SortKey = sortBy;
-    let sf = arr.sort((a: any, b: any) => {
-      const av = Number(a?.[key] ?? 0);
-      const bv = Number(b?.[key] ?? 0);
-      return (av - bv) * -1; // always desc
-    })
-    console.log("Sorted files", sf);
-    return sf;
+    return arr.sort((a: any, b: any) => toNum(b?.[key]) - toNum(a?.[key]));
   });
 
-  // -------- Single-flight "do-it-again" ----------
+  // --- sort-aware max + pct (use .by to track sortBy/files) ---
+  let maxMetric = $derived.by(() => {
+    const key = sortBy;
+    const vals = files?.map(f => toNum(f?.[key])) ?? [];
+    const max = Math.max(0, ...vals);
+    return max > 0 ? max : 1;          // avoid divide-by-zero
+  });
+
+  const pct = (n: any) => {
+    const x = toNum(n);
+    const p = (x / maxMetric) * 100;
+    const clamped = Math.max(0, Math.min(100, p));
+    return Math.round(clamped * 10) / 10; // 1 decimal
+  };
+
+  const metricValue = (file: any) => toNum(file?.[sortBy]);
+
+  // right-side label reflecting current sort
+  function rightValue(file: any) {
+    switch (sortBy) {
+      case "disk":  return formatBytes(toNum(file?.disk));
+      case "size":  return formatBytes(toNum(file?.size));
+      case "count": return toNum(file?.count).toLocaleString();
+    }
+  }
+
+  // ---- single-flight fetch (unchanged) ----
   function createDoItAgain<T extends any[]>(fn: (...args: T) => Promise<void>) {
     let running = false;
     let nextArgs: T | null = null;
-
     return async (...args: T) => {
-      // Always capture the latest intent
       nextArgs = args;
-      if (running) return; // We will run once current completes
+      if (running) return;
       running = true;
       try {
         while (nextArgs) {
@@ -49,21 +69,17 @@
           nextArgs = null;
           await fn(...(argsNow as T));
         }
-      } finally {
-        running = false;
-      }
+      } finally { running = false; }
     };
   }
 
-  // Actual fetcher wrapped with do-it-again
   const fetchFiles = createDoItAgain(async (p: string) => {
-    loading = true; // keep true across the loop
+    loading = true;
     try {
-      const raw: string = await invoke("get_files", { path: p });
-      const list = JSON.parse(raw).sort((a: any, b: any) => b.disk - a.disk);
-      files = list;
+      const raw: string = await invoke("get_files_memory", { path: p });
+      files = JSON.parse(raw);               // keep raw; we sort in derived
     } finally {
-      loading = false; // turns false only after the final run in the loop
+      loading = false;
     }
   });
 
@@ -74,87 +90,39 @@
     histIdx = history.length - 1;
   }
 
-  // Navigate normally: update path & history, then queue fetch
-  async function navigateTo(p: string) {
-    path = p;          // reflect immediately in UI
-    pushHistory(p);    // record history move
-    // Queue the latest path; if a fetch is running, this won't start a new trip,
-    // it will only schedule a single "do it again" with the newest path.
-    fetchFiles(p);
-  }
+  function chooseSort(key: SortKey) { sortBy = key; sortOpen = false; }
+  function navigateTo(p: string) { path = p; pushHistory(p); fetchFiles(p); }
+  function refresh() { fetchFiles(path); }
+  function goUp() { const parent = getParent(path); navigateTo(parent); }
+  function goBack() { if (histIdx > 0) { histIdx -= 1; path = history[histIdx]; fetchFiles(path); } }
+  function goForward() { if (histIdx < history.length - 1) { histIdx += 1; path = history[histIdx]; fetchFiles(path); } }
+  function onPathKeydown(e: KeyboardEvent) { if (e.key === "Enter") navigateTo(path); }
 
-  // Refresh queues current path (same single-flight semantics)
-  function refresh() {
-    fetchFiles(path);
-  }
-
-  function goUp() {
-    const parent = getParent(path);
-    navigateTo(parent); // queue (don’t block UI)
-  }
-
-  // Back/Forward traverse history but DO NOT push a new entry
-  function goBack() {
-    if (histIdx > 0) {
-      histIdx -= 1;
-      path = history[histIdx];
-      fetchFiles(path); // queue latest; single-flight handles coalescing
-    }
-  }
-
-  function goForward() {
-    if (histIdx < history.length - 1) {
-      histIdx += 1;
-      path = history[histIdx];
-      fetchFiles(path); // queue latest; single-flight handles coalescing
-    }
-  }
-
-  function onPathKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter") navigateTo(path);
-  }
-
-  // ---- sort UI helpers ----
-  function chooseSort(key: SortKey) {
-    sortBy = key;
-    sortOpen = false;
-  }
-
-  // right-side formatter based on current sort
-  function rightValue(file: any) {
-    switch (sortBy) {
-      case "disk": return formatBytes(Number(file?.disk ?? 0));
-      case "size": return formatBytes(Number(file?.size ?? 0));
-      case "count": return (Number(file?.count ?? 0)).toLocaleString();
-    }
-  }
-
-  onMount(() => {
-    fetchFiles(path); // initial load
-  });
+  onMount(() => { fetchFiles(path); });
 </script>
+
 
 <div class="flex flex-col h-screen min-h-0 gap-2">
   <div class="flex gap-2 items-center relative">
-    <button on:click={goBack} disabled={histIdx === 0}>◀ Back</button>
-    <button on:click={goForward} disabled={histIdx >= history.length - 1}>Forward ▶</button>
-    <button on:click={goUp} disabled={getParent(path) === path}>Up</button>
-    <button on:click={refresh}>Refresh</button>
+    <button onclick={goBack} disabled={histIdx === 0}>◀ Back</button>
+    <button onclick={goForward} disabled={histIdx >= history.length - 1}>Forward ▶</button>
+    <button onclick={goUp} disabled={getParent(path) === path}>Up</button>
+    <button onclick={refresh}>Refresh</button>
 
     <!-- Sort dropdown -->
     <div class="relative">
-      <button on:click={() => (sortOpen = !sortOpen)}>
+      <button onclick={() => (sortOpen = !sortOpen)}>
         Sort: {sortBy.toUpperCase()} ▾
       </button>
       {#if sortOpen}
         <div class="absolute mt-1 w-40 rounded-md border border-gray-600 bg-gray-800 shadow-lg z-20">
-          <button class="block w-full text-left px-3 py-2 hover:bg-gray-700" on:click={() => chooseSort("disk")}>
+          <button class="block w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseSort("disk")}>
             Disk
           </button>
-          <button class="block w-full text-left px-3 py-2 hover:bg-gray-700" on:click={() => chooseSort("size")}>
+          <button class="block w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseSort("size")}>
             Size
           </button>
-          <button class="block w-full text-left px-3 py-2 hover:bg-gray-700" on:click={() => chooseSort("count")}>
+          <button class="block w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseSort("count")}>
             Files
           </button>
         </div>
@@ -164,7 +132,7 @@
       bind:value={path}
       placeholder="Path..."
       class="grow"
-      on:keydown={onPathKeydown}
+      onkeydown={onPathKeydown}
       aria-busy={loading}
     />
   </div>
@@ -191,10 +159,12 @@
       {#each sortedFiles as file}
         <div
           class="relative p-3 cursor-pointer hover:opacity-95 bg-gray-700 border border-gray-600 rounded-lg overflow-hidden min-h-16 h-16"
-          on:click={() => navigateTo(file.path)}
+          onclick={() => navigateTo(file.path)}
         >
-          <div class="absolute inset-0 bg-orange-500/90 transition-all duration-300"
-               style="width: {pct(file.disk)}%; z-index: 0;"></div>
+          <div
+      class="absolute left-0 top-0 bottom-0 bg-orange-500/90 transition-[width] duration-300 z-0 pointer-events-none"
+      style="width: {pct(metricValue(file))}%"
+    />
           <div class="relative z-10">
             <div class="flex items-center justify-between gap-4">
               <p class="font-medium truncate text-white">{file.path}</p>
@@ -202,8 +172,9 @@
             </div>
             <p class="text-xs text-gray-300 mt-1">
               Files: {file.count} • 
-              Disk Usage: {formatBytes(file.disk)} •
-              Last Modified: {new Date(file.modified * 1000).toLocaleString()}
+              Size: {formatBytes(file.size)} •
+              Disk: {formatBytes(file.disk)} •
+              Modified: {new Date(file.modified * 1000).toLocaleString()}
             </p>
           </div>
         </div>

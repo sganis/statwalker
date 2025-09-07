@@ -328,6 +328,7 @@ fn write_aggregation_file(
         wtr.write_record(&[
             &quoted_path,
             &stats.file_count.to_string(),
+            &stats.file_size.to_string(),
             &stats.disk_usage.to_string(),
             &stats.latest_mtime.to_string(),
             &users_str,
