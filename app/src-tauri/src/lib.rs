@@ -172,6 +172,7 @@ impl InMemoryFSIndex {
     /// Merges rows per path (sum counts/sizes, max mtime, union users).
     pub fn load_from_csv(&mut self, path: &Path, app: AppHandle) -> AResult<HashMap<i32, String>> {
         let total = count_lines(&path)?;
+        let freq = total / 100;
         app.emit("progress", Progress{current: 0, total})?;
 
         println!("Loading filesystem index from CSV: {}", path.display());
@@ -224,7 +225,7 @@ impl InMemoryFSIndex {
             if latest_mtime > entry.latest_mtime { entry.latest_mtime = latest_mtime; }
 
             loaded_count += 1;
-            if loaded_count % 100_000 == 0 {
+            if loaded_count % freq == 0 {
                 app.emit("progress", Progress{current: loaded_count, total})?;
             }
         }
