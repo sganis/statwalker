@@ -2,7 +2,7 @@
 // run: index my.res.csv my.agg.csv
 
 use anyhow::{Context, Result};
-use csv::{ReaderBuilder};
+use csv::ReaderBuilder;
 use redb::{Database, ReadableDatabase, TableDefinition};
 use bincode::{encode_to_vec, config};
 use std::path::PathBuf;
