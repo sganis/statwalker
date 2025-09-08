@@ -19,8 +19,12 @@ client = OpenAI()
 # for m in models.data:
 #     print(m.id)
 
-# model = "gpt-4o-mini"
-model = "gpt-5-mini"
+# gpt-4o-mini → best price/latency for commit messages. 
+# gpt-4.1-mini → slightly stronger at coding/instructions, still quick. 
+# o4-mini or gpt-4.1 → when diffs are huge and you need extra reasoning (slower/costlier). 
+# gpt-5-mini / gpt-5 → top quality but overkill for this use; also pricier. (They’re Chat Completions–compatible if you do choose them.)
+
+model = "gpt-4o-mini"
 
 # Run git diff and capture the output
 result1 = subprocess.run(["git", "diff", "--cached"], capture_output=True, text=True)
