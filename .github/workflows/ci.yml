@@ -4,20 +4,22 @@ name: Build statwaker (Rocky Linux 9, app/)
 on:
   push:
     branches: [ master ]
+  workflow_dispatch:
 
 jobs:
   build-rocky9:
     name: Rocky Linux 9 (x86_64)
     runs-on: ubuntu-latest
     container:
-      image: rockylinux/rockylinux:9
-      options: --privileged
+      # Use the main Rocky image (has better defaults than rockylinux/rockylinux:9-minimal)
+      image: rockylinux:9
+      # (Optional) Add DNS to avoid flaky resolver issues
+      options: --dns 1.1.1.1 --dns 8.8.8.8
     env:
       CARGO_HOME: /github/home/.cargo
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
-    # All `run:` steps happen inside app/
     defaults:
       run:
         working-directory: app
@@ -26,16 +28,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: System deps (GTK/WebKit & tooling for Tauri)
+      # Ensure bash exists before any composite actions that require it
+      - name: Base tools
         run: |
           dnf -y update
           dnf -y install epel-release dnf-plugins-core
           dnf -y config-manager --set-enabled crb
+          dnf -y install bash coreutils findutils which ca-certificates git
+
+      - name: System deps (GTK/WebKit & tooling for Tauri)
+        run: |
           dnf -y install \
-            git gcc-c++ make pkgconfig xz patchelf \
-            glib2-devel gtk3-devel webkit2gtk3-devel librsvg2-devel \
-            libappindicator-gtk3 libappindicator-gtk3-devel \
-            openssl-devel
+            gcc-c++ make pkgconfig xz patchelf \
+            glib2-devel gtk3-devel webkit2gtk3 webkit2gtk3-devel \
+            librsvg2-devel libappindicator-gtk3 libappindicator-gtk3-devel \
+            openssl openssl-devel
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
