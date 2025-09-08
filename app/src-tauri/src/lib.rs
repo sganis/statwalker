@@ -74,3 +74,6 @@ jobs:
           name: statwaker-fedora
           path: app/src-tauri/target/**/release/bundle/**/*
           if-no-files-found: error
+
+
+          
