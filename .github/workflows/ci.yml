@@ -32,7 +32,7 @@ jobs:
           dnf -y install epel-release dnf-plugins-core
           dnf -y config-manager --set-enabled crb
           dnf -y install \
-            git gcc-c++ make pkgconfig curl wget xz patchelf \
+            git gcc-c++ make pkgconfig xz patchelf \
             glib2-devel gtk3-devel webkit2gtk3-devel librsvg2-devel \
             libappindicator-gtk3 libappindicator-gtk3-devel \
             openssl-devel
@@ -73,4 +73,3 @@ jobs:
           name: statwaker-rocky9
           path: app/src-tauri/target/**/release/bundle/**/*
           if-no-files-found: error
-          
