@@ -127,6 +127,25 @@ impl From<AggRowBin> for FileItem {
     }
 }
 
+// ----- NEW: Stacked view data structures -----
+#[derive(Serialize, Debug, Clone)]
+struct FileItemStacked {
+    path: String,
+    total_count: u64,
+    total_size: u128,
+    total_disk: u128,
+    modified: i64,
+    users: HashMap<i32, UserStatsJson>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+struct UserStatsJson {
+    username: String,
+    count: u64,
+    size: u128,
+    disk: u128,
+}
+
 // ----- IN-MEMORY TRIE IMPLEMENTATION -----
 #[derive(Clone, Serialize)]
 struct Progress {
@@ -171,7 +190,7 @@ impl InMemoryFSIndex {
     /// Merges rows per path (sum counts/sizes, max mtime, union users).
     pub fn load_from_csv(&mut self, path: &Path, app: AppHandle) -> AResult<HashMap<i32, String>> {
         let total = count_lines(&path)?;
-        let freq = total / 100;
+        let freq = (total / 100).max(1);
         app.emit("progress", Progress{current: 0, total})?;
 
         println!("Loading filesystem index from CSV: {}", path.display());
@@ -293,7 +312,14 @@ impl InMemoryFSIndex {
         current.data.as_ref()
     }
 
-    pub fn list_children(&self, dir_path: &str) -> AResult<Vec<FileItem>> {
+    pub fn list_children(
+        &self, 
+        dir_path: &str, 
+        uid_name_map: &HashMap<i32, String>,
+        user_filter: &Vec<i32>,            // [] => all users
+    ) -> AResult<Vec<FileItemStacked>> {
+        println!("list_children {:?} {:?}", dir_path, user_filter);
+
         let components = Self::path_to_components(dir_path);
         let mut current = &self.root;
 
@@ -314,60 +340,86 @@ impl InMemoryFSIndex {
                     format!("{}/{}", base_path.trim_end_matches('/'), child_name)
                 };
 
-                let mut item: FileItem = data.clone().into();
-                item.path = full_path;
-                items.push(item);
-            }
-        }
+                // Decide which users to include for this child
+                let users_to_show: Vec<i32> = if user_filter.is_empty() {
+                    // all users present at this path
+                    data.users.iter().copied().collect()
+                } else {
+                    // intersection: only requested users that are present
+                    data.users
+                        .iter()
+                        .copied()
+                        .filter(|uid| user_filter.contains(uid))
+                        .collect()
+                };
 
-        items.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(items)
-    }
+                let mut user_stats: HashMap<i32, UserStatsJson> = HashMap::new();
+                let mut total_count: u64;
+                let mut total_size:  u128;
+                let mut total_disk:  u128;
+                let mut modified:    i64;
 
-    /// Like list_children, but returns stats **only for a single user** (uid).
-    pub fn list_children_for_user(&self, dir_path: &str, uid: i32) -> AResult<Vec<FileItem>> {
-        let components = Self::path_to_components(dir_path);
-        let mut current = &self.root;
+                let normalized_path = Self::normalize_path(&full_path);
 
-        for component in components {
-            current = current.children.get(&component)
-                .ok_or_else(|| anyhow::anyhow!("Directory not found: {}", dir_path))?
-                .as_ref();
-        }
+                if user_filter.is_empty() {
+                    // Fast path: use pre-aggregated totals from the trie node
+                    total_count = data.file_count;
+                    total_size  = data.file_size;
+                    total_disk  = data.disk_usage;
+                    modified    = data.latest_mtime;
 
-        let mut items = Vec::new();
-        let base_path = Self::normalize_path(dir_path);
+                    // Still build per-user breakdown (only for users present here)
+                    for uid in users_to_show {
+                        if let Some(stats) = self.per_user.get(&(normalized_path.clone(), uid)) {
+                            let username = uid_name_map.get(&uid).map(|s| s.as_str()).unwrap_or("UNK");
+                            user_stats.insert(uid, UserStatsJson {
+                                username: username.to_string(),
+                                count: stats.file_count,
+                                size:  stats.file_size,
+                                disk:  stats.disk_usage,
+                            });
+                        }
+                    }
+                } else {
+                    // Filtered path: sum only requested users
+                    total_count = 0;
+                    total_size  = 0;
+                    total_disk  = 0;
+                    modified    = 0;
 
-        for (child_name, child_node) in &current.children {
-            // Build full child path
-            let full_path = if base_path.is_empty() || base_path == "/" {
-                format!("/{}", child_name)
-            } else {
-                format!("{}/{}", base_path.trim_end_matches('/'), child_name)
-            };
+                    for uid in users_to_show {
+                        if let Some(stats) = self.per_user.get(&(normalized_path.clone(), uid)) {
+                            let username = uid_name_map.get(&uid).map(|s| s.as_str()).unwrap_or("UNK");
+                            user_stats.insert(uid, UserStatsJson {
+                                username: username.to_string(),
+                                count: stats.file_count,
+                                size:  stats.file_size,
+                                disk:  stats.disk_usage,
+                            });
 
-            // Lookup exact per-user stats for that path
-            let key = (Self::normalize_path(&full_path), uid);
-            if let Some(stats) = self.per_user.get(&key) {
-                // Fill FileItem using per-user stats; set users = {uid}
-                let mut users = HashSet::new();
-                users.insert(uid);
+                            total_count = total_count.saturating_add(stats.file_count);
+                            total_size  = total_size.saturating_add(stats.file_size);
+                            total_disk  = total_disk.saturating_add(stats.disk_usage);
+                            if stats.latest_mtime > modified { modified = stats.latest_mtime; }
+                        }
+                    }
+                }
 
-                items.push(FileItem {
+                items.push(FileItemStacked {
                     path: full_path,
-                    count: stats.file_count,
-                    size: stats.file_size,
-                    disk: stats.disk_usage,
-                    modified: stats.latest_mtime,
-                    users,
+                    total_count,
+                    total_size,
+                    total_disk,
+                    modified,
+                    users: user_stats,
                 });
             }
-            // If user has no data for that child path, we skip it (no row).
         }
 
         items.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(items)
     }
+
 
     pub fn get_all_with_prefix(&self, prefix: &str) -> AResult<Vec<FileItem>> {
         let components = Self::path_to_components(prefix);
@@ -437,6 +489,8 @@ impl InMemoryFSIndex {
 
 // Global instance - loaded once at startup
 static FS_INDEX: OnceLock<Arc<RwLock<InMemoryFSIndex>>> = OnceLock::new();
+// NEW: Global user name mapping
+static USER_NAME_MAP: OnceLock<Arc<RwLock<HashMap<i32, String>>>> = OnceLock::new();
 
 pub fn get_fs_index() -> AResult<Arc<RwLock<InMemoryFSIndex>>> {
     FS_INDEX.get()
@@ -444,32 +498,26 @@ pub fn get_fs_index() -> AResult<Arc<RwLock<InMemoryFSIndex>>> {
         .map(|arc| arc.clone())
 }
 
-// ----- MEMORY-BASED TAURI COMMANDS -----
+pub fn get_user_name_map() -> AResult<Arc<RwLock<HashMap<i32, String>>>> {
+    USER_NAME_MAP.get()
+        .ok_or_else(|| anyhow::anyhow!("User name map not initialized"))
+        .map(|arc| arc.clone())
+}
 
+// SIMPLIFIED: Replace all 3 functions with just this one
 #[tauri::command]
-async fn get_files_memory(path: String) -> Result<String, String> {
+async fn get_files(path: String, user_filter: Vec<i32>) -> Result<String, String> {
+    println!("user_filter: {:?}", user_filter);
     let index = get_fs_index().map_err(|e| format!("Index not available: {}", e))?;
     let index = index.read().map_err(|e| format!("Failed to read index: {}", e))?;
+    
+    let user_map = get_user_name_map().map_err(|e| format!("User map not available: {}", e))?;
+    let user_map = user_map.read().map_err(|e| format!("Failed to read user map: {}", e))?;
 
-    match index.list_children(&path) {
+    match index.list_children(&path, &user_map, &user_filter) {
         Ok(items) => serde_json::to_string(&items).map_err(|e| format!("JSON serialization error: {}", e)),
         Err(e) => {
             eprintln!("Error listing children for '{}': {:?}", path, e);
-            Ok("[]".to_string())
-        }
-    }
-}
-
-/// Same as get_files_memory, but filtered by a specific user (uid).
-#[tauri::command]
-async fn get_files_memory_user(path: String, uid: i32) -> Result<String, String> {
-    let index = get_fs_index().map_err(|e| format!("Index not available: {}", e))?;
-    let index = index.read().map_err(|e| format!("Failed to read index: {}", e))?;
-
-    match index.list_children_for_user(&path, uid) {
-        Ok(items) => serde_json::to_string(&items).map_err(|e| format!("JSON serialization error: {}", e)),
-        Err(e) => {
-            eprintln!("Error listing children for '{}', uid {}: {:?}", path, uid, e);
             Ok("[]".to_string())
         }
     }
@@ -506,33 +554,29 @@ async fn search_prefix_memory(prefix: String) -> Result<String, String> {
 
 #[tauri::command]
 async fn load_db(app: AppHandle, path: String) -> Result<HashMap<i32, String>, String> {
+    // Fast path: already loaded → just return the users map
+    if let Some(user_map_arc) = USER_NAME_MAP.get() {
+        let users = user_map_arc.read().map_err(|e| format!("User map lock: {e}"))?;
+        return Ok(users.clone());
+    }
+
+    // Not loaded yet → build index and user map once
     let mut index = InMemoryFSIndex::new();
-    let path = Path::new(&path);
-    let users = index.load_from_csv(path, app).map_err(|e| e.to_string())?;
+    let p = std::path::Path::new(&path);
+    let users = index.load_from_csv(p, app).map_err(|e| e.to_string())?;
+
     let (entries, nodes) = index.stats();
-    println!("Index initialized: {} entries, {} trie nodes", entries, nodes);
+    println!("Index initialized: {entries} entries, {nodes} trie nodes");
+
+    USER_NAME_MAP
+        .set(Arc::new(RwLock::new(users.clone())))
+        .map_err(|_| "Failed to initialize global user name map".to_string())?;
 
     FS_INDEX
         .set(Arc::new(RwLock::new(index)))
         .map_err(|_| "Failed to initialize global FS index".to_string())?;
+
     Ok(users)
-}
-
-// ----- EXISTING REDB FUNCTIONS -----
-
-const AGG: TableDefinition<&str, &[u8]> = TableDefinition::new("agg");
-
-#[tauri::command]
-async fn get_files(path: String) -> Result<String, String> {
-    let db_path = PathBuf::from("/Users/san/dev/statwalker/rs/mac.agg.rdb");
-    let json = match list_children_db(&db_path, &path) {
-        Ok(json) => json,
-        Err(e) => {
-            eprintln!("Error listing children for '{}': {:?}", path, e);
-            "[]".to_string()
-        }
-    };
-    Ok(json)
 }
 
 fn unquote_csv_field(field: &str) -> String {
@@ -573,100 +617,13 @@ fn first_segment(s: &str) -> &str {
     s
 }
 
-fn read_one(db_path: &Path, key: &str) -> AResult<Option<AggRowBin>> {
-    let db = Database::open(db_path)?;
-    let read = db.begin_read()?;
-    let table = read.open_table(AGG)?;
-    if let Some(val) = table.get(key)? {
-        let cfg = bincode::config::standard().with_fixed_int_encoding();
-        let (row, _): (AggRowBin, usize) = decode_from_slice(val.value(), cfg)?;
-        Ok(Some(row))
-    } else {
-        Ok(None)
-    }
-}
-
-fn list_children_db(db_path: &Path, dir: &str) -> AResult<String> {
-    let db = Database::open(db_path)?;
-    let read = db.begin_read()?;
-    let table = read.open_table(AGG)?;
-
-    let mut dir_norm = normalize_seps(dir.trim());
-    if cfg!(windows) && dir_norm.ends_with(':') {
-        dir_norm.push(MAIN_SEPARATOR);
-    }
-    let prefix = if is_root_dir(&dir_norm) {
-        ensure_trailing_sep(dir_norm)
-    } else {
-        ensure_trailing_sep(dir_norm.trim_end_matches(|c| c == '/' || c == '\\').to_string())
-    };
-
-    let cmp_prefix = if cfg!(windows) { prefix.to_ascii_lowercase() } else { prefix.clone() };
-    let scan_start = cmp_prefix.clone();
-
-    let mut child_names: BTreeSet<String> = BTreeSet::new();
-
-    for entry in table.range(scan_start.as_str()..)? {
-        let (key_guard, _v) = entry?;
-        let key = key_guard.value();
-
-        if !key.starts_with(&cmp_prefix) {
-            break;
-        }
-
-        let remainder = &key[cmp_prefix.len()..];
-        let child = remainder
-            .split(|ch| ch == '/' || ch == '\\')
-            .next()
-            .unwrap_or_default();
-
-        if !child.is_empty() {
-            child_names.insert(child.to_string());
-        }
-    }
-
-    let mut items: Vec<FileItem> = Vec::with_capacity(child_names.len());
-    let cfg = bincode::config::standard().with_fixed_int_encoding();
-
-    for name in child_names {
-        let full_path = format!("{}{}", prefix, name);
-
-        let mut row_opt = table.get(full_path.as_str())?;
-        if row_opt.is_none() && cfg!(windows) {
-            row_opt = table.get(full_path.to_ascii_lowercase().as_str())?;
-        }
-
-        let item = if let Some(val) = row_opt {
-            let (row, _): (AggRowBin, usize) = decode_from_slice(val.value(), cfg)?;
-            let mut fi: FileItem = row.into();
-            fi.path = full_path.clone();
-            fi
-        } else {
-            FileItem {
-                path: full_path.clone(),
-                count: 0,
-                size: 0,
-                disk: 0,
-                modified: 0,
-                users: HashSet::new(),
-            }
-        };
-
-        items.push(item);
-    }
-
-    Ok(serde_json::to_string(&items)?)
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_files,
-            get_files_memory,
-            get_files_memory_user, 
             get_file_info_memory,
             search_prefix_memory,
             load_db,
