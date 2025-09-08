@@ -1,0 +1,78 @@
+# .github/workflows/build-statwaker-centos8.yml
+name: Build statwaker (CentOS 8, app/)
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ "v*" ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-centos8:
+    name: CentOS Stream 8 (x86_64)
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/centos/centos:stream8
+      options: --privileged
+    env:
+      CARGO_HOME: /github/home/.cargo
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+    # All `run:` steps happen inside app/
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System deps (GTK/WebKit & tooling for Tauri)
+        run: |
+          dnf -y update
+          dnf -y install epel-release dnf-plugins-core
+          dnf -y config-manager --set-enabled powertools || dnf -y config-manager --set-enabled PowerTools
+          dnf -y install \
+            git gcc-c++ make pkgconfig curl wget xz patchelf \
+            gtk3-devel webkit2gtk3-devel librsvg2-devel \
+            libappindicator-gtk3 libappindicator-gtk3-devel \
+            openssl-devel
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: app/package-lock.json
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            /github/home/.cargo/registry
+            /github/home/.cargo/git
+            app/src-tauri/target
+          key: centos8-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            centos8-cargo-
+
+      - name: Install JS deps
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build --if-present
+
+      - name: Build Tauri bundle
+        run: npx tauri build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: statwaker-centos8
+          path: app/src-tauri/target/**/release/bundle/**/*
+          if-no-files-found: error
