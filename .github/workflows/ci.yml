@@ -3,7 +3,7 @@ name: Build statwaker (CentOS 8, app/)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ master ]
 
 jobs:
   build-centos8:
