@@ -13,7 +13,14 @@ api_key = os.getenv("OPENAI_API_KEY")
 assert api_key, "API key not found. Make sure you have a .env file in the parent directory."
 
 client = OpenAI()
-model = "gpt-4o-mini"
+
+# models = client.models.list()
+# print("Available models:\n")
+# for m in models.data:
+#     print(m.id)
+
+# model = "gpt-4o-mini"
+model = "gpt-5-mini"
 
 # Run git diff and capture the output
 result1 = subprocess.run(["git", "diff", "--cached"], capture_output=True, text=True)
