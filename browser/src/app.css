@@ -40,6 +40,27 @@ select {
   background-repeat: no-repeat;
   background-size: 1rem;
 }
+
+/* Works in Chrome, Edge, Safari */
+::-webkit-scrollbar {
+  width: 8px; /* slim scrollbar */
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #1a1a1a; /* dark background */
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: #444; /* default thumb */
+  border-radius: 4px;
+  border: 2px solid #1a1a1a; /* adds space around thumb */
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: #666; /* lighter on hover */
+}
+
 /* Background: 
 Selection: #49483E; Active line often #3E3D32–#43443B. 
 Comments: #75715E. 

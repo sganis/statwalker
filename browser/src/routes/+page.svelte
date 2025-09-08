@@ -4,16 +4,6 @@
   import { api } from "../js/api.svelte";
   import { API_URL } from "../js/store.svelte";
 
-  // Regular file item (existing)
-  type FileItem = {
-    path: string;
-    count: number;
-    size: number;
-    disk: number;
-    modified: number;
-    users: number[];
-  };
-
   // Stacked file item (from index)
   type UserStatsJson = {
     username: string;
@@ -22,7 +12,7 @@
     disk: number;
   };
 
-  type FileItemStacked = {
+  type FileItem = {
     path: string;
     total_count: number;
     total_size: number;
@@ -42,7 +32,7 @@
   };
 
   let path = $state("/");
-  let folders = $state<FileItemStacked[]>([]);
+  let folders = $state<FileItem[]>([]);
   let files = $state<ScannedFile[]>([]);
   let loading = $state(false);
   let initializing = $state(false);
@@ -207,7 +197,7 @@
   }
 
   // Build an aggregate "file" for the current path: sums of all visible children
-  function aggregatePathTotals(foldersArr: any[], p: string): FileItemStacked {
+  function aggregatePathTotals(foldersArr: any[], p: string): FileItem {
     let total_count = 0,
       total_size = 0,
       total_disk = 0,
@@ -538,13 +528,14 @@
       {/each}
     </div>
   {:else}
-    <!-- Folders -->
     <div class="flex flex-col gap-2 overflow-y-auto transition-opacity duration-200 p-4">
+      <!-- Folders -->
       {#each sortedfolders as file}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
-          class="relative p-2 cursor-pointer hover:opacity-95 bg-gray-700 border border-gray-600 rounded-lg overflow-hidden min-h-16 h-16"
+          class="relative px-2 py-1 cursor-pointer hover:opacity-95
+           bg-gray-700 border border-gray-600 rounded-lg overflow-hidden min-h-16"
           onclick={() => navigateTo(file.path)}
         >
           <!-- Stacked bar background -->
@@ -566,8 +557,8 @@
 
           <div class="flex flex-col gap-2 relative z-10 pointer-events-none">
             <div class="flex items-center justify-between gap-4">
-              <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap text-left [direction:rtl]">
-                <span class="[direction:ltr]">{displayPath(file.path)}</span>
+              <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap">
+                <span class="">{file.path}</span>
               </div>
               <span class="text-nowrap font-bold">{rightValue(file)}</span>
             </div>
@@ -580,45 +571,32 @@
           </div>
         </div>
       {/each}
-    </div>
-
-    <!-- Files (after folders) -->
-    {#if sortedfiles.length > 0}
-      <div class="px-4 pt-2 text-xs uppercase tracking-wider text-gray-400">Files</div>
-      <div class="flex flex-col gap-2 overflow-y-auto transition-opacity duration-200 p-4 pt-2">
-        {#each sortedfiles as f}
-          {@const ownerKey = String(f.uid)}
-          {@const color = userColors.get(ownerKey) || '#666'}
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <div class="relative p-2 bg-gray-700 border border-gray-600 rounded-lg overflow-hidden min-h-12 h-12">
-            <!-- single-owner color bar -->
-            <div
-              class="absolute left-0 top-0 bottom-0 z-0 opacity-60"
-              style="width: {filePct(f)}%; background-color: {color};"
-            ></div>
-
-            <div class="relative z-10 flex items-center justify-between gap-3">
-              <div class="flex items-center gap-3 min-w-0">
-                <span class="material-symbols-outlined text-base" style="color: {color}">{fileIconFor(f.path)}</span>
-                <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap text-left [direction:rtl]">
-                  <span class="[direction:ltr]">{displayPath(f.path)}</span>
-                </div>
-              </div>
-              <div class="flex items-center gap-4 text-sm">
-                <span class="font-semibold">{rightValueFile(f)}</span>
-              </div>
-            </div>
-            <div class="relative z-10 flex justify-end">
-              <p class="text-[10px] text-gray-300">
-                Size: {formatBytes(f.size)} • Owner: {users?.[ownerKey] || ownerKey} • Modified:
-                {new Date(f.modified * 1000).toLocaleDateString()}
-              </p>
-            </div>
+      <!-- Files (after folders) -->
+      {#each sortedfiles as f}
+        {@const ownerKey = String(f.uid)}
+        {@const color = userColors.get(ownerKey) || '#666'}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="flex">
+        <span class="material-symbols-outlined text-4xl">subdirectory_arrow_right</span>          
+        <div class="flex grow relative px-2 py-1 bg-gray-700 border-gray-600 
+          rounded overflow-hidden text-xs">
+          <div class="flex flex-col w-full">
+          <div class="absolute left-0 top-0 bottom-0 z-0 opacity-60 "
+            style="width: {filePct(f)}%; background-color: {color};"></div>
+          <div class="relative z-10 flex items-center justify-between gap-1">            
+            <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap ">{f.path}</div>
+            <div class="flex items-center gap-4 text-sm font-semibold text-nowrap">{rightValueFile(f)}</div>
           </div>
-        {/each}
+          <div class="relative z-10 flex justify-end text-gray-300">
+              Size: {formatBytes(f.size)} • Owner: {users?.[ownerKey] || ownerKey} • Modified:
+              {new Date(f.modified * 1000).toLocaleDateString()}            
+          </div>
+          </div>
+        </div>
+        </div>
+      {/each}
       </div>
     {/if}
-  {/if}
   <div class="grow"></div>
 </div>
 
