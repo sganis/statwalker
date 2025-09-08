@@ -73,3 +73,5 @@ jobs:
           name: statwaker-centos8
           path: app/src-tauri/target/**/release/bundle/**/*
           if-no-files-found: error
+
+          
