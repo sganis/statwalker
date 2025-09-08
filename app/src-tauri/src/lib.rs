@@ -1,5 +1,5 @@
-# .github/workflows/build-statwaker-rocky9.yml
-name: Build statwaker (Rocky Linux 9, app/)
+# .github/workflows/build-statwaker-fedora.yml
+name: Build statwaker (Fedora latest, app/)
 
 on:
   push:
@@ -7,12 +7,12 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-rocky9:
-    name: Rocky Linux 9 (x86_64)
+  build-fedora:
+    name: Fedora latest (x86_64)
     runs-on: ubuntu-latest
     container:
-      image: rockylinux:9
-      # Optional: help with DNS hiccups on GH runners
+      image: fedora:latest
+      # optional: harden DNS on GH runners
       options: --dns 1.1.1.1 --dns 8.8.8.8
     env:
       CARGO_HOME: /github/home/.cargo
@@ -20,25 +20,21 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
     steps:
-      # Install git *before* checkout (checkout runs inside the container)
-      - name: Prepare container (git + repo config)
+      # install git BEFORE checkout (we're inside the container)
+      - name: Prepare container (git + build deps)
         shell: bash
         run: |
           dnf -y update
-          dnf -y install --setopt=install_weak_deps=False dnf-plugins-core epel-release git which xz tar
-          dnf -y config-manager --set-enabled crb
+          dnf -y install --setopt=install_weak_deps=False \
+            git which xz tar gzip pkgconf-pkg-config \
+            gcc-c++ make patchelf rpm-build \
+            gtk3-devel librsvg2-devel openssl-devel \
+            libappindicator-gtk3 libappindicator-gtk3-devel
+          # Tauri v2 needs WebKitGTK 4.1; fallback to 4.0 if 4.1 is unavailable
+          dnf -y install webkit2gtk4.1-devel || dnf -y install webkit2gtk4.0-devel
 
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: System deps (GTK/WebKit & tooling for Tauri)
-        shell: bash
-        run: |
-          dnf -y install \
-            gcc-c++ make pkgconfig patchelf \
-            glib2-devel gtk3-devel webkit2gtk3 webkit2gtk3-devel \
-            librsvg2-devel libappindicator-gtk3 libappindicator-gtk3-devel \
-            openssl openssl-devel rpm-build
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -57,16 +53,8 @@ jobs:
             /github/home/.cargo/registry
             /github/home/.cargo/git
             app/src-tauri/target
-          key: rocky9-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: rocky9-cargo-
-
-      - name: Sanity checks
-        shell: bash
-        run: |
-          git --version
-          node -v
-          cargo -vV
-          rustc -vV
+          key: fedora-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: fedora-cargo-
 
       - name: Install JS deps
         working-directory: app
@@ -83,6 +71,6 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: statwaker-rocky9
+          name: statwaker-fedora
           path: app/src-tauri/target/**/release/bundle/**/*
           if-no-files-found: error
