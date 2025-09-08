@@ -20,7 +20,7 @@
   let path = $state("/");
   let files = $state<any[]>([]);
   let loading = $state(false);
-  let initializing = $state(true)
+  let initializing = $state(false)
   let progress_current = $state(0)
   let progress_total = $state(0)
   let progress_percent = $state(0)
@@ -120,7 +120,7 @@
   function goForward() { if (histIdx < history.length - 1) { histIdx += 1; path = history[histIdx]; fetchFiles(path); } }
   function onPathKeydown(e: KeyboardEvent) { if (e.key === "Enter") navigateTo(path); }
   async function scan() { 
-    let db = "/Users/san/dev/statwalker/rs/mac.agg.csv"
+    let db = "/Users/san/dev/statwalker/rs/mac.agg.small.csv"
     try{
       initializing = true
       users = await invoke("load_db", { path: db });
@@ -204,13 +204,15 @@
       </div>
     </button>
   </div>
-  <input
-      bind:value={path}
-      placeholder="Path..."
-      class="grow"
-      onkeydown={onPathKeydown}
-      aria-busy={loading}
-    />
+  <div class="flex">
+    <input
+        bind:value={path}
+        placeholder="Path..."
+        class="grow"
+        onkeydown={onPathKeydown}
+        aria-busy={loading}
+      />
+  </div>
   {#if initializing}
     <div class="flex flex-col w-full h-full items-center justify-between font-mono">
       <div class="w-full bg-gray-700 rounded-full h-1">
@@ -279,4 +281,5 @@
       {/each}
     </div>
   {/if}
+  <div class="grow"></div>
 </div>

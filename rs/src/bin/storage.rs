@@ -2,12 +2,12 @@ use std::fmt;
 
 #[derive(Debug, Clone)]
 pub struct StorageInfo {
-    pub mount_point: String,
     pub device: String,
     pub filesystem: String,
     pub total_bytes: u64,
     pub used_bytes: u64,
     pub available_bytes: u64,
+    pub mount_points: Vec<String>,
 }
 
 impl StorageInfo {
@@ -22,15 +22,23 @@ impl StorageInfo {
 
 impl fmt::Display for StorageInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let binding = "Unknown".to_string();
+        let main_mount = self.mount_points.first().unwrap_or(&binding);
+        let mount_info = if self.mount_points.len() > 1 {
+            format!("{} (+{} others)", main_mount, self.mount_points.len() - 1)
+        } else {
+            main_mount.clone()
+        };
+        
         write!(
             f,
-            "Mount: {} | Device: {} | FS: {} | Total: {:.2} GB | Used: {:.2} GB | Available: {:.2} GB | Usage: {:.1}%",
-            self.mount_point,
+            "Device: {} | Mount: {} | Total: {:.2} GB | Used: {:.2} GB | Usage: {:.1}%",
             self.device,
-            self.filesystem,
+            mount_info,
+            //self.filesystem,
             self.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             self.used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            self.available_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            //self.available_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             self.usage_percentage()
         )
     }
@@ -41,15 +49,14 @@ mod linux {
     use super::StorageInfo;
     use std::fs::File;
     use std::io::{BufRead, BufReader, Result};
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
-    extern "C" {
+    unsafe extern "C" {
         fn statvfs(path: *const libc::c_char, buf: *mut libc::statvfs) -> libc::c_int;
     }
 
     pub fn get_storage_info() -> Result<Vec<StorageInfo>> {
-        let mut storages = Vec::new();
-        let mut seen_devices = HashSet::new();
+        let mut device_map: HashMap<String, StorageInfo> = HashMap::new();
         
         // Read /proc/mounts to get mounted filesystems
         let file = File::open("/proc/mounts")?;
@@ -67,20 +74,52 @@ mod linux {
             let mount_point = parts[1];
             let filesystem = parts[2];
             
-            // Skip virtual filesystems and duplicates
-            if should_skip_filesystem(filesystem, device) || seen_devices.contains(device) {
+            // Skip virtual filesystems
+            if should_skip_filesystem(filesystem, device) {
                 continue;
             }
             
-            seen_devices.insert(device.to_string());
+            // Get the base device name (remove partition numbers and snap paths)
+            let base_device = get_base_device(device);
             
             // Get storage statistics
-            if let Some(storage_info) = get_statvfs_info(mount_point, device, filesystem) {
-                storages.push(storage_info);
+            if let Some(stats) = get_statvfs_info(mount_point, device, filesystem) {
+                if let Some(existing) = device_map.get_mut(&base_device) {
+                    // Add mount point to existing device
+                    existing.mount_points.push(mount_point.to_string());
+                } else {
+                    // Create new device entry
+                    device_map.insert(base_device.clone(), StorageInfo {
+                        device: base_device,
+                        filesystem: stats.filesystem,
+                        total_bytes: stats.total_bytes,
+                        used_bytes: stats.used_bytes,
+                        available_bytes: stats.available_bytes,
+                        mount_points: vec![mount_point.to_string()],
+                    });
+                }
             }
         }
         
-        Ok(storages)
+        Ok(device_map.into_values().collect())
+    }
+    
+    fn get_base_device(device: &str) -> String {
+        // Remove partition numbers and snap paths to get base device
+        if device.starts_with("/dev/") {
+            // Remove partition numbers (e.g., /dev/sda1 -> /dev/sda)
+            let base = device.trim_end_matches(|c: char| c.is_ascii_digit());
+            // Handle nvme drives (e.g., /dev/nvme0n1p1 -> /dev/nvme0n1)
+            if base.contains("nvme") && base.ends_with("n") {
+                return format!("{}1", base);
+            }
+            base.to_string()
+        } else if device.starts_with("/dev/mapper/") || device.contains("snap") {
+            // Keep full path for mapped devices and snaps
+            device.to_string()
+        } else {
+            device.to_string()
+        }
     }
     
     fn should_skip_filesystem(filesystem: &str, device: &str) -> bool {
@@ -112,12 +151,12 @@ mod linux {
             let used_bytes = total_bytes - free_bytes;
             
             Some(StorageInfo {
-                mount_point: mount_point.to_string(),
                 device: device.to_string(),
                 filesystem: filesystem.to_string(),
                 total_bytes,
                 used_bytes,
                 available_bytes,
+                mount_points: vec![mount_point.to_string()],
             })
         } else {
             None
@@ -129,21 +168,20 @@ mod linux {
 mod macos {
     use super::StorageInfo;
     use std::io::Result;
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
-    extern "C" {
+    unsafe extern "C" {
         fn getmntinfo(mntbufp: *mut *mut libc::statfs, flags: libc::c_int) -> libc::c_int;
     }
 
     pub fn get_storage_info() -> Result<Vec<StorageInfo>> {
-        let mut storages = Vec::new();
-        let mut seen_devices = HashSet::new();
+        let mut device_map: HashMap<String, StorageInfo> = HashMap::new();
         
         let mut mounts_ptr: *mut libc::statfs = std::ptr::null_mut();
         let mount_count = unsafe { getmntinfo(&mut mounts_ptr, libc::MNT_WAIT) };
         
         if mount_count < 0 {
-            return Ok(storages);
+            return Ok(vec![]);
         }
         
         unsafe {
@@ -160,12 +198,13 @@ mod macos {
                     .to_string_lossy()
                     .to_string();
                 
-                // Skip virtual filesystems and duplicates
-                if should_skip_filesystem(&filesystem, &device) || seen_devices.contains(&device) {
+                // Skip virtual filesystems
+                if should_skip_filesystem(&filesystem, &device) {
                     continue;
                 }
                 
-                seen_devices.insert(device.clone());
+                // Get base device (physical disk)
+                let base_device = get_base_device(&device);
                 
                 let block_size = mount.f_bsize as u64;
                 let total_bytes = mount.f_blocks * block_size;
@@ -173,18 +212,35 @@ mod macos {
                 let free_bytes = mount.f_bfree * block_size;
                 let used_bytes = total_bytes - free_bytes;
                 
-                storages.push(StorageInfo {
-                    mount_point,
-                    device,
-                    filesystem,
-                    total_bytes,
-                    used_bytes,
-                    available_bytes,
-                });
+                if let Some(existing) = device_map.get_mut(&base_device) {
+                    // Add mount point to existing device
+                    existing.mount_points.push(mount_point);
+                } else {
+                    // Create new device entry
+                    device_map.insert(base_device.clone(), StorageInfo {
+                        device: base_device,
+                        filesystem,
+                        total_bytes,
+                        used_bytes,
+                        available_bytes,
+                        mount_points: vec![mount_point],
+                    });
+                }
             }
         }
         
-        Ok(storages)
+        Ok(device_map.into_values().collect())
+    }
+    
+    fn get_base_device(device: &str) -> String {
+        // For APFS, extract the base disk from device names like /dev/disk3s1s1
+        if device.starts_with("/dev/disk") {
+            // Extract base disk number (e.g., /dev/disk3s1s1 -> /dev/disk3)
+            if let Some(pos) = device.find('s') {
+                return device[..pos].to_string();
+            }
+        }
+        device.to_string()
     }
     
     fn should_skip_filesystem(filesystem: &str, device: &str) -> bool {
@@ -195,8 +251,7 @@ mod macos {
         
         virtual_fs.contains(&filesystem) ||
         device.starts_with("map ") ||
-        device == "devfs" ||
-        mount_point.starts_with("/dev")
+        device == "devfs"
     }
 }
 
@@ -205,7 +260,7 @@ mod windows {
     use super::StorageInfo;
     use std::io::Result;
     use std::ffi::OsString;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStringExt, OsStrExt};
     
     unsafe extern "system" {
         fn GetLogicalDrives() -> u32;
@@ -312,19 +367,19 @@ mod windows {
         };
         
         let drive_type_str = match drive_type {
-            DRIVE_FIXED => "Fixed",
-            DRIVE_REMOVABLE => "Removable",
-            DRIVE_REMOTE => "Network",
-            _ => "Unknown",
+            DRIVE_FIXED => "Fixed Drive",
+            DRIVE_REMOVABLE => "Removable Drive",
+            DRIVE_REMOTE => "Network Drive",
+            _ => "Unknown Drive",
         };
         
         Some(StorageInfo {
-            mount_point: drive_path.to_string(),
             device: format!("{} ({})", drive_path, drive_type_str),
             filesystem,
             total_bytes,
             used_bytes,
             available_bytes,
+            mount_points: vec![drive_path.to_string()],
         })
     }
 }
@@ -356,7 +411,7 @@ pub fn get_all_storage_info() -> std::io::Result<Vec<StorageInfo>> {
 
 // Example usage and test function
 fn main() -> std::io::Result<()> {
-    println!("Storage Information:");
+    println!("Physical Storage Devices:");
     println!("{}", "=".repeat(120));
     
     match get_all_storage_info() {
@@ -366,6 +421,9 @@ fn main() -> std::io::Result<()> {
             } else {
                 for storage in storages {
                     println!("{}", storage);
+                    if storage.mount_points.len() > 1 {
+                        println!("  Mount points: {}", storage.mount_points.join(", "));
+                    }
                 }
             }
         }
@@ -392,8 +450,8 @@ mod tests {
         
         for storage in storages {
             // Basic validation
-            assert!(!storage.mount_point.is_empty());
             assert!(!storage.device.is_empty());
+            assert!(!storage.mount_points.is_empty());
             assert!(storage.total_bytes > 0);
             assert!(storage.used_bytes <= storage.total_bytes);
             assert!(storage.available_bytes <= storage.total_bytes);
@@ -403,17 +461,16 @@ mod tests {
     #[test]
     fn test_storage_info_display() {
         let storage = StorageInfo {
-            mount_point: "/".to_string(),
-            device: "/dev/sda1".to_string(),
+            device: "/dev/sda".to_string(),
             filesystem: "ext4".to_string(),
             total_bytes: 1_000_000_000_000, // 1 TB
             used_bytes: 500_000_000_000,    // 500 GB
             available_bytes: 500_000_000_000, // 500 GB
+            mount_points: vec!["/".to_string()],
         };
         
         let display_str = format!("{}", storage);
-        assert!(display_str.contains("/"));
-        assert!(display_str.contains("/dev/sda1"));
+        assert!(display_str.contains("/dev/sda"));
         assert!(display_str.contains("ext4"));
         assert!(display_str.contains("50.0%"));
     }
