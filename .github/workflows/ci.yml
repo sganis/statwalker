@@ -28,6 +28,10 @@ jobs:
 
       - name: System deps (GTK/WebKit & tooling for Tauri)
         run: |
+          # Fix CentOS 8 EOL repository issues
+          sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*
+          sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*
+          
           dnf -y update
           dnf -y install epel-release dnf-plugins-core
           dnf -y config-manager --set-enabled powertools || dnf -y config-manager --set-enabled PowerTools
@@ -73,5 +77,4 @@ jobs:
           name: statwaker-centos8
           path: app/src-tauri/target/**/release/bundle/**/*
           if-no-files-found: error
-
           
