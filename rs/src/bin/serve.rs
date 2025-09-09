@@ -159,21 +159,21 @@ struct UserStats {
 }
 
 #[derive(Serialize, Debug, Clone)]
-struct UserStatsJson {
-    username: String,
-    count: u64,
-    size: f64,  // GiB
-    disk: f64,  // GiB
+pub struct UserStatsJson {
+    pub username: String,
+    pub count: u64,
+    pub size: f64,  // GiB
+    pub disk: f64,  // GiB
 }
 
 #[derive(Serialize, Debug, Clone)]
-struct FileItemStacked {
-    path: String,
-    total_count: u64,
-    total_size: f64,   // GiB
-    total_disk: f64,   // GiB
-    modified: String,  // ISO date string
-    users: HashMap<String, UserStatsJson>, // keyed by username
+pub struct FileItem {
+    pub path: String,
+    pub total_count: u64,
+    pub total_size: f64,   // GiB
+    pub total_disk: f64,   // GiB
+    pub modified: String,  // ISO date string
+    pub users: HashMap<String, UserStatsJson>, // keyed by username
 }
 
 #[derive(Debug, Clone)]
@@ -292,7 +292,7 @@ impl InMemoryFSIndex {
         &self,
         dir_path: &str,
         user_filter: &Vec<String>, // [] => all users (by username)
-    ) -> AResult<Vec<FileItemStacked>> {
+    ) -> AResult<Vec<FileItem>> {
         let components = Self::path_to_components(dir_path);
         let mut current = &self.root;
         for component in components {
@@ -379,7 +379,7 @@ impl InMemoryFSIndex {
                     }
                 }
 
-                items.push(FileItemStacked {
+                items.push(FileItem {
                     path: full_path,
                     total_count,
                     total_size,
