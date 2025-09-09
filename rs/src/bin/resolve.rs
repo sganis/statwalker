@@ -75,8 +75,8 @@ fn main() -> Result<()> {
         let uid = parse_u32(r.get(3), "UID", line_no)?;
         let gid = parse_u32(r.get(4), "GID", line_no)?;
         let mode_raw = parse_u32(r.get(5), "MODE", line_no)?;
-        let size_b = parse_u128(r.get(6), "SIZE", line_no)?;
-        let disk_b = parse_u128(r.get(7), "DISK", line_no)?;
+        let size_b = parse_u64(r.get(6), "SIZE", line_no)?;
+        let disk_b = parse_u64(r.get(7), "DISK", line_no)?;
         let path_raw = r.get(8).unwrap_or("");
         
         // Unquote the path if it's already quoted (from input CSV)
@@ -104,8 +104,8 @@ fn main() -> Result<()> {
         // aggregation - use unquoted path
         //aggregate_folder_stats(&path, size_b, disk_b, mtime, uid, &mut agg_data);
 
-        let size_gb = bytes_to_gb(size_b);
-        let disk_gb = bytes_to_gb(disk_b);
+        // let size_gb = bytes_to_gb(size_b);
+        // let disk_gb = bytes_to_gb(disk_b);
 
         // Smart quoting - only quote if needed
         //let quoted_path = csv_quote_if_needed(&path);
@@ -118,8 +118,8 @@ fn main() -> Result<()> {
             &group,
             &ftype,
             &perm,
-            &size_gb,
-            &disk_gb,
+            &size_b.to_string(),
+            &disk_b.to_string(),
             &path,
             &category,
             &hash,
@@ -161,9 +161,9 @@ fn parse_u32(s: Option<&str>, field: &str, line: usize) -> Result<u32> {
         .with_context(|| format!("parsing field `{}`='{}' at line {}", field, raw, line))
 }
 
-fn parse_u128(s: Option<&str>, field: &str, line: usize) -> Result<u128> {
+fn parse_u64(s: Option<&str>, field: &str, line: usize) -> Result<u64> {
     let raw = s.unwrap_or("0").trim();
-    raw.parse::<u128>()
+    raw.parse::<u64>()
         .with_context(|| format!("parsing field `{}`='{}' at line {}", field, raw, line))
 }
 
@@ -183,7 +183,7 @@ fn fmt_day(ts: i64, cache: &mut HashMap<i64, String>, off: time::UtcOffset) -> S
     s
 }
 
-fn bytes_to_gb(b: u128) -> String {
+fn _bytes_to_gb(b: u128) -> String {
     // 1 GiB = 1073741824 bytes
     let gb = (b as f64) / 1073741824.0;
     format!("{:.6}", gb)

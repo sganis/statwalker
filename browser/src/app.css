@@ -12,21 +12,154 @@ html, body {
     padding: 0;
     background-color: #181812;
     color: #F8F8F2;
-    font-size: x-large;
+    /* font-size: large; */
 }
 
 :root {
-    --color: #272822
+  --color: #272822;
+
+  --sv-min-height: 40px;
+  --sv-border-radius: 0.25rem;   /* 4px */
+  --sv-border-color: #6b7280;    /* gray-500 */
+  --sv-bg: #1f2937;              /* bg-gray-800 */
+  --sv-dropdown-active-bg: #6b7280;
 }
+
+/* wrapper draws NO border */
+.svelecte{
+  border: 0 !important;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* single border on the control, fixed height */
+.svelecte .sv-control{
+  box-sizing: border-box;
+  min-height: var(--sv-min-height);
+  height: var(--sv-min-height);
+  border: 1px solid var(--sv-border-color) !important;
+  border-radius: var(--sv-border-radius);
+  background: var(--sv-bg);
+  padding: 0 0.5rem;
+  overflow: hidden;
+}
+
+/* kill ALL focus outlines/rings (Chrome/Safari/Firefox) */
+.svelecte,
+.svelecte *{
+  outline: none !important;
+  outline-color: transparent !important;
+  box-shadow: none !important;
+}
+
+/* when focused/open, keep the exact same single border (no blue ring) */
+.svelecte:focus,
+.svelecte:focus-within,
+.svelecte .sv-control:focus,
+.svelecte .sv-control:focus-within,
+.svelecte .sv-control:focus-visible,
+.svelecte .sv-control.is-focused{
+  border-color: var(--sv-border-color) !important;
+}
+
+/* inner input shouldn’t add its own focus ring either */
+.svelecte .sv-input input,
+.svelecte .sv-input input:focus,
+.svelecte .sv-input input:focus-visible{
+  outline: none !important;
+  box-shadow: none !important;
+}
+
+/* vertically center content and lock inner height so it won't grow */
+.svelecte .sv-item-wrap,
+.svelecte .sv-placeholder,
+.svelecte .sv-selected,
+.svelecte .sv-input{
+  height: calc(var(--sv-min-height) - 2px); /* minus 1px top/bottom border */
+  line-height: calc(var(--sv-min-height) - 2px);
+  display: flex;
+  align-items: center;
+}
+
+/* icons aligned to fixed height */
+.svelecte .sv-arrow,
+.svelecte .sv-clear{
+  height: calc(var(--sv-min-height) - 2px);
+  display: flex;
+  align-items: center;
+}
+
+/* optional: prevent multi-line tag wrap growth in multi-select */
+.svelecte .sv-item-wrap{
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  gap: .25rem;
+}
+
+/* Dark dropdown container */
+.svelecte .sv-dropdown {
+  background: #1f2937 !important;             /* bg-gray-800 */
+  border: 1px solid #6b7280 !important;        /* border-gray-500 */
+  box-shadow: 0 8px 24px rgba(0,0,0,.35) !important;
+  color: #e5e7eb !important;                   /* text-gray-200 */
+}
+
+/* List area */
+.svelecte .sv-dropdown .sv-list {
+  background: transparent !important;
+  color: inherit !important;
+  max-height: 320px; /* or your var */
+}
+
+/* Items: base, hover/active, selected */
+.svelecte .sv-dropdown .sv-item {
+  background: transparent !important;
+  color: #e5e7eb !important;                   /* text-gray-200 */
+}
+
+.svelecte .sv-dropdown .sv-item:hover,
+.svelecte .sv-dropdown .sv-item.is-active,
+.svelecte .sv-dropdown .sv-item[aria-activedescendant="true"],
+.svelecte .sv-dropdown .sv-item[aria-selected="true"]:hover {
+  background: #374151 !important;              /* gray-700 */
+  color: #f3f4f6 !important;                   /* text-gray-100 */
+}
+
+.svelecte .sv-dropdown .sv-item.is-selected,
+.svelecte .sv-dropdown .sv-item[aria-selected="true"] {
+  background: #111827 !important;              /* gray-900 */
+  color: #f3f4f6 !important;
+}
+
+/* Group/header/separator + empty/create rows */
+.svelecte .sv-dropdown .sv-separator { 
+  background: #374151 !important;              /* gray-700 */
+}
+.svelecte .sv-dropdown .sv-empty,
+.svelecte .sv-dropdown .sv-create {
+  background: transparent !important;
+  color: #9ca3af !important;                   /* gray-400 */
+  border-color: #4b5563 !important;            /* gray-600 (if any borders) */
+}
+
+/* Optional: dark scrollbars */
+.svelecte .sv-dropdown .sv-list::-webkit-scrollbar { width: 8px; }
+.svelecte .sv-dropdown .sv-list::-webkit-scrollbar-thumb {
+  background: #4b5563; border-radius: 4px;
+}
+
+
+/* your existing controls (unchanged) */
 .btn {
-    @apply border border-gray-500 rounded px-4 h-10 text-nowrap
-     bg-gray-800 text-gray-100 hover:bg-gray-700 cursor-pointer
-     disabled:opacity-50 disabled:cursor-not-allowed;
+  @apply border border-gray-500 rounded px-4 h-10 text-nowrap
+         bg-gray-800 text-gray-100 hover:bg-gray-700 cursor-pointer
+         disabled:opacity-50 disabled:cursor-not-allowed;
 }
 input {
-    @apply border border-gray-500 rounded px-2 h-10
-     bg-gray-800 text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500;
+  @apply border border-gray-500 rounded px-2 h-10
+         bg-gray-800 text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500;
 }
+
 select {
   @apply border border-gray-500 rounded px-4 h-10
     bg-gray-800 text-gray-100

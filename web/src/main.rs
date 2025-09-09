@@ -19,155 +19,12 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
 #[cfg(unix)]
-use std::ffi::CStr;
-
-#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-// ===================== File/Dir scanner (Unix) =====================
-
-#[derive(Debug, Clone, Serialize)]
-pub struct FsItem {
-    pub path: String,
-    pub size: u64,
-    pub modified: i64, // seconds since epoch
-    pub mode: u32,     // unix perms
-    pub uid: u32,
-    pub gid: u32,
-}
-
-/// List only regular files in `folder` owned by `uid` (non-recursive).
-#[cfg(unix)]
-pub fn get_items<P: AsRef<Path>>(folder: P, uid: u32) -> AResult<Vec<FsItem>> {
-    let mut out = Vec::new();
-
-    let dir = fs::read_dir(&folder)
-        .with_context(|| format!("read_dir({}) failed", folder.as_ref().display()))?;
-
-    for entry_res in dir {
-        let entry = match entry_res {
-            Ok(e) => e,
-            Err(_) => continue, // skip unreadable entries
-        };
-        let path = entry.path();
-
-        // Don't follow symlinks; we only want regular files.
-        let md = match fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        if !md.file_type().is_file() {
-            continue;
-        }
-
-        if md.uid() != uid {
-            continue;
-        }
-
-        out.push(FsItem {
-            path: path.to_string_lossy().into_owned(),
-            size: md.size(),
-            modified: md.mtime(),
-            mode: md.mode(),
-            uid: md.uid(),
-            gid: md.gid(),
-        });
-    }
-
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(out)
-}
-
-#[cfg(not(unix))]
-pub fn get_items<P: AsRef<Path>>(_folder: P, _uid: u32) -> AResult<Vec<FsItem>> {
-    anyhow::bail!("get_items(folder, uid) is only implemented on Unix-like systems.");
-}
-
-/// List all regular files (no owner filtering), non-recursive.
-#[cfg(unix)]
-pub fn get_items_all<P: AsRef<Path>>(folder: P) -> AResult<Vec<FsItem>> {
-    let mut out = Vec::new();
-
-    let dir = fs::read_dir(&folder)
-        .with_context(|| format!("read_dir({}) failed", folder.as_ref().display()))?;
-
-    for entry_res in dir {
-        let entry = match entry_res {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let path = entry.path();
-
-        let md = match fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        if !md.file_type().is_file() {
-            continue;
-        }
-
-        out.push(FsItem {
-            path: path.to_string_lossy().into_owned(),
-            size: md.size(),
-            modified: md.mtime(),
-            mode: md.mode(),
-            uid: md.uid(),
-            gid: md.gid(),
-        });
-    }
-
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(out)
-}
-
-#[cfg(not(unix))]
-pub fn get_items_all<P: AsRef<Path>>(_folder: P) -> AResult<Vec<FsItem>> {
-    anyhow::bail!("get_items_all(folder) is only implemented on Unix-like systems.");
-}
-
-// ===================== Username resolution (for CSV index) =====================
+use chrono::{NaiveDateTime, Utc};
 
 #[cfg(unix)]
-fn get_username_from_uid(uid: u32) -> String {
-    unsafe {
-        let passwd = libc::getpwuid(uid);
-        if passwd.is_null() {
-            return "UNK".to_string();
-        }
-        let name_ptr = (*passwd).pw_name;
-        if name_ptr.is_null() {
-            return "UNK".to_string();
-        }
-        match CStr::from_ptr(name_ptr).to_str() {
-            Ok(name) => name.to_string(),
-            Err(_) => "UNK".to_string(),
-        }
-    }
-}
-
-#[cfg(unix)]
-fn resolve_usernames(all_users: &HashSet<i32>) -> HashMap<i32, String> {
-    let mut uid_name_map = HashMap::new();
-    for &uid in all_users {
-        if uid < 0 {
-            continue;
-        }
-        let uname = get_username_from_uid(uid as u32);
-        uid_name_map.insert(uid, uname);
-    }
-    uid_name_map
-}
-
-#[cfg(not(unix))]
-fn resolve_usernames(all_users: &HashSet<i32>) -> HashMap<i32, String> {
-    let mut uid_name_map = HashMap::new();
-    for &uid in all_users {
-        uid_name_map.insert(uid, "UNK".to_string());
-    }
-    uid_name_map
-}
+use std::ffi::CStr;
 
 // ===================== Helpers =====================
 
@@ -181,44 +38,143 @@ fn unquote_csv_field(field: &str) -> String {
     }
 }
 
-// ===================== Core data types (index) =====================
+fn epoch_secs_to_iso_date(secs: i64) -> String {
+    let ndt = NaiveDateTime::from_timestamp_opt(secs, 0)
+        .unwrap_or_else(|| NaiveDateTime::from_timestamp_opt(0, 0).unwrap());
+    chrono::DateTime::<Utc>::from_utc(ndt, Utc)
+        .date_naive()
+        .to_string() // "YYYY-MM-DD"
+}
+
+#[cfg(unix)]
+fn username_from_uid(uid: u32) -> String {
+    unsafe {
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() {
+            return "UNK".to_string();
+        }
+        let name_ptr = (*pw).pw_name;
+        if name_ptr.is_null() {
+            return "UNK".to_string();
+        }
+        match CStr::from_ptr(name_ptr).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => "UNK".to_string(),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn username_from_uid(_uid: u32) -> String {
+    "UNK".to_string()
+}
+
+// ===================== File scan output (for /api/files) =====================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FsItemOut {
+    pub path: String,
+    pub owner: String,   // username
+    pub size: u64,       // bytes
+    pub modified: String // "YYYY-MM-DD" (UTC)
+}
+
+/// List regular files in `folder`. If `usernames` is empty → all users.
+/// Otherwise, include only files owned by a username in the provided list.
+/// Non-recursive.
+#[cfg(unix)]
+pub fn get_items<P: AsRef<Path>>(folder: P, usernames: &[String]) -> AResult<Vec<FsItemOut>> {
+    let filter: Option<HashSet<String>> = if usernames.is_empty() {
+        None
+    } else {
+        Some(usernames.iter().cloned().collect())
+    };
+
+    let mut out = Vec::new();
+
+    let dir = fs::read_dir(&folder)
+        .with_context(|| format!("read_dir({}) failed", folder.as_ref().display()))?;
+
+    for entry_res in dir {
+        let entry = match entry_res {
+            Ok(e) => e,
+            Err(_) => continue, // skip unreadable entries
+        };
+        let path = entry.path();
+
+        let md = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        if !md.file_type().is_file() {
+            continue;
+        }
+
+        let owner = username_from_uid(md.uid());
+
+        if let Some(ref allow) = filter {
+            if !allow.contains(&owner) {
+                continue;
+            }
+        }
+
+        out.push(FsItemOut {
+            path: path.to_string_lossy().into_owned(),
+            owner,
+            size: md.size(),
+            modified: epoch_secs_to_iso_date(md.mtime()),
+        });
+    }
+
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+#[cfg(not(unix))]
+pub fn get_items<P: AsRef<Path>>(_folder: P, _usernames: &[String]) -> AResult<Vec<FsItemOut>> {
+    anyhow::bail!("get_items(folder, usernames) is only implemented on Unix-like systems.");
+}
+
+// ===================== Aggregated index (folders) =====================
+// NOTE: This matches your current aggregated CSV shape:
+//   path,user,file_count,file_size,disk_usage,latest_modified
+// where sizes are stored as GiB (f64) and dates are ISO strings.
 
 #[derive(Serialize, Debug, Clone)]
 struct AggRowBin {
     file_count: u64,
-    file_size: u128,
-    disk_usage: u128,
-    latest_mtime: i64,
-    users: HashSet<i32>,
+    file_size: f64,       // GiB
+    disk_usage: f64,      // GiB
+    latest_mtime: String, // ISO date string
+    users: HashSet<String>, // usernames
 }
 
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone)]
 struct UserStats {
     file_count: u64,
-    file_size: u128,
-    disk_usage: u128,
-    latest_mtime: i64,
+    file_size: f64,  // GiB
+    disk_usage: f64, // GiB
+    latest_mtime: String,
 }
 
 #[derive(Serialize, Debug, Clone)]
 struct UserStatsJson {
     username: String,
     count: u64,
-    size: u128,
-    disk: u128,
+    size: f64,  // GiB
+    disk: f64,  // GiB
 }
 
 #[derive(Serialize, Debug, Clone)]
 struct FileItemStacked {
     path: String,
     total_count: u64,
-    total_size: u128,
-    total_disk: u128,
-    modified: i64,
-    users: HashMap<i32, UserStatsJson>,
+    total_size: f64,   // GiB
+    total_disk: f64,   // GiB
+    modified: String,  // ISO date string
+    users: HashMap<String, UserStatsJson>, // keyed by username
 }
-
-// ===================== In-memory trie index (still used for /folders & /users) =====================
 
 #[derive(Debug, Clone)]
 struct TrieNode {
@@ -233,7 +189,7 @@ impl TrieNode {
 pub struct InMemoryFSIndex {
     root: TrieNode,
     total_entries: usize,
-    per_user: HashMap<(String, i32), UserStats>, // per-(path, uid)
+    per_user: HashMap<(String, String), UserStats>, // (path, username)
 }
 
 impl InMemoryFSIndex {
@@ -241,56 +197,64 @@ impl InMemoryFSIndex {
         Self { root: TrieNode::new(), total_entries: 0, per_user: HashMap::new() }
     }
 
-    /// CSV columns: path, uid, file_count, file_size, disk_usage, latest_mtime
-    pub fn load_from_csv(&mut self, path: &FsPath) -> AResult<HashMap<i32, String>> {
+    /// CSV columns (with header): path,user,file_count,file_size,disk_usage,latest_modified
+    pub fn load_from_csv(&mut self, path: &FsPath) -> AResult<Vec<String>> {
         let mut rdr = ReaderBuilder::new()
-            .has_headers(false)
+            .has_headers(true)
             .from_path(path)
             .with_context(|| format!("Failed to open CSV file: {}", path.display()))?;
 
-        let mut all_users: HashSet<i32> = HashSet::new();
+        let mut all_users: HashSet<String> = HashSet::new();
         let mut loaded_count = 0usize;
 
         for (line_no, record) in rdr.records().enumerate() {
-            let record = record.with_context(|| format!("Failed to read CSV line {}", line_no + 1))?;
+            let record = record.with_context(|| format!("Failed to read CSV line {}", line_no + 2))?;
             if record.len() < 6 {
                 continue;
             }
 
             let path_str = unquote_csv_field(record.get(0).unwrap_or(""));
-            let uid: i32 = record.get(1).unwrap_or("0").parse().unwrap_or(0);
+            let username = record.get(1).unwrap_or("").trim().to_string();
             let file_count: u64 = record.get(2).unwrap_or("0").parse().unwrap_or(0);
-            let file_size: u128 = record.get(3).unwrap_or("0").parse().unwrap_or(0);
-            let disk_usage: u128 = record.get(4).unwrap_or("0").parse().unwrap_or(0);
-            let latest_mtime: i64 = record.get(5).unwrap_or("0").parse().unwrap_or(0);
+            let file_size: f64 = record.get(3).unwrap_or("0").parse().unwrap_or(0.0);
+            let disk_usage: f64 = record.get(4).unwrap_or("0").parse().unwrap_or(0.0);
+            let latest_mtime: String = record.get(5).unwrap_or("").trim().to_string();
 
-            all_users.insert(uid);
+            if path_str.is_empty() || username.is_empty() {
+                continue;
+            }
 
-            self.insert_merge(&path_str, file_count, file_size, disk_usage, latest_mtime, uid);
+            all_users.insert(username.clone());
 
-            // per-user stats with canonical key
-            let key = (Self::canonical_key(&path_str), uid);
+            self.insert_merge(&path_str, file_count, file_size, disk_usage, &latest_mtime, &username);
+
+            let key = (Self::canonical_key(&path_str), username.clone());
             let entry = self.per_user.entry(key).or_insert(UserStats::default());
             entry.file_count = entry.file_count.saturating_add(file_count);
-            entry.file_size  = entry.file_size.saturating_add(file_size);
-            entry.disk_usage = entry.disk_usage.saturating_add(disk_usage);
-            if latest_mtime > entry.latest_mtime { entry.latest_mtime = latest_mtime; }
+            entry.file_size  += file_size;
+            entry.disk_usage += disk_usage;
+            if entry.latest_mtime.is_empty() || entry.latest_mtime < latest_mtime {
+                entry.latest_mtime = latest_mtime.clone();
+            }
 
             loaded_count += 1;
         }
 
         self.total_entries = loaded_count;
-        Ok(resolve_usernames(&all_users))
+
+        let mut users: Vec<String> = all_users.into_iter().collect();
+        users.sort();
+        Ok(users)
     }
 
     fn insert_merge(
         &mut self,
         path: &str,
         file_count: u64,
-        file_size: u128,
-        disk_usage: u128,
-        latest_mtime: i64,
-        uid: i32,
+        file_size: f64,
+        disk_usage: f64,
+        latest_mtime: &str,
+        username: &str,
     ) {
         let components = Self::path_to_components(path);
         let mut current = &mut self.root;
@@ -303,15 +267,23 @@ impl InMemoryFSIndex {
         match &mut current.data {
             Some(data) => {
                 data.file_count = data.file_count.saturating_add(file_count);
-                data.file_size  = data.file_size.saturating_add(file_size);
-                data.disk_usage = data.disk_usage.saturating_add(disk_usage);
-                if latest_mtime > data.latest_mtime { data.latest_mtime = latest_mtime; }
-                data.users.insert(uid);
+                data.file_size  += file_size;
+                data.disk_usage += disk_usage;
+                if data.latest_mtime.is_empty() || data.latest_mtime.as_str() < latest_mtime {
+                    data.latest_mtime = latest_mtime.to_string();
+                }
+                data.users.insert(username.to_string());
             }
             None => {
                 let mut users = HashSet::new();
-                users.insert(uid);
-                current.data = Some(AggRowBin { file_count, file_size, disk_usage, latest_mtime, users });
+                users.insert(username.to_string());
+                current.data = Some(AggRowBin {
+                    file_count,
+                    file_size,
+                    disk_usage,
+                    latest_mtime: latest_mtime.to_string(),
+                    users,
+                });
             }
         }
     }
@@ -319,8 +291,7 @@ impl InMemoryFSIndex {
     pub fn list_children(
         &self,
         dir_path: &str,
-        uid_name_map: &HashMap<i32, String>,
-        user_filter: &Vec<i32>, // [] => all users
+        user_filter: &Vec<String>, // [] => all users (by username)
     ) -> AResult<Vec<FileItemStacked>> {
         let components = Self::path_to_components(dir_path);
         let mut current = &self.root;
@@ -341,13 +312,13 @@ impl InMemoryFSIndex {
                     format!("{}/{}", base_path.trim_end_matches('/'), child_name)
                 };
 
-                let users_to_show: Vec<i32> = if user_filter.is_empty() {
-                    data.users.iter().copied().collect()
+                let users_to_show: Vec<String> = if user_filter.is_empty() {
+                    data.users.iter().cloned().collect()
                 } else {
                     data.users
                         .iter()
-                        .copied()
-                        .filter(|uid| user_filter.contains(uid))
+                        .filter(|u| user_filter.contains(*u))
+                        .cloned()
                         .collect()
                 };
 
@@ -355,11 +326,11 @@ impl InMemoryFSIndex {
                     continue;
                 }
 
-                let mut user_stats: HashMap<i32, UserStatsJson> = HashMap::new();
+                let mut user_stats: HashMap<String, UserStatsJson> = HashMap::new();
                 let mut total_count: u64;
-                let mut total_size:  u128;
-                let mut total_disk:  u128;
-                let mut modified:    i64;
+                let mut total_size:  f64;
+                let mut total_disk:  f64;
+                let mut modified:    String;
 
                 let pkey = Self::canonical_key(&full_path);
 
@@ -367,13 +338,12 @@ impl InMemoryFSIndex {
                     total_count = data.file_count;
                     total_size  = data.file_size;
                     total_disk  = data.disk_usage;
-                    modified    = data.latest_mtime;
+                    modified    = data.latest_mtime.clone();
 
-                    for uid in users_to_show {
-                        if let Some(stats) = self.per_user.get(&(pkey.clone(), uid)) {
-                            let username = uid_name_map.get(&uid).map(|s| s.as_str()).unwrap_or("UNK");
-                            user_stats.insert(uid, UserStatsJson {
-                                username: username.to_string(),
+                    for uname in users_to_show {
+                        if let Some(stats) = self.per_user.get(&(pkey.clone(), uname.clone())) {
+                            user_stats.insert(uname.clone(), UserStatsJson {
+                                username: uname,
                                 count: stats.file_count,
                                 size:  stats.file_size,
                                 disk:  stats.disk_usage,
@@ -382,24 +352,25 @@ impl InMemoryFSIndex {
                     }
                 } else {
                     total_count = 0;
-                    total_size  = 0;
-                    total_disk  = 0;
-                    modified    = 0;
+                    total_size  = 0.0;
+                    total_disk  = 0.0;
+                    modified    = String::new();
 
-                    for uid in users_to_show {
-                        if let Some(stats) = self.per_user.get(&(pkey.clone(), uid)) {
-                            let username = uid_name_map.get(&uid).map(|s| s.as_str()).unwrap_or("UNK");
-                            user_stats.insert(uid, UserStatsJson {
-                                username: username.to_string(),
+                    for uname in users_to_show {
+                        if let Some(stats) = self.per_user.get(&(pkey.clone(), uname.clone())) {
+                            user_stats.insert(uname.clone(), UserStatsJson {
+                                username: uname.clone(),
                                 count: stats.file_count,
                                 size:  stats.file_size,
                                 disk:  stats.disk_usage,
                             });
 
                             total_count = total_count.saturating_add(stats.file_count);
-                            total_size  = total_size.saturating_add(stats.file_size);
-                            total_disk  = total_disk.saturating_add(stats.disk_usage);
-                            if stats.latest_mtime > modified { modified = stats.latest_mtime; }
+                            total_size  += stats.file_size;
+                            total_disk  += stats.disk_usage;
+                            if modified.is_empty() || modified.as_str() < stats.latest_mtime.as_str() {
+                                modified = stats.latest_mtime.clone();
+                            }
                         }
                     }
 
@@ -453,10 +424,10 @@ impl InMemoryFSIndex {
 // ===================== Globals =====================
 
 static FS_INDEX: OnceLock<InMemoryFSIndex> = OnceLock::new();
-static USER_NAME_MAP: OnceLock<HashMap<i32, String>> = OnceLock::new();
+static USERS: OnceLock<Vec<String>> = OnceLock::new();
 
-fn get_users() -> &'static HashMap<i32, String> {
-    USER_NAME_MAP.get().expect("User map not initialized")
+fn get_users() -> &'static Vec<String> {
+    USERS.get().expect("User list not initialized")
 }
 
 // ===================== Web layer =====================
@@ -465,47 +436,62 @@ fn get_users() -> &'static HashMap<i32, String> {
 struct FolderQuery {
     /// path inside the indexed tree. If omitted/empty -> "/"
     path: Option<String>,
-    /// Comma-separated UIDs. If omitted/empty -> all users
+    /// Comma-separated usernames. If omitted/empty -> all users
+    users: Option<String>,
+    /// Legacy alias (also usernames): ?uids=support,san
     uids: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct FilesQuery {
     path: Option<String>,
-    /// Accept both "uid" and "uids" for convenience (CSV list).
-    uid: Option<String>,
+    /// Username filter: comma-separated "users=support,san"
+    users: Option<String>,
+    /// Legacy alias for usernames: "uids=support,san"
     uids: Option<String>,
 }
 
-fn parse_uids_i32(s: &str) -> Vec<i32> {
-    s.split(',').filter_map(|p| p.trim().parse::<i32>().ok()).collect()
-}
-fn parse_uids_u32(s: &str) -> Vec<u32> {
-    s.split(',').filter_map(|p| p.trim().parse::<u32>().ok()).collect()
+fn parse_users_csv(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
+        .collect()
 }
 
 async fn users_handler() -> impl IntoResponse {
     Json(get_users().clone())
 }
 
-/// NEW: /api/folders?path=/Users/foo&uids=0,43  (reads from index)
+/// /api/folders?path=/Users/foo&users=alice,bob  (reads from index)
+/// also supports legacy ?uids=alice,bob (treated as usernames)
 async fn get_folders_handler(Query(q): Query<FolderQuery>) -> impl IntoResponse {
     // normalize path
     let mut path = q.path.unwrap_or_else(|| "/".to_string());
     if path.is_empty() { path = "/".to_string(); }
     if !path.starts_with('/') { path = format!("/{}", path); }
 
-    // user filter (i32 for index)
-    let user_filter: Vec<i32> = q
-        .uids
-        .as_deref()
-        .map(parse_uids_i32)
-        .unwrap_or_default(); // empty => all users
+    // Merge users + legacy uids into a single username list
+    let mut merged = String::new();
+    if let Some(s) = q.users.as_deref() {
+        if !s.trim().is_empty() { merged.push_str(s); }
+    }
+    if let Some(s) = q.uids.as_deref() {
+        if !s.trim().is_empty() {
+            if !merged.is_empty() { merged.push(','); }
+            merged.push_str(s);
+        }
+    }
+
+    let user_filter: Vec<String> = if merged.trim().is_empty() {
+        Vec::new() // empty => all users
+    } else {
+        parse_users_csv(&merged)
+    };
 
     let index = FS_INDEX.get().expect("FS index not initialized");
-    let user_map = USER_NAME_MAP.get().expect("User map not initialized");
 
-    let items = match index.list_children(&path, user_map, &user_filter) {
+    let items = match index.list_children(&path, &user_filter) {
         Ok(v) => v,
         Err(_) => Vec::new(),
     };
@@ -513,7 +499,9 @@ async fn get_folders_handler(Query(q): Query<FolderQuery>) -> impl IntoResponse 
     Json(items)
 }
 
-/// /api/files?path=/some/dir&uid=0,1000 (or &uids=...)
+/// /api/files?path=/some/dir&users=alice,bob
+/// also supports legacy alias: &uids=alice,bob
+/// Returns: [{ path, owner: <username>, size: <bytes>, modified: "YYYY-MM-DD" }, ...]
 async fn get_files_handler(Query(q): Query<FilesQuery>) -> impl IntoResponse {
     // validate path
     let folder = match q.path.as_deref() {
@@ -521,30 +509,25 @@ async fn get_files_handler(Query(q): Query<FilesQuery>) -> impl IntoResponse {
         _ => return (StatusCode::BAD_REQUEST, "missing 'path' query parameter").into_response(),
     };
 
-    // accept uid or uids (CSV)
-    let uids_csv = q.uid.or(q.uids).unwrap_or_default();
-    let uids: Vec<u32> = if uids_csv.trim().is_empty() {
-        Vec::new()
+    // Merge users + legacy uids into a single username list
+    let mut merged = String::new();
+    if let Some(s) = q.users.as_deref() {
+        if !s.trim().is_empty() { merged.push_str(s); }
+    }
+    if let Some(s) = q.uids.as_deref() {
+        if !s.trim().is_empty() {
+            if !merged.is_empty() { merged.push(','); }
+            merged.push_str(s);
+        }
+    }
+    let usernames: Vec<String> = if merged.trim().is_empty() {
+        Vec::new() // empty => all users
     } else {
-        parse_uids_u32(&uids_csv)
+        parse_users_csv(&merged)
     };
 
-    // run blocking scan(s)
-    let fut = if uids.is_empty() {
-        tokio::task::spawn_blocking(move || get_items_all(folder))
-    } else {
-        tokio::task::spawn_blocking(move || {
-            let mut acc: Vec<FsItem> = Vec::new();
-            for uid in uids {
-                match get_items(&folder, uid) {
-                    Ok(mut v) => acc.append(&mut v),
-                    Err(_) => continue,
-                }
-            }
-            acc.sort_by(|a, b| a.path.cmp(&b.path));
-            Ok::<_, anyhow::Error>(acc)
-        })
-    };
+    // run blocking scan
+    let fut = tokio::task::spawn_blocking(move || get_items(folder, &usernames));
 
     match fut.await {
         Err(join_err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("task error: {join_err}")).into_response(),
@@ -571,7 +554,7 @@ async fn main() -> anyhow::Result<()> {
     let mut idx = InMemoryFSIndex::new();
     let users = idx.load_from_csv(FsPath::new(&csv_path))?;
     FS_INDEX.set(idx).expect("FS_INDEX already set");
-    USER_NAME_MAP.set(users).expect("USER_NAME_MAP already set");
+    USERS.set(users).expect("USERS already set");
 
     // static dir (frontend build)
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "public".to_string());
@@ -592,9 +575,9 @@ async fn main() -> anyhow::Result<()> {
 
     // API
     let api = Router::new()
-        .route("/users", get(users_handler))
-        .route("/folders", get(get_folders_handler)) // ← querystring version, reads index
-        .route("/files", get(get_files_handler));    // ← filesystem scan
+        .route("/users", get(users_handler))         // Vec<String> usernames
+        .route("/folders", get(get_folders_handler)) // query: users=alice,bob or uids=alice,bob
+        .route("/files", get(get_files_handler));    // path + optional users/uids
 
     // App
     let app = Router::new()

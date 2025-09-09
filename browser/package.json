@@ -18,6 +18,7 @@
 		"@tailwindcss/vite": "^4.1.13",
 		"idb": "^8.0.3",
 		"material-symbols": "^0.35.0",
+		"svelecte": "^5.3.0",
 		"svelte": "^5.0.0",
 		"svelte-check": "^4.0.0",
 		"tailwindcss": "^4.1.13",

@@ -3,33 +3,37 @@
   import { getParent, formatBytes, capitalize, COLORS } from "../js/util";
   import { api } from "../js/api.svelte";
   import { API_URL } from "../js/store.svelte";
+  import Svelecte from 'svelecte'
 
-  // Stacked file item (from index)
+  // ---------- Types from the NEW backend shape (bytes) ----------
+
+  // Per-user stats embedded in a folder row (sizes in BYTES now)
   type UserStatsJson = {
     username: string;
     count: number;
-    size: number;
-    disk: number;
+    size: number; // bytes
+    disk: number; // bytes
   };
 
+  // Folder row from /api/folders (index)
   type FileItem = {
     path: string;
     total_count: number;
-    total_size: number;
-    total_disk: number;
-    modified: number;
-    users: Record<number, UserStatsJson>;
+    total_size: number; // bytes
+    total_disk: number; // bytes
+    modified: string;   // ISO date string (e.g., "2025-09-09")
+    users: Record<string, UserStatsJson>; // keyed by username
   };
 
-  // Scanned file (from /api/files)
+  // Scanned file from /api/files
   type ScannedFile = {
     path: string;
-    size: number;
-    modified: number; // seconds since epoch
-    mode: number;
-    uid: number;
-    gid: number;
+    size: number;      // bytes
+    modified: string;  // ISO date string
+    owner: string;     // username
   };
+
+  // ---------- State ----------
 
   let path = $state("/");
   let folders = $state<FileItem[]>([]);
@@ -41,30 +45,48 @@
   let progress_percent = $state(0);
   let history = $state<string[]>([path]);
   let histIdx = $state(0);
+
   type SortKey = "disk" | "size" | "count";
   let sortBy = $state<SortKey>("disk");
   let sortOpen = $state(false);
-  let selectedUser = $state(-1);
-  let users = $state<any>({});
-  let userColors = $state(new Map<string, string>());
 
-  // Normalize a path for DISPLAY ONLY:
-  // ensure leading "/", remove trailing "/", keep "/" as-is
+  // selection is by username (not uid). Empty string = "All users"
+  let selectedUser = $state<string>("All Users");
+
+  // /api/users returns a simple string[]
+  let users = $state<string[]>([]);
+  let userColors = $state(new Map<string, string>()); // cache: username -> color
+
+  // ---------- Helpers ----------
+
   function displayPath(p: string): string {
     if (!p) return "/";
     let s = p.replace(/\\/g, "/");
-    if (s !== "/") s = s.replace(/\/+$/, "");  // strip trailing slashes except for root
+    if (s !== "/") s = s.replace(/\/+$/, "");
     if (!s.startsWith("/")) s = "/" + s;
     return s || "/";
   }
 
-  // Generate consistent colors for users
-  function generateUserColors(users: any) {
-    const colorMap = new Map<string, string>();
-    Object.keys(users).forEach((uid, index) => {
-      colorMap.set(uid, COLORS[index % COLORS.length]);
+  // Seed colors for known users (optional)
+  function seedUserColors(usernames: string[]) {
+    usernames.forEach((uname, index) => {
+      if (!userColors.has(uname)) {
+        userColors.set(uname, COLORS[index % COLORS.length]);
+      }
     });
-    return colorMap;
+  }
+
+  // Deterministic color for any username (stable + cached)
+  function colorForUsername(uname: string): string {
+    const cached = userColors.get(uname);
+    if (cached) return cached;
+    let h = 0;
+    for (let i = 0; i < uname.length; i++) {
+      h = (h * 31 + uname.charCodeAt(i)) >>> 0;
+    }
+    const color = COLORS[h % COLORS.length];
+    userColors.set(uname, color);
+    return color;
   }
 
   type Tip = {
@@ -87,29 +109,26 @@
       percent: Math.round(percent * 10) / 10,
     };
   }
-
   function moveTip(e: MouseEvent) {
     if (!tip.show) return;
     tip = { ...tip, x: e.clientX, y: e.clientY };
   }
-
   function hideTip() {
     tip = { show: false, x: 0, y: 0 };
   }
 
-  // robust number coercion
   const toNum = (v: any) => {
     const n = Number(v);
     return Number.isFinite(n) ? n : 0;
   };
 
-  // ----------------------- Sorting (Folders) -----------------------
+  // ---------- Sorting (Folders) ----------
+
   const sortedfolders = $derived.by(() => {
     const key = sortBy;
     const arr = folders ? [...folders] : [];
     return arr.sort((a: any, b: any) => {
       let aVal, bVal;
-
       switch (key) {
         case "disk":
           aVal = toNum(a?.total_disk);
@@ -143,17 +162,17 @@
         }
       }) ?? [];
     const max = Math.max(0, ...vals);
-    return max > 0 ? max : 1; // avoid divide-by-zero
+    return max > 0 ? max : 1;
   });
 
   const pct = (n: any) => {
     const x = toNum(n);
     const p = (x / maxMetric) * 100;
     const clamped = Math.max(0, Math.min(100, p));
-    return Math.round(clamped * 10) / 10; // 1 decimal
+    return Math.round(clamped * 10) / 10;
   };
 
-  const metricValue = (file: any) => {
+  const metricValue = (file: FileItem) => {
     switch (sortBy) {
       case "disk":
         return toNum(file?.total_disk);
@@ -164,8 +183,8 @@
     }
   };
 
-  // right-side label reflecting current sort (folders)
-  function rightValue(file: any) {
+  // Right label (folders) – sizes already in BYTES
+  function rightValue(file: FileItem) {
     switch (sortBy) {
       case "disk":
         return formatBytes(toNum(file?.total_disk));
@@ -176,7 +195,7 @@
     }
   }
 
-  // Helper function for user-specific right values
+  // Per-user right label – sizes already in BYTES
   function rightValueForUser(userData: UserStatsJson) {
     switch (sortBy) {
       case "disk":
@@ -188,34 +207,35 @@
     }
   }
 
-  const userMetricFor = (ud: any) =>
+  const userMetricFor = (ud: UserStatsJson) =>
     sortBy === "disk" ? Number(ud.disk) : sortBy === "size" ? Number(ud.size) : Number(ud.count);
 
-  // per-folder per-user sorter
-  function sortedUserEntries(file: any) {
-    return Object.entries(file?.users ?? {}).sort(([, a], [, b]) => userMetricFor(a) - userMetricFor(b)); // small → large
+  function sortedUserEntries(file: FileItem) {
+    return Object.entries(file?.users ?? {}).sort(([, a], [, b]) => userMetricFor(a) - userMetricFor(b));
   }
 
-  // Build an aggregate "file" for the current path: sums of all visible children
-  function aggregatePathTotals(foldersArr: any[], p: string): FileItem {
-    let total_count = 0,
-      total_size = 0,
-      total_disk = 0,
-      modified = 0;
+  // Build an aggregate "file" for the current path: sums of all visible children (bytes)
+  function aggregatePathTotals(foldersArr: FileItem[], p: string): FileItem {
+    let total_count = 0;
+    let total_size = 0;
+    let total_disk = 0;
+    let modified = ""; // ISO string; keep the latest lexicographically
     const aggUsers: Record<string, UserStatsJson> = {};
 
     for (const f of foldersArr ?? []) {
       total_count += toNum(f?.total_count);
       total_size += toNum(f?.total_size);
       total_disk += toNum(f?.total_disk);
-      modified = Math.max(modified, toNum(f?.modified));
+      if (typeof f?.modified === "string" && f.modified) {
+        if (!modified || f.modified > modified) modified = f.modified;
+      }
 
       const u = f?.users ?? {};
-      for (const [uid, data] of Object.entries(u)) {
-        const key = String(uid);
+      for (const [uname, data] of Object.entries(u)) {
+        const key = String(uname);
         const prev =
           aggUsers[key] ?? {
-            username: (users && (users as any)[key]) || (data as any)?.username || key,
+            username: (data as any)?.username || key,
             count: 0,
             size: 0,
             disk: 0,
@@ -235,23 +255,18 @@
       total_size,
       total_disk,
       modified,
-      users: aggUsers as any,
+      users: aggUsers,
     };
   }
 
-  // Recompute whenever `folders` or `path` changes
   const pathTotals = $derived.by(() => aggregatePathTotals(folders, path));
 
-  // ----------------------- Sorting (Files) -----------------------
-  // For files, align with folder sort key:
-  // - disk -> use file.size
-  // - size -> use file.size
-  // - count -> treat each file as 1
+  // ---------- Sorting (Files) ----------
   function fileMetricValue(f: ScannedFile) {
     switch (sortBy) {
       case "disk":
       case "size":
-        return toNum(f.size);
+        return toNum(f.size); // bytes
       case "count":
         return 1;
     }
@@ -262,7 +277,6 @@
     return arr.sort((a, b) => fileMetricValue(b) - fileMetricValue(a));
   });
 
-  // files bar max (own scale)
   const maxFileMetric = $derived.by(() => {
     const vals = files?.map((f) => fileMetricValue(f)) ?? [];
     const max = Math.max(0, ...vals);
@@ -274,13 +288,13 @@
     switch (sortBy) {
       case "disk":
       case "size":
-        return formatBytes(toNum(f.size));
+        return formatBytes(toNum(f.size)); // bytes
       case "count":
         return "1";
     }
   }
 
-  // ---- single-flight fetch (updated for stacked view) ----
+  // ---- single-flight fetch (usernames) ----
   function createDoItAgain<T extends any[]>(fn: (...args: T) => Promise<void>) {
     let running = false;
     let nextArgs: T | null = null;
@@ -300,22 +314,14 @@
     };
   }
 
-  const fetchFolders = createDoItAgain(async (p: string) => {
+  const fetchFolders = createDoItAgain(async (_p: string) => {
     loading = true;
     try {
-      // Determine user filter based on current UI state
-      let userFilter: number[] = [];
-      if (selectedUser > -1) {
-        userFilter = [Number(selectedUser)];
-      }
-      // Load folders (index) and files (fs scan)
+      const userFilter: string[] = selectedUser ==='All Users'? []: [selectedUser];
       folders = await api.getFolders(path, userFilter);
-      files = await api.getFiles(path, userFilter);
-
-      // Generate user colors when we have user data
-      if (users) {
-        userColors = generateUserColors(users);
-      }
+      files = await api.getFiles(path, userFilter); // files now include owner + ISO modified
+      // Seed colors for the known users list, but bars use colorForUsername() anyway
+      if (users && users.length > 0) seedUserColors(users);
     } finally {
       loading = false;
     }
@@ -333,9 +339,9 @@
     sortOpen = false;
   }
   function navigateTo(p: string) {
-    path = p;
-    pushHistory(p);
-    fetchFolders(p);
+    path = displayPath(p);
+    pushHistory(path);
+    fetchFolders(path);
   }
   function refresh() {
     fetchFolders(path);
@@ -362,35 +368,12 @@
     if (e.key === "Enter") navigateTo(path);
   }
 
-  // --- file type icon helpers ---
-  function extOf(p: string): string {
-    const i = p.lastIndexOf(".");
-    if (i <= 0) return "";
-    return p.slice(i + 1).toLowerCase();
-  }
-
-  function fileIconFor(p: string): string {
-    const ext = extOf(p);
-    if (!ext) return "description";
-
-    if (["png", "jpg", "jpeg", "gif", "webp", "svg", "heic"].includes(ext)) return "image";
-    if (["pdf"].includes(ext)) return "picture_as_pdf";
-    if (["mp4", "mov", "mkv", "avi", "webm"].includes(ext)) return "movie";
-    if (["mp3", "wav", "flac", "m4a", "ogg"].includes(ext)) return "audio_file";
-    if (["zip", "gz", "bz2", "xz", "rar", "7z", "tar"].includes(ext)) return "archive";
-    if (["csv", "xls", "xlsx"].includes(ext)) return "table_chart";
-    if (["doc", "docx", "odt", "rtf"].includes(ext)) return "article";
-    if (["ppt", "pptx", "key"].includes(ext)) return "slideshow";
-    if (["txt", "md", "log"].includes(ext)) return "description";
-    if (["json", "yml", "yaml", "toml", "ini"].includes(ext)) return "data_object";
-    if (["c", "cc", "cpp", "h", "hpp", "rs", "py", "js", "ts", "tsx", "go", "rb", "java", "swift", "kts", "sh"].includes(ext))
-      return "code";
-    return "insert_drive_file";
-  }
-
   onMount(async () => {
     console.log("api url:", API_URL);
-    users = await api.getUsers();
+    users = await api.getUsers(); // array of usernames
+    users.splice(0,0,"All Users")
+    selectedUser = 'All Users'
+    seedUserColors(users);
     await refresh();
   });
 </script>
@@ -398,16 +381,22 @@
 <div class="flex flex-col h-screen min-h-0 gap-2 p-2">
   <div class="flex gap-2 items-center relative">
     <button class="btn" onclick={goBack} disabled={histIdx === 0}>
+      <div class="flex items-center">
       <span class="material-symbols-outlined">arrow_back_ios</span>
+      </div>
     </button>
     <button class="btn" onclick={goForward} disabled={histIdx >= history.length - 1}>
+      <div class="flex items-center">
       <span class="material-symbols-outlined">arrow_forward_ios</span>
+      </div>
     </button>
     <button class="btn" onclick={goUp} disabled={getParent(path) === path}>
+      <div class="flex items-center">
       <span class="material-symbols-outlined">arrow_upward</span>
+      </div>
     </button>
     <button class="btn" onclick={refresh}>
-      <div class="flex items-center gap-2">
+      <div class="flex items-center">
         <span class="material-symbols-outlined">refresh</span>
       </div>
     </button>
@@ -423,12 +412,12 @@
       {#if sortOpen}
         <div
           class="flex flex-col divide-y divide-gray-500 absolute w-24 rounded border
-           border-gray-500  bg-gray-800 shadow-lg z-20 overflow-hidden mt-1"
+           border-gray-500 bg-gray-800 shadow-lg z-20 overflow-hidden mt-1"
         >
           <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseSort("disk")}>
             By Disk
           </button>
-          <button class="w-full text-left px-3 py-2 hover:bg-gray-700 border-trasparent" onclick={() => chooseSort("size")}>
+          <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseSort("size")}>
             By Size
           </button>
           <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseSort("count")}>
@@ -438,30 +427,28 @@
       {/if}
     </div>
 
-    <!-- Hide user selector in stacked mode -->
-    <select bind:value={selectedUser} onchange={refresh}>
-      <option value={-1}>All Users</option>
-      {#each Object.entries(users) as [uid, username]}
-        <option value={uid}>{username}</option>
+    <!-- username selector -->
+    <!-- <select bind:value={selectedUser} onchange={refresh} class="min-w-40">
+      <option value="">All Users</option>
+      {#each users as uname}
+        <option value={uname}>{uname}</option>
       {/each}
-    </select>
-
-    <button class="btn" onclick={scan}>
-      <div class="flex items-center gap-2">
-        <span class="material-symbols-outlined">scan</span>
-      </div>
-    </button>
+    </select> -->
+    <Svelecte  bind:value={selectedUser} options={users} onChange={refresh}
+       class="z-20 min-w-20 h-10 border rounded border-gray-600 bg-gray-800 text-white"
+    />
   </div>
+
   <div class="flex">
     <input bind:value={path} placeholder="Path..." class="grow" onkeydown={onPathKeydown} aria-busy={loading} />
   </div>
 
   <!-- Path total header item -->
-  <div class="">
+  <div>
     <div class="relative px-2 bg-gray-700 border border-gray-600 rounded overflow-hidden">
       <!-- Stacked bar for TOTAL of current path (full width) -->
       <div class="absolute left-0 top-0 bottom-0 flex z-0" style="width: 100%">
-        {#each sortedUserEntries(pathTotals) as [uid, userData] (uid)}
+        {#each sortedUserEntries(pathTotals) as [uname, userData] (uname)}
           {@const userMetric = sortBy === "disk" ? userData.disk : sortBy === "size" ? userData.size : userData.count}
           {@const totalMetric =
             sortBy === "disk" ? pathTotals.total_disk : sortBy === "size" ? pathTotals.total_size : pathTotals.total_count}
@@ -469,7 +456,7 @@
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
             class="h-full transition-all duration-300 min-w-[0.5px] hover:opacity-90"
-            style="width: {userPercent}%; background-color: {userColors.get(uid) || '#666'};"
+            style="width: {userPercent}%; background-color: {colorForUsername(uname)};"
             onmouseenter={(e) => showTip(e, userData, userPercent)}
             onmousemove={moveTip}
             onmouseleave={hideTip}
@@ -482,7 +469,7 @@
         <div class="flex items-center justify-end">
           <p class="text-xs">
             folders: {pathTotals.total_count} • Modified:
-            {pathTotals.modified ? new Date(pathTotals.modified * 1000).toLocaleDateString() : "—"} • Size:
+            {pathTotals.modified || "—"} • Size:
             {formatBytes(pathTotals.total_size)} • Disk: {formatBytes(pathTotals.total_disk)}
           </p>
         </div>
@@ -495,18 +482,18 @@
       <div class="w-full bg-gray-700 rounded-full h-1">
         <div class="bg-orange-500 h-1 rounded-full transition-all duration-300" style="width: {progress_percent}%"></div>
       </div>
-      <div class="flex flex-col justify-center grow  items-center w-64">
+      <div class="flex flex-col justify-center grow items-center w-64">
         <div class="flex w-full justify-between">
-          <div class="">Progress:</div>
-          <div class="">{progress_percent}%</div>
+          <div>Progress:</div>
+          <div>{progress_percent}%</div>
         </div>
         <div class="flex w-full justify-between">
-          <div class="">Loaded folders:</div>
-          <div class="">{progress_current}</div>
+          <div>Loaded folders:</div>
+          <div>{progress_current}</div>
         </div>
         <div class="flex w-full justify-between">
-          <div class="">Total:</div>
-          <div class="">{progress_total}</div>
+          <div>Total:</div>
+          <div>{progress_total}</div>
         </div>
       </div>
     </div>
@@ -534,19 +521,18 @@
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
-          class="relative px-2 py-1 cursor-pointer hover:opacity-95
-           bg-gray-700 border border-gray-600 rounded-lg overflow-hidden min-h-16"
+          class="relative px-2 py-1 cursor-pointer hover:opacity-95 bg-gray-700 border border-gray-600 rounded-lg overflow-hidden min-h-16"
           onclick={() => navigateTo(file.path)}
         >
           <!-- Stacked bar background -->
           <div class="absolute left-0 top-0 bottom-0 flex z-0" style="width: {pct(metricValue(file))}%">
-            {#each sortedUserEntries(file) as [uid, userData]}
+            {#each sortedUserEntries(file) as [uname, userData]}
               {@const userMetric = sortBy === "disk" ? userData.disk : sortBy === "size" ? userData.size : userData.count}
               {@const totalMetric = sortBy === "disk" ? file.total_disk : sortBy === "size" ? file.total_size : file.total_count}
               {@const userPercent = totalMetric > 0 ? (userMetric / totalMetric) * 100 : 0}
               <div
                 class="h-full transition-all duration-300 min-w-[0.5px] hover:opacity-90"
-                style="width: {userPercent}%; background-color: {userColors.get(uid) || '#666'};"
+                style="width: {userPercent}%; background-color: {colorForUsername(uname)};"
                 onmouseenter={(e) => showTip(e, userData, userPercent)}
                 onmousemove={moveTip}
                 onmouseleave={hideTip}
@@ -558,45 +544,42 @@
           <div class="flex flex-col gap-2 relative z-10 pointer-events-none">
             <div class="flex items-center justify-between gap-4">
               <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap">
-                <span class="">{file.path}</span>
+                <span>{file.path}</span>
               </div>
               <span class="text-nowrap font-bold">{rightValue(file)}</span>
             </div>
             <div class="flex justify-end">
               <p class="text-xs text-gray-300">
-                folders: {file.total_count} • Size: {formatBytes(file.total_size)} • Disk: {formatBytes(file.total_disk)} •
-                Modified: {new Date(file.modified * 1000).toLocaleDateString()}
+                folders: {file.total_count} • Size: {formatBytes(file.total_size)} • Disk:
+                {formatBytes(file.total_disk)} • Modified: {file.modified || "—"}
               </p>
             </div>
           </div>
         </div>
       {/each}
+
       <!-- Files (after folders) -->
       {#each sortedfiles as f}
-        {@const ownerKey = String(f.uid)}
-        {@const color = userColors.get(ownerKey) || '#666'}
+        {@const color = colorForUsername(f.owner)}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div class="flex">
-        <span class="material-symbols-outlined text-4xl">subdirectory_arrow_right</span>          
-        <div class="flex grow relative px-2 py-1 bg-gray-700 border-gray-600 
-          rounded overflow-hidden text-xs">
-          <div class="flex flex-col w-full">
-          <div class="absolute left-0 top-0 bottom-0 z-0 opacity-60 "
-            style="width: {filePct(f)}%; background-color: {color};"></div>
-          <div class="relative z-10 flex items-center justify-between gap-1">            
-            <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap ">{f.path}</div>
-            <div class="flex items-center gap-4 text-sm font-semibold text-nowrap">{rightValueFile(f)}</div>
+          <span class="material-symbols-outlined text-4xl">subdirectory_arrow_right</span>
+          <div class="flex grow relative px-2 py-1 bg-gray-700 border-gray-600 rounded overflow-hidden text-xs">
+            <div class="flex flex-col w-full">
+              <div class="absolute left-0 top-0 bottom-0 z-0 opacity-60" style="width: {filePct(f)}%; background-color: {color};"></div>
+              <div class="relative z-10 flex items-center justify-between gap-1">
+                <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap">{f.path}</div>
+                <div class="flex items-center gap-4 text-sm font-semibold text-nowrap">{rightValueFile(f)}</div>
+              </div>
+              <div class="relative z-10 flex justify-end text-gray-300">
+                Size: {formatBytes(f.size)} • Owner: {f.owner} • Modified: {f.modified}
+              </div>
+            </div>
           </div>
-          <div class="relative z-10 flex justify-end text-gray-300">
-              Size: {formatBytes(f.size)} • Owner: {users?.[ownerKey] || ownerKey} • Modified:
-              {new Date(f.modified * 1000).toLocaleDateString()}            
-          </div>
-          </div>
-        </div>
         </div>
       {/each}
-      </div>
-    {/if}
+    </div>
+  {/if}
   <div class="grow"></div>
 </div>
 
@@ -615,8 +598,6 @@
         <div class="text-xs opacity-80">{tip.percent}%</div>
       </div>
       <div class="text-xs opacity-90 mt-1">{tip.value}</div>
-
-      <!-- arrow pointing down to the cursor -->
       <div class="absolute left-1/2 top-full -translate-x-1/2 mt-[-4px]">
         <div class="w-2 h-2 rotate-45 bg-black/90 border border-white/10 border-l-0 border-t-0"></div>
       </div>

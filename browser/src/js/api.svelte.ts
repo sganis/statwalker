@@ -65,13 +65,13 @@ class Api {
   async getUsers(): Promise<string[] | null> {
     return await this.request<string[]>('users', "GET", undefined, true);
   }
-  async getFolders(path: string, users: number[]): Promise<string[] | null> {
-    let uids = users.join(',')
-    return await this.request<string[]>(`folders?path=${path}&uids=${uids}`, "GET", undefined, true);
+  async getFolders(path: string, users: string[]): Promise<string[] | null> {
+    let u = users.join(',')
+    return await this.request<string[]>(`folders?path=${path}&users=${u}`, "GET", undefined, true);
   }
-  async getFiles(path: string, users: number[]): Promise<string[] | null> {
-    let uids = users.join(',')
-    return await this.request<string[]>(`files?path=${path}&uids=${uids}`, "GET", undefined, true);
+  async getFiles(path: string, users: string[]): Promise<string[] | null> {
+    let u = users.join(',')
+    return await this.request<string[]>(`files?path=${path}&users=${u}`, "GET", undefined, true);
   }
 
   // async createItem(Item: Partial<Item>): Promise<Item | null> {
