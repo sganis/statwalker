@@ -3,7 +3,27 @@
   import { getParent, formatBytes, capitalize, COLORS } from "../js/util";
   import { api } from "../js/api.svelte";
   import { API_URL } from "../js/store.svelte";
-  import Svelecte from 'svelecte'
+  import Svelecte, { addRenderer } from 'svelecte';
+
+  function colorRenderer(item, _isSelection, _inputValue) {
+    const base = "width:16px;height:16px;border:1px solid white;border-radius:3px;flex:none;";
+    const a = COLORS[0];
+    const b = COLORS[1] ?? a;
+    const c = COLORS[2] ?? b;
+    const d = COLORS[3] ?? c;
+
+    const bg =
+      item.user === "All Users"
+        ? `background: linear-gradient(90deg, ${a} 0%, ${b} 33%, ${c} 66%, ${d} 100%);`
+        : `background: ${item.color};`;
+      return `<div class="flex gap-2 items-center">
+                <div class="border border-gray-400 rounded"
+                  style="${base}${bg}"></div>
+                <div>${item.user}</div>              
+              </div>`
+  }
+
+  addRenderer('color', colorRenderer);
 
   // ---------- Types from the NEW backend shape (bytes) ----------
 
@@ -43,7 +63,7 @@
   let progress_current = $state(0);
   let progress_total = $state(0);
   let progress_percent = $state(0);
-  let history = $state<string[]>([path]);
+  let history = $state<string[]>(['/']);
   let histIdx = $state(0);
 
   type SortKey = "disk" | "size" | "count";
@@ -56,7 +76,7 @@
   // /api/users returns a simple string[]
   let users = $state<string[]>([]);
   let userColors = $state(new Map<string, string>()); // cache: username -> color
-
+  let userDropdown = $state([])
   // ---------- Helpers ----------
 
   function displayPath(p: string): string {
@@ -73,7 +93,8 @@
       if (!userColors.has(uname)) {
         userColors.set(uname, COLORS[index % COLORS.length]);
       }
-    });
+    })
+    userDropdown = Array.from(userColors.entries()).map(([user, color]) => ({user,color}))
   }
 
   // Deterministic color for any username (stable + cached)
@@ -99,11 +120,39 @@
   };
   let tip = $state<Tip>({ show: false, x: 0, y: 0 });
 
+  // === Tooltip clamping additions ===
+  let bubbleEl: HTMLDivElement | null = $state(null);
+  const MARGIN = 8;       // min distance from viewport edges
+  const ARROW_GAP = 10;   // matches translateY calc(-100% - 10px)
+
+  function clampToViewport(rawX: number, rawY: number) {
+    const ww = window.innerWidth;
+    const wh = window.innerHeight;
+
+    const w = bubbleEl?.offsetWidth ?? 200;
+    const h = bubbleEl?.offsetHeight ?? 60;
+
+    const halfW = w / 2;
+
+    // Because we center horizontally and position ABOVE the pointer
+    const minX = MARGIN + halfW;
+    const maxX = ww - MARGIN - halfW;
+
+    const minY = MARGIN + h + ARROW_GAP; // enough space to render above the pointer
+    const maxY = wh - MARGIN;            // don't let the anchor go below bottom
+
+    return {
+      x: Math.min(maxX, Math.max(minX, rawX)),
+      y: Math.min(maxY, Math.max(minY, rawY)),
+    };
+  }
+
   function showTip(e: MouseEvent, userData: UserStatsJson, percent: number) {
+    const { x, y } = clampToViewport(e.clientX, e.clientY);
     tip = {
       show: true,
-      x: e.clientX,
-      y: e.clientY,
+      x,
+      y,
       username: userData.username,
       value: rightValueForUser(userData),
       percent: Math.round(percent * 10) / 10,
@@ -111,7 +160,8 @@
   }
   function moveTip(e: MouseEvent) {
     if (!tip.show) return;
-    tip = { ...tip, x: e.clientX, y: e.clientY };
+    const { x, y } = clampToViewport(e.clientX, e.clientY);
+    tip = { ...tip, x, y };
   }
   function hideTip() {
     tip = { show: false, x: 0, y: 0 };
@@ -171,25 +221,28 @@
     const clamped = Math.max(0, Math.min(100, p));
     return Math.round(clamped * 10) / 10;
   };
-
+  const displaySortBy = (key: string) => {
+    switch (sortBy) {
+      case "disk":
+        return 'Disk Usage'
+      case "count":
+        return 'Total Files'
+    }
+  }
   const metricValue = (file: FileItem) => {
     switch (sortBy) {
       case "disk":
         return toNum(file?.total_disk);
-      case "size":
-        return toNum(file?.total_size);
       case "count":
         return toNum(file?.total_count);
     }
-  };
+  }
 
   // Right label (folders) – sizes already in BYTES
   function rightValue(file: FileItem) {
     switch (sortBy) {
       case "disk":
         return formatBytes(toNum(file?.total_disk));
-      case "size":
-        return formatBytes(toNum(file?.total_size));
       case "count":
         return toNum(file?.total_count).toLocaleString();
     }
@@ -200,15 +253,13 @@
     switch (sortBy) {
       case "disk":
         return formatBytes(toNum(userData?.disk));
-      case "size":
-        return formatBytes(toNum(userData?.size));
       case "count":
         return toNum(userData?.count).toLocaleString();
     }
   }
 
   const userMetricFor = (ud: UserStatsJson) =>
-    sortBy === "disk" ? Number(ud.disk) : sortBy === "size" ? Number(ud.size) : Number(ud.count);
+    sortBy === "disk" ? Number(ud.disk) : Number(ud.count);
 
   function sortedUserEntries(file: FileItem) {
     return Object.entries(file?.users ?? {}).sort(([, a], [, b]) => userMetricFor(a) - userMetricFor(b));
@@ -265,7 +316,6 @@
   function fileMetricValue(f: ScannedFile) {
     switch (sortBy) {
       case "disk":
-      case "size":
         return toNum(f.size); // bytes
       case "count":
         return 1;
@@ -287,7 +337,6 @@
   function rightValueFile(f: ScannedFile) {
     switch (sortBy) {
       case "disk":
-      case "size":
         return formatBytes(toNum(f.size)); // bytes
       case "count":
         return "1";
@@ -321,7 +370,8 @@
       folders = await api.getFolders(path, userFilter);
       files = await api.getFiles(path, userFilter); // files now include owner + ISO modified
       // Seed colors for the known users list, but bars use colorForUsername() anyway
-      if (users && users.length > 0) seedUserColors(users);
+      if (users && users.length > 0) 
+        seedUserColors(users);
     } finally {
       loading = false;
     }
@@ -367,6 +417,11 @@
   function onPathKeydown(e: KeyboardEvent) {
     if (e.key === "Enter") navigateTo(path);
   }
+  function userChanged() {
+    if (!selectedUser)
+      selectedUser = 'All Users'
+    refresh()
+  }
 
   onMount(async () => {
     console.log("api url:", API_URL);
@@ -403,39 +458,33 @@
 
     <!-- Sort dropdown -->
     <div class="relative">
-      <button class="btn w-24" onclick={() => (sortOpen = !sortOpen)}>
+      <button class="btn w-36" onclick={() => (sortOpen = !sortOpen)}>
         <div class="flex items-center gap-2">
           <span class="material-symbols-outlined">sort</span>
-          {capitalize(sortBy)}
+          {displaySortBy(sortBy)}
         </div>
       </button>
       {#if sortOpen}
         <div
-          class="flex flex-col divide-y divide-gray-500 absolute w-24 rounded border
+          class="flex flex-col divide-y divide-gray-500 absolute w-36 rounded border
            border-gray-500 bg-gray-800 shadow-lg z-20 overflow-hidden mt-1"
         >
-          <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseSort("disk")}>
-            By Disk
-          </button>
-          <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseSort("size")}>
-            By Size
+          <button class="w-full text-left px-3 py-2 hover:bg-gray-700 text-nowrap" onclick={() => chooseSort("disk")}>
+            By Disk Usage
           </button>
           <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseSort("count")}>
-            By Count
+            By Total Files
           </button>
         </div>
       {/if}
     </div>
 
-    <!-- username selector -->
-    <!-- <select bind:value={selectedUser} onchange={refresh} class="min-w-40">
-      <option value="">All Users</option>
-      {#each users as uname}
-        <option value={uname}>{uname}</option>
-      {/each}
-    </select> -->
-    <Svelecte  bind:value={selectedUser} options={users} onChange={refresh}
-       class="z-20 min-w-20 h-10 border rounded border-gray-600 bg-gray-800 text-white"
+    <Svelecte  bind:value={selectedUser} 
+      options={userDropdown}
+      valueField="user" 
+      renderer="color"
+      onChange={userChanged}
+      class="z-20 min-w-20 h-10 border rounded border-gray-600 bg-gray-800 text-white"
     />
   </div>
 
@@ -468,9 +517,9 @@
       <div class="relative z-10 pointer-events-none">
         <div class="flex items-center justify-end">
           <p class="text-xs">
-            folders: {pathTotals.total_count} • Modified:
-            {pathTotals.modified || "—"} • Size:
-            {formatBytes(pathTotals.total_size)} • Disk: {formatBytes(pathTotals.total_disk)}
+            {pathTotals.total_count} Files 
+            • Last Modified: {pathTotals.modified || "—"} 
+            • {formatBytes(pathTotals.total_size)} ({formatBytes(pathTotals.total_disk)} on disk)
           </p>
         </div>
       </div>
@@ -527,8 +576,8 @@
           <!-- Stacked bar background -->
           <div class="absolute left-0 top-0 bottom-0 flex z-0" style="width: {pct(metricValue(file))}%">
             {#each sortedUserEntries(file) as [uname, userData]}
-              {@const userMetric = sortBy === "disk" ? userData.disk : sortBy === "size" ? userData.size : userData.count}
-              {@const totalMetric = sortBy === "disk" ? file.total_disk : sortBy === "size" ? file.total_size : file.total_count}
+              {@const userMetric = sortBy === "disk" ? userData.disk : userData.count}
+              {@const totalMetric = sortBy === "disk" ? file.total_disk : file.total_count}
               {@const userPercent = totalMetric > 0 ? (userMetric / totalMetric) * 100 : 0}
               <div
                 class="h-full transition-all duration-300 min-w-[0.5px] hover:opacity-90"
@@ -550,8 +599,10 @@
             </div>
             <div class="flex justify-end">
               <p class="text-xs text-gray-300">
-                folders: {file.total_count} • Size: {formatBytes(file.total_size)} • Disk:
-                {formatBytes(file.total_disk)} • Modified: {file.modified || "—"}
+                {file.total_count} Files 
+                • Last Modified: {file.modified || "—"} 
+                • {formatBytes(file.total_size)} 
+                  ({formatBytes(file.total_disk)} on disk)          
               </p>
             </div>
           </div>
@@ -571,8 +622,9 @@
                 <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap">{f.path}</div>
                 <div class="flex items-center gap-4 text-sm font-semibold text-nowrap">{rightValueFile(f)}</div>
               </div>
-              <div class="relative z-10 flex justify-end text-gray-300">
-                Size: {formatBytes(f.size)} • Owner: {f.owner} • Modified: {f.modified}
+              <div class="relative z-10 flex justify-between text-gray-300">
+                <div class="">{f.owner}</div>
+                <div class="">Last Modified: {f.modified}</div>
               </div>
             </div>
           </div>
@@ -592,12 +644,17 @@
       transform: translate(-50%, calc(-100% - 10px));
     "
   >
-    <div class="relative rounded-xl border border-white/10 bg-black/90 text-white shadow-xl px-3 py-2">
-      <div class="flex items-center justify-between gap-3">
-        <div class="font-medium text-sm truncate max-w-[180px]">{tip.username}</div>
-        <div class="text-xs opacity-80">{tip.percent}%</div>
+    <div
+      bind:this={bubbleEl}
+      class="relative rounded-xl border border-white/10 bg-black/90 text-white shadow-xl px-3 py-2"
+    >
+      <div class="flex items-center justify-center">
+        <div class="font-medium text-sm truncate max-w-[180px]">{tip.username}</div>        
       </div>
-      <div class="text-xs opacity-90 mt-1">{tip.value}</div>
+      <div class="flex gap-2 items-center justify-between text-xs opacity-90">
+        <div class="text-nowrap">{tip.value}</div>
+        <div class="">{tip.percent}%</div>
+      </div>
       <div class="absolute left-1/2 top-full -translate-x-1/2 mt-[-4px]">
         <div class="w-2 h-2 rotate-45 bg-black/90 border border-white/10 border-l-0 border-t-0"></div>
       </div>
