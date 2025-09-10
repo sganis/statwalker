@@ -4,15 +4,17 @@
 // csv = "1"
 // memchr = "2"
 // chrono = { version = "0.4", features = ["clock"] }
+// libc = "0.2"
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use clap::Parser;
 use csv::{ByteRecord, ReaderBuilder, Trim, WriterBuilder};
 use memchr::memchr_iter;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::Utc;
+
 #[cfg(unix)]
 use std::ffi::CStr;
 
@@ -111,47 +113,6 @@ fn parse_field_as_u64(field: Option<&[u8]>) -> u64 {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0)
 }
-fn parse_field_as_string(field: Option<&[u8]>) -> String {
-    field
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .unwrap_or("")
-        .trim()
-        .to_string()
-}
-
-/// Parse a MODIFIED field into Unix seconds.
-/// Accepts:
-/// - pure digits => epoch seconds
-/// - RFC3339 (e.g., "2025-09-07T12:34:56Z")
-/// - "YYYY-MM-DD" => assumes 00:00:00Z
-fn parse_mtime_to_unix(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-
-    // All digits -> epoch seconds
-    if s.bytes().all(|b| b.is_ascii_digit()) {
-        return s.parse::<i64>().ok();
-    }
-
-    // RFC3339
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.timestamp());
-    }
-
-    // YYYY-MM-DD
-    if s.len() == 10 && &s[4..5] == "-" && &s[7..8] == "-" {
-        if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-            let nt = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
-            let ndt = NaiveDateTime::new(date, nt);
-            let ts = DateTime::<Utc>::from_utc(ndt, Utc).timestamp();
-            return Some(ts);
-        }
-    }
-
-    None
-}
 
 /// Bucket age in days into:
 /// 0: <= 60 days
@@ -237,6 +198,24 @@ fn write_results(
     Ok(())
 }
 
+fn write_unknown_uids(unk_path: &Path, unk_uids: &HashSet<u32>) -> Result<(), Box<dyn std::error::Error>> {
+    // deterministic order
+    let mut list: Vec<u32> = unk_uids.iter().copied().collect();
+    list.sort_unstable();
+
+    let mut wtr = WriterBuilder::new()
+        .has_headers(false)
+        .from_path(unk_path)?;
+
+    for uid in list {
+        let mut rec = ByteRecord::new();
+        rec.push_field(uid.to_string().as_bytes());
+        wtr.write_byte_record(&rec)?;
+    }
+    wtr.flush()?;
+    Ok(())
+}
+
 fn resolve_user(uid: u32, cache: &mut HashMap<u32, String>) -> String {
     if let Some(u) = cache.get(&uid) {
         return u.clone();
@@ -265,8 +244,9 @@ fn get_username_from_uid(uid: u32) -> String {
 }
 
 #[cfg(not(unix))]
-fn get_username_from_uid(uid: u32) -> String { 
-    uid.to_string() 
+fn get_username_from_uid(uid: u32) -> String {
+    // On non-Unix just echo the uid as a "name"
+    uid.to_string()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -274,7 +254,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Determine output path
-    let output_path = args.output.unwrap_or_else(|| {
+    let output_path = args.output.clone().unwrap_or_else(|| {
         let stem = args
             .input
             .file_stem()
@@ -283,7 +263,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from(format!("{}.agg.csv", stem))
     });
 
-    let mut user_cache: HashMap<u32, String> = HashMap::new(); // USERS
+    // Unknown UID output path is always derived from INPUT stem (per request)
+    let unk_path = {
+        let stem = args
+            .input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        PathBuf::from(format!("{}.unk.csv", stem))
+    };
+
+    let mut user_cache: HashMap<u32, String> = HashMap::new(); // UID -> username cache
+    let mut unk_uids: HashSet<u32> = HashSet::new(); // collect UIDs that resolve to UNK
 
     // Count total lines for progress tracking
     println!("Counting lines in {}", args.input.display());
@@ -317,13 +308,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Parse required fields
-        // Columns: INODE,ACCESSED,MODIFIED,USER,GROUP,TYPE,PERM,SIZE,DISK,PATH,CATEGORY,HASH
-        // IN: "INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH"
+        // Columns (as used here): INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH
         let mtime = parse_field_as_i64(record.get(2));
-        //let mtime_secs = parse_mtime_to_unix(&modified_str).unwrap_or(0);
         let uid = parse_field_as_u32(record.get(3));
         let user = resolve_user(uid, &mut user_cache);
-        //let user = parse_field_as_string(record.get(3));
+
+        // track unknowns
+        if user == "UNK" {
+            unk_uids.insert(uid);
+        }
+
         let disk_usage = parse_field_as_u64(record.get(7)); // integer bytes
         let path_bytes = record.get(8).unwrap_or(b"");
 
@@ -351,13 +345,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write results
     write_results(&output_path, &aggregated_data)?;
+    // Write unknown UIDs list
+    write_unknown_uids(&unk_path, &unk_uids)?;
 
     let duration = start_time.elapsed();
     println!("✓ Aggregation complete!");
     println!("  Output: {}", output_path.display());
+    println!("  Unknown UIDs: {} -> {}", unk_uids.len(), unk_path.display());
+    let percent_unique = if data_lines > 0 { ((aggregated_data.len() as f64 / data_lines as f64) * 100.0) as i32 } else { 0 };
     println!(
-        "  Unique (folder, user, age) triples: {}",
-        aggregated_data.len()
+        "  Unique (folder, user, age) triples: {} - {}%",
+        aggregated_data.len(), percent_unique
     );
     println!("  Time: {:.2} seconds", duration.as_secs_f64());
 
@@ -481,22 +479,19 @@ mod tests {
     fn test_user_stats_update() {
         let mut stats = UserStats::default();
 
-        stats.update(100, 50, 10);
+        stats.update(50, 10);
         assert_eq!(stats.file_count, 1);
-        assert_eq!(stats.file_size, 100);
         assert_eq!(stats.disk_usage, 50);
         assert_eq!(stats.latest_mtime, 10);
 
-        stats.update(200, 75, 20);
+        stats.update(75, 20);
         assert_eq!(stats.file_count, 2);
-        assert_eq!(stats.file_size, 300);
         assert_eq!(stats.disk_usage, 125);
         assert_eq!(stats.latest_mtime, 20);
 
         // Older timestamp shouldn't update latest_mtime
-        stats.update(50, 25, 5);
+        stats.update(25, 5);
         assert_eq!(stats.file_count, 3);
-        assert_eq!(stats.file_size, 350);
         assert_eq!(stats.disk_usage, 150);
         assert_eq!(stats.latest_mtime, 20);
     }
@@ -505,10 +500,10 @@ mod tests {
     fn test_user_stats_empty_mtime() {
         let mut stats = UserStats::default();
 
-        stats.update(100, 50, 0);
+        stats.update(50, 0);
         assert_eq!(stats.latest_mtime, 0);
 
-        stats.update(100, 50, 123);
+        stats.update(50, 123);
         assert_eq!(stats.latest_mtime, 123);
     }
 
