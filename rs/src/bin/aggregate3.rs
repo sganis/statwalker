@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-
 use clap::Parser;
 use csv::{ByteRecord, ReaderBuilder, Trim, WriterBuilder};
 use memchr::memchr_iter;
-
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+#[cfg(unix)]
+use std::ffi::CStr;
 
 #[derive(Parser, Debug)]
 #[command(about = "Aggregate statwalker CSV into per-(folder, user, age) rows")]
