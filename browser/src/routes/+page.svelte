@@ -5,6 +5,7 @@
   import { API_URL } from "../js/store.svelte";
   import Svelecte, { addRenderer } from 'svelecte';
 
+  //#region colors
   function colorRenderer(item, _isSelection, _inputValue) {
     const base = "width:16px;height:16px;border:1px solid white;border-radius:3px;flex:none;";
     const a = COLORS[0];
@@ -22,11 +23,34 @@
                 <div>${item.user}</div>              
               </div>`
   }
-
   addRenderer('color', colorRenderer);
 
-  // ---------- Types from the NEW backend shape (bytes) ----------
+    // Seed colors for known users (optional)
+  function seedUserColors(usernames: string[]) {
+    usernames.forEach((uname, index) => {
+      if (!userColors.has(uname)) {
+        userColors.set(uname, COLORS[index % COLORS.length]);
+      }
+    })
+    userDropdown = Array.from(userColors.entries()).map(([user, color]) => ({user,color}))
+  }
 
+  // Deterministic color for any username (stable + cached)
+  function colorForUsername(uname: string): string {
+    const cached = userColors.get(uname);
+    if (cached) return cached;
+    let h = 0;
+    for (let i = 0; i < uname.length; i++) {
+      h = (h * 31 + uname.charCodeAt(i)) >>> 0;
+    }
+    const color = COLORS[h % COLORS.length];
+    userColors.set(uname, color);
+    return color;
+  }
+
+  //#endregion
+
+  // ---------- Types from the NEW backend shape (bytes) ----------
   // Per-user stats embedded in a folder row (sizes in BYTES now)
   type UserStatsJson = {
     username: string;
@@ -53,9 +77,9 @@
     owner: string;     // username
   };
 
-  // ---------- State ----------
+  //#region state
+//  let path = $state("/");
 
-  let path = $state("/");
   let folders = $state<FileItem[]>([]);
   let files = $state<ScannedFile[]>([]);
   let loading = $state(false);
@@ -77,6 +101,70 @@
   let users = $state<string[]>([]);
   let userColors = $state(new Map<string, string>()); // cache: username -> color
   let userDropdown = $state([])
+
+  // Your Svelte 5 component
+  let pathInput = $state();
+  let path = $state('/');
+  let fullPath = $state('');
+  let isEditing = $state(false);
+
+  //#endregion
+
+  // Function to set path programmatically (use this instead of directly setting path)
+  function setPath(newPath) {
+    const displayedPath = displayPath(newPath);
+    fullPath = displayedPath;
+    
+    if (!isEditing) {
+      path = truncatePathFromStart(displayedPath);
+    } else {
+      path = displayedPath;
+    }
+  }
+
+  
+  // Function to truncate path from the beginning
+  function truncatePathFromStart(inputPath, maxLength = 50) {
+    if (!inputPath || inputPath.length <= maxLength) return inputPath;
+    
+    const parts = inputPath.split('/');
+    let result = parts[parts.length - 1]; // Start with filename
+    
+    // Add directories from the end until we approach maxLength  
+    for (let i = parts.length - 2; i >= 0; i--) {
+      const potential = parts[i] + '/' + result;
+      if (('...' + potential).length > maxLength) break;
+      result = potential;
+    }
+    
+    return '...' + result;
+  }
+
+
+function onPathFocus() {
+  isEditing = true;
+  // Show full path when focused
+  if (fullPath) {
+    path = fullPath;
+  }
+}
+
+function onPathBlur() {
+  isEditing = false;
+  // Store the full path if it doesn't start with ...
+  if (path && !path.startsWith('...')) {
+    fullPath = path;
+  }
+  // Show truncated version
+  if (fullPath) {
+    path = truncatePathFromStart(fullPath);
+  }
+  // Your existing focus logic here
+}
+
+ 
+
+
   // ---------- Helpers ----------
 
   function displayPath(p: string): string {
@@ -85,29 +173,6 @@
     if (s !== "/") s = s.replace(/\/+$/, "");
     if (!s.startsWith("/")) s = "/" + s;
     return s || "/";
-  }
-
-  // Seed colors for known users (optional)
-  function seedUserColors(usernames: string[]) {
-    usernames.forEach((uname, index) => {
-      if (!userColors.has(uname)) {
-        userColors.set(uname, COLORS[index % COLORS.length]);
-      }
-    })
-    userDropdown = Array.from(userColors.entries()).map(([user, color]) => ({user,color}))
-  }
-
-  // Deterministic color for any username (stable + cached)
-  function colorForUsername(uname: string): string {
-    const cached = userColors.get(uname);
-    if (cached) return cached;
-    let h = 0;
-    for (let i = 0; i < uname.length; i++) {
-      h = (h * 31 + uname.charCodeAt(i)) >>> 0;
-    }
-    const color = COLORS[h % COLORS.length];
-    userColors.set(uname, color);
-    return color;
   }
 
   type Tip = {
@@ -367,8 +432,8 @@
     loading = true;
     try {
       const userFilter: string[] = selectedUser ==='All Users'? []: [selectedUser];
-      folders = await api.getFolders(path, userFilter);
-      files = await api.getFiles(path, userFilter); // files now include owner + ISO modified
+      folders = await api.getFolders(_p, userFilter);
+      files = await api.getFiles(_p, userFilter); // files now include owner + ISO modified
       // Seed colors for the known users list, but bars use colorForUsername() anyway
       if (users && users.length > 0) 
         seedUserColors(users);
@@ -388,34 +453,37 @@
     sortBy = key;
     sortOpen = false;
   }
-  function navigateTo(p: string) {
-    path = displayPath(p);
-    pushHistory(path);
-    fetchFolders(path);
+  function navigateTo(p) {
+    setPath(p);
+    pushHistory(fullPath || path);
+    fetchFolders(fullPath || path);
   }
   function refresh() {
-    fetchFolders(path);
+    fetchFolders(fullPath || path);
   }
   function goUp() {
-    const parent = getParent(path);
+    const parent = getParent(fullPath || path);  // ← Use fullPath
     navigateTo(parent);
   }
   function goBack() {
     if (histIdx > 0) {
       histIdx -= 1;
-      path = history[histIdx];
-      fetchFolders(path);
+      setPath(history[histIdx]);  // ← Use setPath to handle truncation properly
+      fetchFolders(history[histIdx]);
     }
   }
+
   function goForward() {
     if (histIdx < history.length - 1) {
       histIdx += 1;
-      path = history[histIdx];
-      fetchFolders(path);
+      setPath(history[histIdx]);  // ← Use setPath to handle truncation properly
+      fetchFolders(history[histIdx]);
     }
   }
   function onPathKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter") navigateTo(path);
+    if (e.key === "Enter") {
+      navigateTo(fullPath || path);
+    }
   }
   function userChanged() {
     if (!selectedUser)
@@ -429,7 +497,14 @@
     users.splice(0,0,"All Users")
     selectedUser = 'All Users'
     seedUserColors(users);
+    
+    // Initialize the path truncation
+    fullPath = path;
+    path = truncatePathFromStart(path);
+
     await refresh();
+
+  
   });
 </script>
 
@@ -487,9 +562,15 @@
       class="z-20 min-w-20 h-10 border rounded border-gray-600 bg-gray-800 text-white"
     />
   </div>
-
   <div class="flex">
-    <input bind:value={path} placeholder="Path..." class="grow" onkeydown={onPathKeydown} aria-busy={loading} />
+    <input 
+    bind:this={pathInput}
+    bind:value={path} placeholder="Path..." 
+    class="w-full truncate text-left"
+    onkeydown={onPathKeydown} 
+    onblur={onPathBlur}
+    onfocus={onPathFocus}
+    disabled={loading} />
   </div>
 
   <!-- Path total header item -->

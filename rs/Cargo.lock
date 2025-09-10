@@ -948,29 +948,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "statwalker"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "bincode",
- "blake3",
- "chrono",
- "clap",
- "crossbeam",
- "csv",
- "itoa",
- "libc",
- "memchr",
- "num_cpus",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "tower-http",
-]
-
-[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1172,6 +1149,29 @@ name = "virtue"
 version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
+
+[[package]]
+name = "walk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bincode",
+ "blake3",
+ "chrono",
+ "clap",
+ "crossbeam",
+ "csv",
+ "itoa",
+ "libc",
+ "memchr",
+ "num_cpus",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tower-http",
+]
 
 [[package]]
 name = "wasi"

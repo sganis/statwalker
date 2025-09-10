@@ -51,6 +51,8 @@ def generate_commit_message(model, diff):
                     Keep the response in a single line without markdown formatting.
                     Make several messages if needed for clarity but all of them in a single line.
                     If I ask this question again with the same diff, add more details.
+                    Ignore analysis of minified js files like those in the public directory.
+                    Any file in the public/ folder is a build and ignore it.
                     Git diff output: {diff}
                     """
                 }
