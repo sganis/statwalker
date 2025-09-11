@@ -3,7 +3,6 @@ use std::{
     fs::{self, File},
     io::{self, BufWriter, Write, BufRead, BufReader},
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering::Relaxed},
@@ -12,9 +11,6 @@ use std::sync::{
 use std::{thread, time::Instant, io::Read};
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use num_cpus;
-
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
 use itoa::Buffer;
 use clap::{Parser, ColorChoice};
 use blake3::Hasher;
@@ -22,6 +18,8 @@ use blake3::Hasher;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
+#[cfg(windows)]
+std::time::SystemTime,
 
 
 // Increased chunk sizes for better batching
