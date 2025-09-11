@@ -249,7 +249,7 @@
   //#endregion
 
   //#region folders and files bars
-  
+
   function transformFolders(raw: RawFolder[], filter: AgeFilter): FileItem[] {
     // Ages to include
     const ages: string[] = filter === -1 ? ["0","1","2"] : [String(filter)];
