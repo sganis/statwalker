@@ -19,7 +19,7 @@ use blake3::Hasher;
 use std::os::windows::fs::MetadataExt;
 
 #[cfg(windows)]
-std::time::SystemTime;
+use std::time::SystemTime;
 
 
 // Increased chunk sizes for better batching
