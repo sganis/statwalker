@@ -287,10 +287,8 @@ fn worker(
                     buf.clear();
                 }
 
-                let n = enum_dir(&dir, &tx, &inflight, cfg.skip.as_deref());
-                if n > 0 {
-                    stats.errors += n;
-                }
+                let error_count = enum_dir(&dir, &tx, &inflight, cfg.skip.as_deref());
+                stats.errors += error_count;
                 inflight.fetch_sub(1, Relaxed);
             }
 
@@ -354,9 +352,20 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
 
         // Use cached file_type() result to avoid extra syscalls
         let file_type = dent.file_type();
-        let is_dir = file_type
-            .map(|t| t.is_dir())
-            .unwrap_or_else(|_| dent.path().is_dir());
+        let is_dir = match file_type {
+            Ok(ft) => ft.is_dir(),
+            Err(_) => {
+                // If file_type() fails, try fallback path.is_dir()
+                match dent.path().is_dir() {
+                    true => true,
+                    false => {
+                        // If both fail, we can't determine type - count as failed
+                        error_count += 1;
+                        continue;
+                    }
+                }
+            }
+        };
 
         if is_dir {
             if should_skip(&dent.path(), skip) { continue; }
