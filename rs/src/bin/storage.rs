@@ -260,7 +260,7 @@ mod windows {
     use super::StorageInfo;
     use std::io::Result;
     use std::ffi::OsString;
-    use std::os::windows::ffi::{OsStringExt, OsStrExt};
+    use std::os::windows::ffi::OsStrExt;
     
     unsafe extern "system" {
         fn GetLogicalDrives() -> u32;

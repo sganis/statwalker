@@ -44,10 +44,10 @@ fn username_from_uid(uid: u32) -> String {
     }
 }
 
-#[cfg(not(unix))]
-fn username_from_uid(_uid: u32) -> String {
-    "UNK".to_string()
-}
+// #[cfg(not(unix))]
+// fn username_from_uid(_uid: u32) -> String {
+//     "UNK".to_string()
+// }
 
 // ===================== File scan output (for /api/files) =====================
 
