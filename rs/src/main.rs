@@ -65,6 +65,7 @@ enum Task {
 #[derive(Default)]
 struct Stats {
     files: u64,
+    errors: u64,
 }
 
 // Packed category enum for better cache efficiency
@@ -191,6 +192,7 @@ fn main() -> std::io::Result<()> {
     for j in joins {
         let s = j.join().expect("worker panicked");
         total.files += s.files;
+        total.errors += s.errors;
     }
 
     // ---- merge shards and print summary ----
@@ -200,6 +202,7 @@ fn main() -> std::io::Result<()> {
     let secs = elapsed.as_secs_f64();
 
     println!("Total files : {}", total.files);
+    println!("Failed files: {}", total.errors);  // Add this line
     println!("Elapsed time: {:.3} seconds", secs);
     println!("Files/sec.  : {:.2}", (total.files as f64) / secs);
 
@@ -258,6 +261,7 @@ fn worker(
 
     let mut stats = Stats {
         files: 0,
+        errors: 0,
     };
 
     while let Ok(task) = rx.recv() {
@@ -270,17 +274,25 @@ fn worker(
                     continue;
                 }
                 // emit one row for the directory itself
-                if let Some(row) = stat_row(&dir, &cfg) {
-                    write_row(&mut buf, row, &cfg);
-                    stats.files += 1;
-
-                    if buf.len() >= FLUSH_BYTES {
-                        let _ = shard.write_all(&buf);
-                        buf.clear();
+                match stat_row(&dir, &cfg) {
+                    Some(row) => {
+                        write_row(&mut buf, row, &cfg);
+                        stats.files += 1;
+                    }
+                    None => {
+                        stats.errors += 1;  // Count directory stat failures
                     }
                 }
 
-                enum_dir(&dir, &tx, &inflight, cfg.skip.as_deref());
+                if buf.len() >= FLUSH_BYTES {
+                    let _ = shard.write_all(&buf);
+                    buf.clear();
+                }
+
+                let n = enum_dir(&dir, &tx, &inflight, cfg.skip.as_deref());
+                if n > 0 {
+                    stats.errors += n;
+                }
                 inflight.fetch_sub(1, Relaxed);
             }
 
@@ -292,14 +304,19 @@ fn worker(
                 // Process files in batch to reduce overhead
                 for name in names {
                     let full = base.join(&name);
-                    if let Some(row) = stat_row(&full, &cfg) {
-                        write_row(&mut buf, row, &cfg);
-                        stats.files += 1;
-
-                        if buf.len() >= FLUSH_BYTES {
-                            let _ = shard.write_all(&buf);
-                            buf.clear();
+                    match stat_row(&full, &cfg) {
+                        Some(row) => {
+                            write_row(&mut buf, row, &cfg);
+                            stats.files += 1;
                         }
+                        None => {
+                            stats.errors += 1;  // Count file stat failures
+                        }
+                    }
+
+                    if buf.len() >= FLUSH_BYTES {
+                        let _ = shard.write_all(&buf);
+                        buf.clear();
                     }
                 }
                 inflight.fetch_sub(1, Relaxed);
@@ -316,26 +333,26 @@ fn worker(
 }
 
 fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<&str>) -> u64 {
+    // return number of errors
     let rd = match fs::read_dir(dir) {
         Ok(it) => it,
-        Err(_) => return 0,
+        Err(_) => return 1,
     };
-
+    let mut error_count: u64 = 0;
     let mut page: Vec<OsString> = Vec::with_capacity(FILE_CHUNK);
-    let mut entry_count: u64 = 0;
     let base_arc = Arc::new(dir.to_path_buf());
 
     for dent in rd {
         let dent = match dent {
             Ok(d) => d,
-            Err(_) => continue,
+            Err(_) => { error_count += 1; continue; }
         };
 
         let name = dent.file_name();
         if name == OsStr::new(".") || name == OsStr::new("..") {
             continue;
         }
-        entry_count += 1;
+
 
         // Use cached file_type() result to avoid extra syscalls
         let file_type = dent.file_type();
@@ -367,7 +384,7 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
         });
     }
 
-    entry_count
+    error_count
 }
 
 // Optimized category detection with lookup table
