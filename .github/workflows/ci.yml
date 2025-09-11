@@ -36,11 +36,11 @@ jobs:
 
       - name: Build Rust project (rs/)
         working-directory: rs
-        run: cargo build
+        run: cargo build -r
 
       - name: Test Rust project (rs/)
         working-directory: rs
-        run: cargo test
+        run: cargo test -r
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
