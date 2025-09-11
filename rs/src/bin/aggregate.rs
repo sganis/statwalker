@@ -3,18 +3,23 @@
 // clap = { version = "4", features = ["derive"] }
 // csv = "1"
 // memchr = "2"
+// chrono = { version = "0.4", features = ["clock"] }
+// libc = "0.2"
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-
 use clap::Parser;
-use csv::{ByteRecord, ReaderBuilder, Trim, WriterBuilder};
+use csv::{ReaderBuilder, Trim, WriterBuilder};
 use memchr::memchr_iter;
+use chrono::Utc;
+
+#[cfg(unix)]
+use std::ffi::CStr;
 
 #[derive(Parser, Debug)]
-#[command(about = "Aggregate statwalker CSV into per-(folder, user) rows")]
+#[command(about = "Aggregate statwalker CSV into per-(folder, user, age) rows")]
 struct Args {
     /// Input CSV file path
     input: PathBuf,
@@ -26,31 +31,32 @@ struct Args {
 #[derive(Default, Clone, Debug, PartialEq)]
 struct UserStats {
     file_count: u64,
-    file_size: u64,     // CHANGED: integer bytes
-    disk_usage: u64,    // CHANGED: integer bytes
-    latest_mtime: String,
+    disk_usage: u64,    // integer bytes
+    latest_mtime: i64,  // seconds since Unix epoch
 }
 
 impl UserStats {
-    fn update(&mut self, size: u64, disk: u64, mtime: &str) {
+    fn update(&mut self, disk: u64, mtime_secs: i64) {
         self.file_count = self.file_count.saturating_add(1);
-        self.file_size = self.file_size.saturating_add(size);
         self.disk_usage = self.disk_usage.saturating_add(disk);
-        if self.latest_mtime.is_empty() || self.latest_mtime.as_str() < mtime {
-            self.latest_mtime = mtime.to_string();
+        if mtime_secs > self.latest_mtime {
+            self.latest_mtime = mtime_secs;
         }
     }
 }
 
+/// Convert path bytes into a list of ancestor folder paths:
+///  "/a/b/file.txt" -> ["/", "/a", "/a/b"]
 fn get_folder_ancestors(path: &[u8]) -> Vec<Vec<u8>> {
     // Normalize path separators
-    let normalized: Vec<u8> = path.iter()
+    let normalized: Vec<u8> = path
+        .iter()
         .map(|&b| if b == b'\\' { b'/' } else { b })
         .collect();
 
     // Find the last directory separator
     let parent_end = normalized.iter().rposition(|&b| b == b'/');
-    
+
     let folder = match parent_end {
         Some(0) | None => return vec![b"/".to_vec()], // Root or no separator
         Some(pos) => &normalized[..pos],
@@ -64,7 +70,7 @@ fn get_folder_ancestors(path: &[u8]) -> Vec<Vec<u8>> {
 
     // Build ancestor list starting with root
     let mut ancestors = vec![b"/".to_vec()];
-    
+
     // Skip leading '/' and split by '/'
     let trimmed = if folder.starts_with(&[b'/']) { &folder[1..] } else { &folder[..] };
     if trimmed.is_empty() {
@@ -74,7 +80,7 @@ fn get_folder_ancestors(path: &[u8]) -> Vec<Vec<u8>> {
     // Build paths incrementally: /a, /a/b, /a/b/c
     let mut current_path = Vec::new();
     current_path.push(b'/');
-    
+
     for segment in trimmed.split(|&b| b == b'/').filter(|s| !s.is_empty()) {
         if current_path.len() > 1 {
             current_path.push(b'/');
@@ -86,6 +92,27 @@ fn get_folder_ancestors(path: &[u8]) -> Vec<Vec<u8>> {
     ancestors
 }
 
+/// Safely convert bytes to UTF-8 string, replacing invalid sequences
+fn bytes_to_safe_string(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn parse_field_as_u32(field: Option<&[u8]>) -> u32 {
+    field
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .map(|s| s.trim())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn parse_field_as_i64(field: Option<&[u8]>) -> i64 {
+    field
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .map(|s| s.trim())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
 fn parse_field_as_u64(field: Option<&[u8]>) -> u64 {
     field
         .and_then(|b| std::str::from_utf8(b).ok())
@@ -94,71 +121,146 @@ fn parse_field_as_u64(field: Option<&[u8]>) -> u64 {
         .unwrap_or(0)
 }
 
-fn parse_field_as_string(field: Option<&[u8]>) -> String {
-    field
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .unwrap_or("")
-        .trim()
-        .to_string()
+/// Sanitize mtime: if it's more than 1 day in the future, set to 0
+fn sanitize_mtime(now_ts: i64, mtime_ts: i64) -> i64 {
+    const ONE_DAY_SECS: i64 = 86_400;
+    
+    if mtime_ts > now_ts + ONE_DAY_SECS {
+        0  // Set to epoch if more than 1 day in the future
+    } else {
+        mtime_ts
+    }
 }
 
-fn count_lines_fast(path: &Path) -> std::io::Result<usize> {
+/// Bucket age in days into:
+/// 0: <= 60 days
+/// 1: 61..=600 days
+/// 2: > 600 days OR unknown/invalid mtime
+fn age_bucket(now_ts: i64, mtime_ts: i64) -> u8 {
+    if mtime_ts <= 0 {
+        return 2;
+    }
+    let age_secs = now_ts.saturating_sub(mtime_ts);
+    let days = age_secs / 86_400;
+    if days <= 60 {
+        0
+    } else if days <= 600 {
+        1
+    } else {
+        2
+    }
+}
+
+pub fn count_lines(path: &Path) -> std::io::Result<usize> {
     let mut file = File::open(path)?;
-    let mut buffer = vec![0u8; 1024 * 1024]; // 1MB buffer
-    let mut line_count = 0;
-    let mut has_content = false;
-    let mut last_byte = b'\n';
+    let mut buf = [0u8; 128 * 1024]; // 128 KiB is plenty; adjust if you like
+    let mut count = 0usize;
+    let mut last: Option<u8> = None;
 
     loop {
-        let bytes_read = file.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
+        let n = file.read(&mut buf)?;
+        if n == 0 { break; }
+        count += memchr_iter(b'\n', &buf[..n]).count();
+        last = Some(buf[n - 1]);
+    }
+
+    if let Some(b) = last {
+        if b != b'\n' {
+            count += 1; // account for final line without trailing newline
         }
-        has_content = true;
-        line_count += memchr_iter(b'\n', &buffer[..bytes_read]).count();
-        last_byte = buffer[bytes_read - 1];
     }
-
-    // Count final line if file doesn't end with newline
-    if has_content && last_byte != b'\n' {
-        line_count += 1;
-    }
-
-    Ok(line_count)
+    Ok(count)
 }
-
 fn write_results(
     output_path: &Path,
-    aggregated_data: &HashMap<(Vec<u8>, String), UserStats>,
+    aggregated_data: &HashMap<(Vec<u8>, String, u8), UserStats>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut sorted_entries: Vec<_> = aggregated_data.iter().collect();
     sorted_entries.sort_by(|a, b| {
-        let (path_a, user_a) = &a.0;
-        let (path_b, user_b) = &b.0;
-        path_a.cmp(path_b).then_with(|| user_a.cmp(user_b))
+        let (path_a, user_a, age_a) = &a.0;
+        let (path_b, user_b, age_b) = &b.0;
+        path_a
+            .cmp(path_b)
+            .then_with(|| user_a.cmp(user_b))
+            .then_with(|| age_a.cmp(age_b))
     });
 
-    let mut writer = WriterBuilder::new()
-        .has_headers(true)
-        .from_path(output_path)?;
+    let mut writer = WriterBuilder::new().has_headers(true).from_path(output_path)?;
 
     writer.write_record(&[
-        "path", "user", "file_count", "file_size", "disk_usage", "latest_modified"
+        "path",
+        "user",
+        "age",
+        "files",
+        "disk",
+        "modified",
     ])?;
 
-    for ((path, user), stats) in sorted_entries {
-        let mut record = ByteRecord::new();
-        record.push_field(path);
-        record.push_field(user.as_bytes());
-        record.push_field(stats.file_count.to_string().as_bytes());
-        record.push_field(stats.file_size.to_string().as_bytes());   // integers
-        record.push_field(stats.disk_usage.to_string().as_bytes());  // integers
-        record.push_field(stats.latest_mtime.as_bytes());
-        writer.write_byte_record(&record)?;
+    for ((path_bytes, user, age), stats) in sorted_entries {
+        // Convert path bytes to safe UTF-8 string
+        let path_str = bytes_to_safe_string(path_bytes);
+        
+        writer.write_record(&[
+            &path_str,
+            user,
+            &age.to_string(),
+            &stats.file_count.to_string(),
+            &stats.disk_usage.to_string(),
+            &stats.latest_mtime.to_string(),
+        ])?;
     }
 
     writer.flush()?;
     Ok(())
+}
+
+fn write_unknown_uids(unk_path: &Path, unk_uids: &HashSet<u32>) -> Result<(), Box<dyn std::error::Error>> {
+    // deterministic order
+    let mut list: Vec<u32> = unk_uids.iter().copied().collect();
+    list.sort_unstable();
+
+    let mut wtr = WriterBuilder::new()
+        .has_headers(false)
+        .from_path(unk_path)?;
+
+    for uid in list {
+        wtr.write_record(&[uid.to_string()])?;
+    }
+    wtr.flush()?;
+    Ok(())
+}
+
+fn resolve_user(uid: u32, cache: &mut HashMap<u32, String>) -> String {
+    if let Some(u) = cache.get(&uid) {
+        return u.clone();
+    }
+    let name = get_username_from_uid(uid);
+    cache.insert(uid, name.clone());
+    name
+}
+
+#[cfg(unix)]
+fn get_username_from_uid(uid: u32) -> String {
+    unsafe {
+        let passwd = libc::getpwuid(uid);
+        if passwd.is_null() {
+            return "UNK".to_string();
+        }
+        let name_ptr = (*passwd).pw_name;
+        if name_ptr.is_null() {
+            return "UNK".to_string();
+        }
+        match CStr::from_ptr(name_ptr).to_str() {
+            Ok(name) => name.to_string(),
+            Err(_) => "UNK".to_string(),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn get_username_from_uid(uid: u32) -> String {
+    // On non-Unix just echo the uid as a "name"
+    uid.to_string()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -166,16 +268,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Determine output path
-    let output_path = args.output.unwrap_or_else(|| {
-        let stem = args.input.file_stem()
+    let output_path = args.output.clone().unwrap_or_else(|| {
+        let stem = args
+            .input
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("output");
         PathBuf::from(format!("{}.agg.csv", stem))
     });
 
+    // Unknown UID output path is always derived from INPUT stem (per request)
+    let unk_path = {
+        let stem = args
+            .input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        PathBuf::from(format!("{}.unk.csv", stem))
+    };
+
+    let mut user_cache: HashMap<u32, String> = HashMap::new(); // UID -> username cache
+    let mut unk_uids: HashSet<u32> = HashSet::new(); // collect UIDs that resolve to UNK
+
     // Count total lines for progress tracking
     println!("Counting lines in {}", args.input.display());
-    let total_lines = count_lines_fast(&args.input)?;
+    let total_lines = count_lines(&args.input)?;
     let data_lines = total_lines.saturating_sub(1);
     println!("Total lines: {} (data: {})", total_lines, data_lines);
 
@@ -188,8 +305,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Processing {}", args.input.display());
 
-    let mut aggregated_data: HashMap<(Vec<u8>, String), UserStats> = HashMap::new();
+    // path, user, age -> stats
+    let mut aggregated_data: HashMap<(Vec<u8>, String, u8), UserStats> = HashMap::new();
     let progress_interval = if data_lines >= 10 { data_lines / 10 } else { 0 };
+
+    // Use Local::now() instead of deprecated Utc::now()
+    let now_ts = Utc::now().timestamp();
+
+
+    // fn epoch_secs_to_iso_date(secs: i64) -> String {
+    //     chrono::DateTime::<Utc>::from_timestamp(secs, 0)
+    //         .map(|dt| dt.date_naive().to_string()) // "YYYY-MM-DD"
+    //         .unwrap_or_else(|| "1970-01-01".to_string())
+    // }
 
     // Process each record
     for (index, record_result) in reader.byte_records().enumerate() {
@@ -201,39 +329,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        // Parse required fields (columns: INODE,ACCESSED,MODIFIED,USER,GROUP,TYPE,PERM,SIZE,DISK,PATH,CATEGORY,HASH)
-        let modified_time = parse_field_as_string(record.get(2));
-        let user = parse_field_as_string(record.get(3));
-        let file_size = parse_field_as_u64(record.get(7)); // integer bytes
-        let disk_usage = parse_field_as_u64(record.get(8)); // integer bytes
-        let path_bytes = record.get(9).unwrap_or(b"");
+        // Parse required fields
+        // Columns (as used here): INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH
+        let raw_mtime = parse_field_as_i64(record.get(2));
+        let sanitized_mtime = sanitize_mtime(now_ts, raw_mtime);
+        
+        let uid = parse_field_as_u32(record.get(3));
+        let user = resolve_user(uid, &mut user_cache);
+
+        // track unknowns
+        if user == "UNK" {
+            unk_uids.insert(uid);
+        }
+
+        let disk_usage = parse_field_as_u64(record.get(7)); // integer bytes
+        let path_bytes = record.get(8).unwrap_or(b"");
 
         if user.is_empty() || path_bytes.is_empty() {
             continue;
         }
 
+        let bucket = age_bucket(now_ts, sanitized_mtime);
+
         // Update statistics for each ancestor folder
         for folder_path in get_folder_ancestors(path_bytes) {
-            let key = (folder_path, user.clone());
-            aggregated_data.entry(key)
+            let key = (folder_path, user.clone(), bucket);
+            aggregated_data
+                .entry(key)
                 .or_default()
-                .update(file_size, disk_usage, &modified_time);
+                .update(disk_usage, sanitized_mtime);
         }
 
         // Show progress (approx 10% steps)
         if progress_interval > 0 && (index + 1) % progress_interval == 0 {
             let percent = ((index + 1) as f64 * 100.0 / data_lines.max(1) as f64).ceil() as u32;
-            println!("{}% - Processed {} rows", percent.min(100), index + 1);
+            println!("{}%", percent.min(100));
         }
     }
 
     // Write results
     write_results(&output_path, &aggregated_data)?;
+    // Write unknown UIDs list
+    write_unknown_uids(&unk_path, &unk_uids)?;
 
     let duration = start_time.elapsed();
     println!("✓ Aggregation complete!");
     println!("  Output: {}", output_path.display());
-    println!("  Unique (folder, user) pairs: {}", aggregated_data.len());
+    println!("  Unknown UIDs: {} -> {}", unk_uids.len(), unk_path.display());
+    let percent_unique = if data_lines > 0 { ((aggregated_data.len() as f64 / data_lines as f64) * 100.0) as i32 } else { 0 };
+    println!(
+        "  Unique (folder, user, age) triples: {} - {}%",
+        aggregated_data.len(), percent_unique
+    );
     println!("  Time: {:.2} seconds", duration.as_secs_f64());
 
     Ok(())
@@ -246,11 +393,10 @@ mod tests {
     #[test]
     fn test_folder_ancestors_basic() {
         let result = get_folder_ancestors(b"/a/b/file.txt");
-        assert_eq!(result, vec![
-            b"/".to_vec(),
-            b"/a".to_vec(),
-            b"/a/b".to_vec()
-        ]);
+        assert_eq!(
+            result,
+            vec![b"/".to_vec(), b"/a".to_vec(), b"/a/b".to_vec()]
+        );
     }
 
     #[test]
@@ -268,44 +414,46 @@ mod tests {
     #[test]
     fn test_folder_ancestors_windows_separators() {
         let result = get_folder_ancestors(b"C:\\Users\\test\\file.txt");
-        assert_eq!(result, vec![
-            b"/".to_vec(),
-            b"/C:".to_vec(),
-            b"/C:/Users".to_vec(),
-            b"/C:/Users/test".to_vec()
-        ]);
+        assert_eq!(
+            result,
+            vec![
+                b"/".to_vec(),
+                b"/C:".to_vec(),
+                b"/C:/Users".to_vec(),
+                b"/C:/Users/test".to_vec()
+            ]
+        );
     }
 
     #[test]
     fn test_folder_ancestors_deep_path() {
         let result = get_folder_ancestors(b"/a/b/c/d/e/file.txt");
-        assert_eq!(result, vec![
-            b"/".to_vec(),
-            b"/a".to_vec(),
-            b"/a/b".to_vec(),
-            b"/a/b/c".to_vec(),
-            b"/a/b/c/d".to_vec(),
-            b"/a/b/c/d/e".to_vec()
-        ]);
+        assert_eq!(
+            result,
+            vec![
+                b"/".to_vec(),
+                b"/a".to_vec(),
+                b"/a/b".to_vec(),
+                b"/a/b/c".to_vec(),
+                b"/a/b/c/d".to_vec(),
+                b"/a/b/c/d/e".to_vec()
+            ]
+        );
     }
 
     #[test]
     fn test_folder_ancestors_trailing_slash() {
         let result = get_folder_ancestors(b"/a/b/");
-        assert_eq!(result, vec![
-            b"/".to_vec(),
-            b"/a".to_vec()
-        ]);
+        assert_eq!(result, vec![b"/".to_vec(), b"/a".to_vec()]);
     }
 
     #[test]
     fn test_folder_ancestors_empty_segments() {
         let result = get_folder_ancestors(b"/a//b/file.txt");
-        assert_eq!(result, vec![
-            b"/".to_vec(),
-            b"/a".to_vec(),
-            b"/a/b".to_vec()
-        ]);
+        assert_eq!(
+            result,
+            vec![b"/".to_vec(), b"/a".to_vec(), b"/a/b".to_vec()]
+        );
     }
 
     #[test]
@@ -319,46 +467,81 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_field_as_string() {
-        assert_eq!(parse_field_as_string(Some(b"hello")), "hello");
-        assert_eq!(parse_field_as_string(Some(b"  trimmed  ")), "trimmed");
-        assert_eq!(parse_field_as_string(Some(b"")), "");
-        assert_eq!(parse_field_as_string(None), "");
+    fn test_sanitize_mtime() {
+        let now = 2_000_000_000i64; // ~2033
+        let one_day = 86_400i64;
+        
+        // Normal case: mtime in the past
+        assert_eq!(sanitize_mtime(now, now - 1000), now - 1000);
+        
+        // Normal case: mtime slightly in future (< 1 day)
+        assert_eq!(sanitize_mtime(now, now + 3600), now + 3600); // 1 hour future
+        
+        // Edge case: exactly 1 day in future
+        assert_eq!(sanitize_mtime(now, now + one_day), now + one_day);
+        
+        // Problem case: more than 1 day in future - should be sanitized to 0
+        assert_eq!(sanitize_mtime(now, now + one_day + 1), 0);
+        assert_eq!(sanitize_mtime(now, now + 365 * one_day), 0); // 1 year future
+        
+        // Zero/negative timestamps should pass through
+        assert_eq!(sanitize_mtime(now, 0), 0);
+        assert_eq!(sanitize_mtime(now, -1), -1);
+    }
+
+    #[test]
+    fn test_bytes_to_safe_string() {
+        // Valid UTF-8
+        assert_eq!(bytes_to_safe_string(b"hello"), "hello");
+        assert_eq!(bytes_to_safe_string(b"/path/to/file"), "/path/to/file");
+        
+        // Invalid UTF-8 - should be replaced with replacement character
+        let invalid_utf8 = &[0x80, 0x81, 0x82];
+        let result = bytes_to_safe_string(invalid_utf8);
+        assert!(result.contains('\u{FFFD}')); // replacement character
+    }
+
+    #[test]
+    fn test_age_bucket() {
+        let now = 2_000_000_000i64; // ~2033
+        assert_eq!(age_bucket(now, now), 0); // 0 days
+        assert_eq!(age_bucket(now, now - 60 * 86_400), 0); // 60d
+        assert_eq!(age_bucket(now, now - 61 * 86_400), 1); // 61d
+        assert_eq!(age_bucket(now, now - 600 * 86_400), 1); // 600d
+        assert_eq!(age_bucket(now, now - 601 * 86_400), 2); // 601d
+        assert_eq!(age_bucket(now, 0), 2); // sanitized timestamp
     }
 
     #[test]
     fn test_user_stats_update() {
         let mut stats = UserStats::default();
-        
-        stats.update(100, 50, "2023-01-01T00:00:00Z");
+
+        stats.update(50, 10);
         assert_eq!(stats.file_count, 1);
-        assert_eq!(stats.file_size, 100);
         assert_eq!(stats.disk_usage, 50);
-        assert_eq!(stats.latest_mtime, "2023-01-01T00:00:00Z");
+        assert_eq!(stats.latest_mtime, 10);
 
-        stats.update(200, 75, "2023-01-02T00:00:00Z");
+        stats.update(75, 20);
         assert_eq!(stats.file_count, 2);
-        assert_eq!(stats.file_size, 300);
         assert_eq!(stats.disk_usage, 125);
-        assert_eq!(stats.latest_mtime, "2023-01-02T00:00:00Z");
+        assert_eq!(stats.latest_mtime, 20);
 
-        // Test older timestamp doesn't update latest_mtime
-        stats.update(50, 25, "2022-12-31T00:00:00Z");
+        // Older timestamp shouldn't update latest_mtime
+        stats.update(25, 5);
         assert_eq!(stats.file_count, 3);
-        assert_eq!(stats.file_size, 350);
         assert_eq!(stats.disk_usage, 150);
-        assert_eq!(stats.latest_mtime, "2023-01-02T00:00:00Z");
+        assert_eq!(stats.latest_mtime, 20);
     }
 
     #[test]
     fn test_user_stats_empty_mtime() {
         let mut stats = UserStats::default();
-        
-        stats.update(100, 50, "");
-        assert_eq!(stats.latest_mtime, "");
 
-        stats.update(100, 50, "2023-01-01T00:00:00Z");
-        assert_eq!(stats.latest_mtime, "2023-01-01T00:00:00Z");
+        stats.update(50, 0);
+        assert_eq!(stats.latest_mtime, 0);
+
+        stats.update(50, 123);
+        assert_eq!(stats.latest_mtime, 123);
     }
 
     #[test]

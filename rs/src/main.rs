@@ -15,7 +15,7 @@ use num_cpus;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use itoa::Buffer;
-use clap::Parser;
+use clap::{Parser, ColorChoice};
 use blake3::Hasher;
 
 // Increased chunk sizes for better batching
@@ -24,11 +24,14 @@ const FLUSH_BYTES: usize = 4 * 1024 * 1024; // 4MB buffer (doubled)
 const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2MB for file reads
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Super Fast FS Scanner")]
+#[command(author, version, about = "Super Fast FS Scanner", color = ColorChoice::Always)]
 struct Args {
     /// Root folder to scan
     #[arg(default_value = ".")]
     root: String,
+    /// Output CSV path (default: "<canonical-root>.csv")
+    #[arg(short, long, value_name = "FILE")]
+    output: Option<PathBuf>,
     /// Detect file category (text/binary/image/video/etc), 50% decrease in performance
     #[arg(long)]
     category: bool,
@@ -47,8 +50,6 @@ enum Task {
 #[derive(Default)]
 struct Stats {
     files: u64,
-    largest_file_count: u64,
-    largest_file_count_dir: PathBuf,
 }
 
 // Packed category enum for better cache efficiency
@@ -92,21 +93,22 @@ struct Row<'a> {
 
 fn main() -> std::io::Result<()> {
     let start_time = Instant::now();
-
     let args = Args::parse();
-    
     let folder = PathBuf::from(args.root.clone());
     let fullpath = fs::canonicalize(&folder)?
         .into_os_string()
         .into_string()
         .unwrap();
-
-    #[cfg(unix)]
-    let name = fullpath[1..].replace("/", "-");
-    #[cfg(windows)]
-    let name = fullpath[7..].replace('\\', "-");
-
-    let final_path = PathBuf::from(&format!("{name}.csv"));
+    let final_path: PathBuf = match args.output {
+        Some(p) => p,
+        None => {
+            #[cfg(unix)]
+            let name = fullpath.trim_start_matches('/').replace('/', "-");
+            #[cfg(windows)]
+            let name = fullpath.trim_start_matches("\\\\?\\").replace('\\', "-");
+            PathBuf::from(format!("{name}.csv"))
+        }
+    };
     println!("output: {}", &final_path.display());
 
     // Use more threads for I/O bound work
@@ -158,30 +160,17 @@ fn main() -> std::io::Result<()> {
     for j in joins {
         let s = j.join().expect("worker panicked");
         total.files += s.files;
-
-        if s.largest_file_count > total.largest_file_count {
-            total.largest_file_count = s.largest_file_count;
-            total.largest_file_count_dir = s.largest_file_count_dir;
-        }
     }
 
     // ---- merge shards and print summary ----
     merge_shards(&out_dir, &final_path, threads)?;
 
-    println!("Total entries (files + dirs): {}", total.files);
-
-    if total.largest_file_count > 0 {
-        println!(
-            "Largest folder by entry count: {} ({} entries)",
-            total.largest_file_count_dir.display(),
-            total.largest_file_count
-        );
-    }
-
     let elapsed = start_time.elapsed();
     let secs = elapsed.as_secs_f64();
+
+    println!("Total files : {}", total.files);
     println!("Elapsed time: {:.3} seconds", secs);
-    println!("Files per second: {:.2}", (total.files as f64) / secs);
+    println!("Files/sec.  : {:.2}", (total.files as f64) / secs);
 
     Ok(())
 }
@@ -203,8 +192,6 @@ fn worker(
 
     let mut stats = Stats {
         files: 0,
-        largest_file_count: 0,
-        largest_file_count_dir: PathBuf::new(),
     };
 
     while let Ok(task) = rx.recv() {
@@ -223,12 +210,7 @@ fn worker(
                     }
                 }
 
-                let child_entries = enum_dir(&dir, &tx, &inflight);
-
-                if child_entries > stats.largest_file_count {
-                    stats.largest_file_count = child_entries;
-                    stats.largest_file_count_dir = dir.clone();
-                }
+                let _child_entries = enum_dir(&dir, &tx, &inflight);
 
                 inflight.fetch_sub(1, Relaxed);
             }

@@ -10,41 +10,21 @@ use csv::ReaderBuilder;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    fs::{File},
+    io::{Read, Write},
     net::SocketAddr,
-    path::{Path, Path as FsPath},
+    path::{Path, PathBuf},
     sync::OnceLock,
 };
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
-
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-
-use chrono::{NaiveDateTime, Utc};
+use memchr::memchr_iter;
 
 #[cfg(unix)]
 use std::ffi::CStr;
 
+
 // ===================== Helpers =====================
-
-fn unquote_csv_field(field: &str) -> String {
-    let trimmed = field.trim();
-    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        let inner = &trimmed[1..trimmed.len() - 1];
-        inner.replace("\"\"", "\"")
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn epoch_secs_to_iso_date(secs: i64) -> String {
-    let ndt = NaiveDateTime::from_timestamp_opt(secs, 0)
-        .unwrap_or_else(|| NaiveDateTime::from_timestamp_opt(0, 0).unwrap());
-    chrono::DateTime::<Utc>::from_utc(ndt, Utc)
-        .date_naive()
-        .to_string() // "YYYY-MM-DD"
-}
 
 #[cfg(unix)]
 fn username_from_uid(uid: u32) -> String {
@@ -76,19 +56,29 @@ pub struct FsItemOut {
     pub path: String,
     pub owner: String,   // username
     pub size: u64,       // bytes
-    pub modified: String // "YYYY-MM-DD" (UTC)
+    pub modified: i64    // unix
 }
 
-/// List regular files in `folder`. If `usernames` is empty → all users.
-/// Otherwise, include only files owned by a username in the provided list.
-/// Non-recursive.
 #[cfg(unix)]
-pub fn get_items<P: AsRef<Path>>(folder: P, usernames: &[String]) -> AResult<Vec<FsItemOut>> {
+pub fn get_items<P: AsRef<std::path::Path>>(
+    folder: P,
+    usernames: &[String],
+    age_filter: Option<u8>, // 0 recent (≤60d), 1 mid (≤730d), 2 old (>730d)
+) -> AResult<Vec<FsItemOut>> {
+    use std::{collections::HashSet, fs};
+    use std::os::unix::fs::MetadataExt;
+    use chrono::{Duration, Utc};
+
     let filter: Option<HashSet<String>> = if usernames.is_empty() {
         None
     } else {
         Some(usernames.iter().cloned().collect())
     };
+
+    // Precompute cutoffs once in epoch seconds (fast)
+    let now = Utc::now();
+    let cutoff_recent = (now - Duration::days(60)).timestamp();
+    let cutoff_old    = (now - Duration::days(730)).timestamp();
 
     let mut out = Vec::new();
 
@@ -96,34 +86,31 @@ pub fn get_items<P: AsRef<Path>>(folder: P, usernames: &[String]) -> AResult<Vec
         .with_context(|| format!("read_dir({}) failed", folder.as_ref().display()))?;
 
     for entry_res in dir {
-        let entry = match entry_res {
-            Ok(e) => e,
-            Err(_) => continue, // skip unreadable entries
-        };
+        let entry = match entry_res { Ok(e) => e, Err(_) => continue };
         let path = entry.path();
 
-        let md = match fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        if !md.file_type().is_file() {
-            continue;
-        }
+        let md = match fs::symlink_metadata(&path) { Ok(m) => m, Err(_) => continue };
+        if !md.file_type().is_file() { continue; }
 
         let owner = username_from_uid(md.uid());
-
         if let Some(ref allow) = filter {
-            if !allow.contains(&owner) {
-                continue;
-            }
+            if !allow.contains(&owner) { continue; }
+        }
+
+        let mtime = md.mtime();
+
+        if let Some(af) = age_filter {
+            let age = if mtime >= cutoff_recent { 0 }
+                      else if mtime <  cutoff_old { 2 }
+                      else                         { 1 };
+            if age != af { continue; }
         }
 
         out.push(FsItemOut {
             path: path.to_string_lossy().into_owned(),
             owner,
             size: md.size(),
-            modified: epoch_secs_to_iso_date(md.mtime()),
+            modified: mtime,
         });
     }
 
@@ -132,73 +119,92 @@ pub fn get_items<P: AsRef<Path>>(folder: P, usernames: &[String]) -> AResult<Vec
 }
 
 #[cfg(not(unix))]
-pub fn get_items<P: AsRef<Path>>(_folder: P, _usernames: &[String]) -> AResult<Vec<FsItemOut>> {
-    anyhow::bail!("get_items(folder, usernames) is only implemented on Unix-like systems.");
+pub fn get_items<P: AsRef<std::path::Path>>(
+    _folder: P,
+    _usernames: &[String],
+    _age_filter: Option<u8>,
+) -> AResult<Vec<FsItemOut>> {
+    anyhow::bail!("get_items(folder, usernames, age_filter) is only implemented on Unix-like systems.");
 }
 
 // ===================== Aggregated index (folders) =====================
-// NOTE: This matches your current aggregated CSV shape:
-//   path,user,file_count,file_size,disk_usage,latest_modified
-// where sizes are stored as GiB (f64) and dates are ISO strings.
+// CSV shape (header):
+//   path,user,age,files,disk,modified
+// - 'disk' is integer bytes (u64)
+// - 'modified' is Unix epoch seconds (i64)
+// - 'size' is not present in CSV; we mirror size=disk to keep UI compatibility.
 
-#[derive(Serialize, Debug, Clone)]
-struct AggRowBin {
-    file_count: u64,
-    file_size: f64,       // GiB
-    disk_usage: f64,      // GiB
-    latest_mtime: String, // ISO date string
-    users: HashSet<String>, // usernames
+pub fn count_lines(path: &Path) -> std::io::Result<usize> {
+    let mut file = File::open(path)?;
+    let mut buf = [0u8; 128 * 1024]; // 128 KiB is plenty; adjust if you like
+    let mut count = 0usize;
+    let mut last: Option<u8> = None;
+
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 { break; }
+        count += memchr_iter(b'\n', &buf[..n]).count();
+        last = Some(buf[n - 1]);
+    }
+
+    if let Some(b) = last {
+        if b != b'\n' {
+            count += 1; // account for final line without trailing newline
+        }
+    }
+    Ok(count)
 }
 
 #[derive(Default, Debug, Clone)]
-struct UserStats {
+struct Stats {
     file_count: u64,
-    file_size: f64,  // GiB
-    disk_usage: f64, // GiB
-    latest_mtime: String,
-}
-
-#[derive(Serialize, Debug, Clone)]
-pub struct UserStatsJson {
-    pub username: String,
-    pub count: u64,
-    pub size: f64,  // GiB
-    pub disk: f64,  // GiB
-}
-
-#[derive(Serialize, Debug, Clone)]
-pub struct FileItem {
-    pub path: String,
-    pub total_count: u64,
-    pub total_size: f64,   // GiB
-    pub total_disk: f64,   // GiB
-    pub modified: String,  // ISO date string
-    pub users: HashMap<String, UserStatsJson>, // keyed by username
+    size_bytes: u64,   // mirrored from disk
+    disk_bytes: u64,   // from CSV
+    latest_mtime: i64, // Unix seconds
 }
 
 #[derive(Debug, Clone)]
 struct TrieNode {
     children: HashMap<String, Box<TrieNode>>,
-    data: Option<AggRowBin>,
+    // only used to quickly discover which users exist under a path
+    users: HashSet<String>,
 }
 impl TrieNode {
-    fn new() -> Self { Self { children: HashMap::new(), data: None } }
+    fn new() -> Self { Self { children: HashMap::new(), users: HashSet::new() } }
 }
 
 #[derive(Debug, Clone)]
 pub struct InMemoryFSIndex {
     root: TrieNode,
     total_entries: usize,
-    per_user: HashMap<(String, String), UserStats>, // (path, username)
+    // Single authoritative index
+    per_user_age: HashMap<(String, String, u8), Stats>, // (path, username, age)
+    // To know which users exist under a given path quickly
+    users_by_path: HashMap<String, HashSet<String>>,
 }
 
 impl InMemoryFSIndex {
     pub fn new() -> Self {
-        Self { root: TrieNode::new(), total_entries: 0, per_user: HashMap::new() }
+        Self {
+            root: TrieNode::new(),
+            total_entries: 0,
+            per_user_age: HashMap::new(),
+            users_by_path: HashMap::new(),
+        }
     }
 
-    /// CSV columns (with header): path,user,file_count,file_size,disk_usage,latest_modified
-    pub fn load_from_csv(&mut self, path: &FsPath) -> AResult<Vec<String>> {
+    /// CSV columns (with header): path,user,age,files,disk,modified
+    pub fn load_from_csv(&mut self, path: &Path) -> AResult<Vec<String>> {
+
+        // Count total lines for progress tracking
+        print!("Counting lines in {}... ", path.display());
+        std::io::stdout().flush().unwrap(); 
+        let total_lines = count_lines(&path)?;
+        let data_lines = total_lines.saturating_sub(1);
+        let progress_interval = if data_lines >= 10 { data_lines / 10 } else { 0 };
+        println!("done:\nTotal lines: {}", total_lines);
+        println!("Loading and building index...");
+
         let mut rdr = ReaderBuilder::new()
             .has_headers(true)
             .from_path(path)
@@ -213,12 +219,12 @@ impl InMemoryFSIndex {
                 continue;
             }
 
-            let path_str = unquote_csv_field(record.get(0).unwrap_or(""));
-            let username = record.get(1).unwrap_or("").trim().to_string();
-            let file_count: u64 = record.get(2).unwrap_or("0").parse().unwrap_or(0);
-            let file_size: f64 = record.get(3).unwrap_or("0").parse().unwrap_or(0.0);
-            let disk_usage: f64 = record.get(4).unwrap_or("0").parse().unwrap_or(0.0);
-            let latest_mtime: String = record.get(5).unwrap_or("").trim().to_string();
+            let path_str           = record.get(0).unwrap_or("");
+            let username           = record.get(1).unwrap_or("").trim().to_string();
+            let age: u8            = record.get(2).unwrap_or("0").parse().unwrap_or(0);
+            let file_count: u64    = record.get(3).unwrap_or("0").parse().unwrap_or(0);
+            let disk_bytes: u64    = record.get(4).unwrap_or("0").parse().unwrap_or(0);
+            let latest_mtime: i64  = record.get(5).unwrap_or("0").parse().unwrap_or(0);
 
             if path_str.is_empty() || username.is_empty() {
                 continue;
@@ -226,18 +232,28 @@ impl InMemoryFSIndex {
 
             all_users.insert(username.clone());
 
-            self.insert_merge(&path_str, file_count, file_size, disk_usage, &latest_mtime, &username);
+            // Maintain user set under this path
+            let pkey = Self::canonical_key(&path_str);
+            self.users_by_path.entry(pkey.clone()).or_default().insert(username.clone());
 
-            let key = (Self::canonical_key(&path_str), username.clone());
-            let entry = self.per_user.entry(key).or_insert(UserStats::default());
+            // Insert into trie for structural navigation
+            self.insert_path(&path_str, &username);
+
+            // Single index: (path, user, age)
+            let entry = self.per_user_age.entry((pkey, username, age)).or_insert_with(Stats::default);
             entry.file_count = entry.file_count.saturating_add(file_count);
-            entry.file_size  += file_size;
-            entry.disk_usage += disk_usage;
-            if entry.latest_mtime.is_empty() || entry.latest_mtime < latest_mtime {
-                entry.latest_mtime = latest_mtime.clone();
+            entry.size_bytes = entry.size_bytes.saturating_add(disk_bytes); // mirror size=disk
+            entry.disk_bytes = entry.disk_bytes.saturating_add(disk_bytes);
+            if latest_mtime > entry.latest_mtime {
+                entry.latest_mtime = latest_mtime;
             }
 
             loaded_count += 1;
+            // Show progress (approx 10% steps)
+            if progress_interval > 0 && (line_no + 1) % progress_interval == 0 {
+                let percent = ((line_no + 1) as f64 * 100.0 / data_lines.max(1) as f64).ceil() as u32;
+                println!("{}%", percent.min(100));
+            }
         }
 
         self.total_entries = loaded_count;
@@ -247,52 +263,24 @@ impl InMemoryFSIndex {
         Ok(users)
     }
 
-    fn insert_merge(
-        &mut self,
-        path: &str,
-        file_count: u64,
-        file_size: f64,
-        disk_usage: f64,
-        latest_mtime: &str,
-        username: &str,
-    ) {
+    fn insert_path(&mut self, path: &str, username: &str) {
         let components = Self::path_to_components(path);
         let mut current = &mut self.root;
         for component in components {
             current = current.children
                 .entry(component)
                 .or_insert_with(|| Box::new(TrieNode::new()));
-        }
-
-        match &mut current.data {
-            Some(data) => {
-                data.file_count = data.file_count.saturating_add(file_count);
-                data.file_size  += file_size;
-                data.disk_usage += disk_usage;
-                if data.latest_mtime.is_empty() || data.latest_mtime.as_str() < latest_mtime {
-                    data.latest_mtime = latest_mtime.to_string();
-                }
-                data.users.insert(username.to_string());
-            }
-            None => {
-                let mut users = HashSet::new();
-                users.insert(username.to_string());
-                current.data = Some(AggRowBin {
-                    file_count,
-                    file_size,
-                    disk_usage,
-                    latest_mtime: latest_mtime.to_string(),
-                    users,
-                });
-            }
+            current.users.insert(username.to_string());
         }
     }
 
     pub fn list_children(
         &self,
         dir_path: &str,
-        user_filter: &Vec<String>, // [] => all users (by username)
-    ) -> AResult<Vec<FileItem>> {
+        user_filter: &Vec<String>, // [] => all users
+        age_filter: Option<u8>,     // Some(0|1|2) or None
+    ) -> AResult<Vec<FolderOut>> {
+        // descend to the directory node
         let components = Self::path_to_components(dir_path);
         let mut current = &self.root;
         for component in components {
@@ -304,90 +292,82 @@ impl InMemoryFSIndex {
         let mut items = Vec::new();
         let base_path = Self::normalize_path(dir_path);
 
-        for (child_name, child_node) in &current.children {
-            if let Some(data) = &child_node.data {
-                let full_path = if base_path.is_empty() || base_path == "/" {
-                    format!("/{}", child_name)
-                } else {
-                    format!("{}/{}", base_path.trim_end_matches('/'), child_name)
-                };
+        for (child_name, _child_node) in &current.children {
+            let full_path = if base_path.is_empty() || base_path == "/" {
+                format!("/{}", child_name)
+            } else {
+                format!("{}/{}", base_path.trim_end_matches('/'), child_name)
+            };
 
-                let users_to_show: Vec<String> = if user_filter.is_empty() {
-                    data.users.iter().cloned().collect()
-                } else {
-                    data.users
-                        .iter()
-                        .filter(|u| user_filter.contains(*u))
-                        .cloned()
-                        .collect()
-                };
+            let pkey = Self::canonical_key(&full_path);
 
-                if !user_filter.is_empty() && users_to_show.is_empty() {
-                    continue;
-                }
-
-                let mut user_stats: HashMap<String, UserStatsJson> = HashMap::new();
-                let mut total_count: u64;
-                let mut total_size:  f64;
-                let mut total_disk:  f64;
-                let mut modified:    String;
-
-                let pkey = Self::canonical_key(&full_path);
-
-                if user_filter.is_empty() {
-                    total_count = data.file_count;
-                    total_size  = data.file_size;
-                    total_disk  = data.disk_usage;
-                    modified    = data.latest_mtime.clone();
-
-                    for uname in users_to_show {
-                        if let Some(stats) = self.per_user.get(&(pkey.clone(), uname.clone())) {
-                            user_stats.insert(uname.clone(), UserStatsJson {
-                                username: uname,
-                                count: stats.file_count,
-                                size:  stats.file_size,
-                                disk:  stats.disk_usage,
-                            });
-                        }
-                    }
-                } else {
-                    total_count = 0;
-                    total_size  = 0.0;
-                    total_disk  = 0.0;
-                    modified    = String::new();
-
-                    for uname in users_to_show {
-                        if let Some(stats) = self.per_user.get(&(pkey.clone(), uname.clone())) {
-                            user_stats.insert(uname.clone(), UserStatsJson {
-                                username: uname.clone(),
-                                count: stats.file_count,
-                                size:  stats.file_size,
-                                disk:  stats.disk_usage,
-                            });
-
-                            total_count = total_count.saturating_add(stats.file_count);
-                            total_size  += stats.file_size;
-                            total_disk  += stats.disk_usage;
-                            if modified.is_empty() || modified.as_str() < stats.latest_mtime.as_str() {
-                                modified = stats.latest_mtime.clone();
-                            }
-                        }
-                    }
-
-                    if user_stats.is_empty() {
-                        continue;
-                    }
-                }
-
-                items.push(FileItem {
-                    path: full_path,
-                    total_count,
-                    total_size,
-                    total_disk,
-                    modified,
-                    users: user_stats,
-                });
+            // Which users exist under this child?
+            let available_users = self.users_by_path.get(&pkey);
+            if available_users.is_none() {
+                continue;
             }
+            let available_users = available_users.unwrap();
+
+            // Apply user filter
+            let mut users_to_show: Vec<String> = if user_filter.is_empty() {
+                available_users.iter().cloned().collect()
+            } else {
+                available_users
+                    .iter()
+                    .filter(|u| user_filter.contains(*u))
+                    .cloned()
+                    .collect()
+            };
+            users_to_show.sort();
+
+            if !user_filter.is_empty() && users_to_show.is_empty() {
+                continue;
+            }
+
+            // Build users -> username -> ages map and compute totals for this folder
+            let mut users_map: HashMap<String, HashMap<String, AgeMini>> = HashMap::new();
+            let mut total_count: u64 = 0;
+            let mut total_size:  u64 = 0;
+            let mut total_disk:  u64 = 0;
+            let mut modified:    i64 = 0;
+
+            let ages_to_consider: Vec<u8> = if let Some(a) = age_filter { vec![a] } else { vec![0,1,2] };
+
+            for uname in &users_to_show {
+                let mut age_map: HashMap<String, AgeMini> = HashMap::new();
+
+                for a in &ages_to_consider {
+                    if let Some(s) = self.per_user_age.get(&(pkey.clone(), uname.clone(), *a)) {
+                        age_map.insert(a.to_string(), AgeMini {
+                            count: s.file_count,
+                            size:  s.size_bytes,
+                            disk:  s.disk_bytes,
+                            mtime: s.latest_mtime,
+                        });
+
+                        total_count = total_count.saturating_add(s.file_count);
+                        total_size  = total_size.saturating_add(s.size_bytes);
+                        total_disk  = total_disk.saturating_add(s.disk_bytes);
+                        if s.latest_mtime > modified {
+                            modified = s.latest_mtime;
+                        }
+                    }
+                }
+
+                if !age_map.is_empty() {
+                    users_map.insert(uname.clone(), age_map);
+                }
+            }
+
+            // Skip folders with no matching user/age after filters
+            if users_map.is_empty() {
+                continue;
+            }
+
+            items.push(FolderOut {
+                path: full_path,
+                users: users_map,
+            });
         }
 
         items.sort_by(|a, b| a.path.cmp(&b.path));
@@ -411,7 +391,6 @@ impl InMemoryFSIndex {
         normalized
     }
 
-    /// Canonical key for per_user: normalized and without trailing slash (except root "/").
     fn canonical_key(path: &str) -> String {
         let mut n = Self::normalize_path(path);
         if n.len() > 1 {
@@ -419,6 +398,22 @@ impl InMemoryFSIndex {
         }
         n
     }
+}
+
+// ----------- Output shapes for /api/folders -----------
+
+#[derive(Serialize, Debug, Clone)]
+pub struct AgeMini {
+    pub count: u64,
+    pub size:  u64,  // bytes (mirrored from disk)
+    pub disk:  u64,  // bytes
+    pub mtime: i64,  // Unix seconds
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct FolderOut {
+    pub path: String,
+    pub users: HashMap<String, HashMap<String, AgeMini>>, // username -> age_string -> stats
 }
 
 // ===================== Globals =====================
@@ -434,21 +429,16 @@ fn get_users() -> &'static Vec<String> {
 
 #[derive(Deserialize)]
 struct FolderQuery {
-    /// path inside the indexed tree. If omitted/empty -> "/"
     path: Option<String>,
-    /// Comma-separated usernames. If omitted/empty -> all users
-    users: Option<String>,
-    /// Legacy alias (also usernames): ?uids=support,san
-    uids: Option<String>,
+    users: Option<String>, // "alice,bob"
+    age:   Option<u8>,     // 0|1|2
 }
 
 #[derive(Deserialize)]
 struct FilesQuery {
     path: Option<String>,
-    /// Username filter: comma-separated "users=support,san"
     users: Option<String>,
-    /// Legacy alias for usernames: "uids=support,san"
-    uids: Option<String>,
+    age:   Option<u8>,     // 0|1|2
 }
 
 fn parse_users_csv(s: &str) -> Vec<String> {
@@ -463,35 +453,20 @@ async fn users_handler() -> impl IntoResponse {
     Json(get_users().clone())
 }
 
-/// /api/folders?path=/Users/foo&users=alice,bob  (reads from index)
-/// also supports legacy ?uids=alice,bob (treated as usernames)
 async fn get_folders_handler(Query(q): Query<FolderQuery>) -> impl IntoResponse {
     // normalize path
     let mut path = q.path.unwrap_or_else(|| "/".to_string());
     if path.is_empty() { path = "/".to_string(); }
     if !path.starts_with('/') { path = format!("/{}", path); }
 
-    // Merge users + legacy uids into a single username list
-    let mut merged = String::new();
-    if let Some(s) = q.users.as_deref() {
-        if !s.trim().is_empty() { merged.push_str(s); }
-    }
-    if let Some(s) = q.uids.as_deref() {
-        if !s.trim().is_empty() {
-            if !merged.is_empty() { merged.push(','); }
-            merged.push_str(s);
-        }
-    }
-
-    let user_filter: Vec<String> = if merged.trim().is_empty() {
-        Vec::new() // empty => all users
-    } else {
-        parse_users_csv(&merged)
+    let usernames: Vec<String> = match q.users.as_deref() {
+        Some(s) if !s.trim().is_empty() => parse_users_csv(s),
+        _ => Vec::new(), // empty means "all users"
     };
 
     let index = FS_INDEX.get().expect("FS index not initialized");
 
-    let items = match index.list_children(&path, &user_filter) {
+    let items = match index.list_children(&path, &usernames, q.age) {
         Ok(v) => v,
         Err(_) => Vec::new(),
     };
@@ -500,8 +475,6 @@ async fn get_folders_handler(Query(q): Query<FolderQuery>) -> impl IntoResponse 
 }
 
 /// /api/files?path=/some/dir&users=alice,bob
-/// also supports legacy alias: &uids=alice,bob
-/// Returns: [{ path, owner: <username>, size: <bytes>, modified: "YYYY-MM-DD" }, ...]
 async fn get_files_handler(Query(q): Query<FilesQuery>) -> impl IntoResponse {
     // validate path
     let folder = match q.path.as_deref() {
@@ -509,25 +482,13 @@ async fn get_files_handler(Query(q): Query<FilesQuery>) -> impl IntoResponse {
         _ => return (StatusCode::BAD_REQUEST, "missing 'path' query parameter").into_response(),
     };
 
-    // Merge users + legacy uids into a single username list
-    let mut merged = String::new();
-    if let Some(s) = q.users.as_deref() {
-        if !s.trim().is_empty() { merged.push_str(s); }
-    }
-    if let Some(s) = q.uids.as_deref() {
-        if !s.trim().is_empty() {
-            if !merged.is_empty() { merged.push(','); }
-            merged.push_str(s);
-        }
-    }
-    let usernames: Vec<String> = if merged.trim().is_empty() {
-        Vec::new() // empty => all users
-    } else {
-        parse_users_csv(&merged)
+    let usernames: Vec<String> = match q.users.as_deref() {
+        Some(s) if !s.trim().is_empty() => parse_users_csv(s),
+        _ => Vec::new(), // empty means "all users"
     };
 
     // run blocking scan
-    let fut = tokio::task::spawn_blocking(move || get_items(folder, &usernames));
+    let fut = tokio::task::spawn_blocking(move || get_items(folder, &usernames, q.age));
 
     match fut.await {
         Err(join_err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("task error: {join_err}")).into_response(),
@@ -541,6 +502,13 @@ async fn get_files_handler(Query(q): Query<FilesQuery>) -> impl IntoResponse {
     }
 }
 
+fn default_static_dir() -> String {
+    let mut exe_dir = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    exe_dir.pop(); // remove the binary name
+    let static_dir = exe_dir.join("public");
+    static_dir.to_string_lossy().into_owned()
+}
+
 // ===================== Bootstrap =====================
 
 #[tokio::main]
@@ -552,12 +520,12 @@ async fn main() -> anyhow::Result<()> {
         .expect("Provide CSV path as first arg or set CSV_PATH env var");
 
     let mut idx = InMemoryFSIndex::new();
-    let users = idx.load_from_csv(FsPath::new(&csv_path))?;
+    let users = idx.load_from_csv(Path::new(&csv_path))?;
     FS_INDEX.set(idx).expect("FS_INDEX already set");
     USERS.set(users).expect("USERS already set");
 
     // static dir (frontend build)
-    let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "public".to_string());
+    let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| default_static_dir());
 
     // ServeDir directly; SPA fallback to index.html
     let frontend = ServeDir::new(&static_dir)
@@ -576,7 +544,7 @@ async fn main() -> anyhow::Result<()> {
     // API
     let api = Router::new()
         .route("/users", get(users_handler))         // Vec<String> usernames
-        .route("/folders", get(get_folders_handler)) // query: users=alice,bob or uids=alice,bob
+        .route("/folders", get(get_folders_handler)) // query: path, optional users/uids, optional age
         .route("/files", get(get_files_handler));    // path + optional users/uids
 
     // App

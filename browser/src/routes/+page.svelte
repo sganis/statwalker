@@ -1,11 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { getParent, formatBytes, capitalize, COLORS } from "../js/util";
+  import { getParent, humanTime, humanCount, formatBytes, COLORS } from "../js/util";
   import { api } from "../js/api.svelte";
   import { API_URL } from "../js/store.svelte";
   import Svelecte, { addRenderer } from 'svelecte';
-  import { formatDistanceToNow } from 'date-fns';
-
+  
   //#region colors
   function colorRenderer(item, _isSelection, _inputValue) {
     const base = "width:16px;height:16px;border:1px solid white;border-radius:3px;flex:none;";
@@ -70,6 +69,7 @@
     count: number;
     size: number; // bytes
     disk: number; // bytes
+    mtime: number;
   };
 
   type FileItem = {
@@ -77,7 +77,7 @@
     total_count: number;
     total_size: number; // bytes
     total_disk: number; // bytes
-    modified: string;   // ISO date string (e.g., "2025-09-09")
+    modified: number;   // unix time
     users: Record<string, UserStatsJson>; // keyed by username (aggregated across ages)
   };
 
@@ -85,18 +85,8 @@
   type ScannedFile = {
     path: string;
     size: number;      // bytes
-    modified: string;  // ISO date string
+    modified: number;  // unix
     owner: string;     // username
-  };
-
-  // --- helper to turn unix seconds into YYYY-MM-DD for display only ---
-  function unixToISO(secs: number): string {
-    if (!secs || secs <= 0) return "";
-    try {
-      return new Date(secs * 1000).toISOString().slice(0, 10);
-    } catch {
-      return "";
-    }
   }
 
   // ===== Age Filter =====
@@ -105,10 +95,11 @@
   let ageOpen = $state(false);
   const AGE_LABELS: Record<AgeFilter, string> = {
     all: "All Ages",
-    0: "Recents (<2m)",
-    1: "Not too old (<2y)",
-    2: "Old files (2y+)",
-  };
+    0: "Recents",
+    1: "Not too old",
+    2: "Old files",
+  }
+
   function displayAgeLabel(a: AgeFilter) { return AGE_LABELS[a]; }
   function chooseAge(a: AgeFilter) {
     ageFilter = a;
@@ -118,48 +109,62 @@
 
   // ---------- derive legacy FileItem from RawFolder (apply ageFilter) ----------
   function transformFolders(raw: RawFolder[], filter: AgeFilter): FileItem[] {
-    // Which ages should we include?
-    const ages: string[] =
-      filter === 'all' ? ["0","1","2"] : [String(filter)];
+    // Ages to include
+    const ages: string[] = filter === 'all' ? ["0","1","2"] : [String(filter)];
 
-    return (raw ?? []).map((rf) => {
-      const usersAgg: Record<string, UserStatsJson> = {};
-      let total_count = 0;
-      let total_size  = 0;
-      let total_disk  = 0;
-      let max_mtime   = 0;
+    return (raw ?? [])
+      .map((rf) => {
+        const usersAgg: Record<string, UserStatsJson> = {};
+        let total_count = 0;
+        let total_size  = 0;
+        let total_disk  = 0;
+        let max_mtime   = 0;
 
-      for (const [uname, agesMap] of Object.entries(rf.users ?? {})) {
-        let u_count = 0, u_size = 0, u_disk = 0, u_mtime = 0;
+        const userEntries = Object.entries(rf.users ?? {});
+        for (const [uname, agesMap] of userEntries) {
+          let u_count = 0, u_size = 0, u_disk = 0, u_mtime = 0;
 
-        for (const a of ages) {
-          const s = agesMap?.[a];
-          if (!s) continue;
-          u_count += Number(s.count ?? 0);
-          u_size  += Number(s.size ?? 0);
-          u_disk  += Number(s.disk ?? 0);
-          if (Number(s.mtime ?? 0) > u_mtime) u_mtime = Number(s.mtime);
+          for (const a of ages) {
+            const s = agesMap?.[a];
+            if (!s) continue;
+            // coerce defensively
+            const c = Number(s.count ?? 0);
+            const sz = Number(s.size ?? 0);
+            const dk = Number(s.disk ?? 0);
+            const mt = Number(s.mtime ?? 0);
+
+            u_count += Number.isFinite(c) ? c : 0;
+            u_size  += Number.isFinite(sz) ? sz : 0;
+            u_disk  += Number.isFinite(dk) ? dk : 0;
+            if (Number.isFinite(mt) && mt > u_mtime) u_mtime = mt;
+          }
+
+          if (u_count || u_size || u_disk) {
+            usersAgg[uname] = {
+              username: uname,
+              count: u_count,
+              size:  u_size,
+              disk:  u_disk,
+              mtime: u_mtime,
+            };
+            total_count += u_count;
+            total_size  += u_size;
+            total_disk  += u_disk;
+            if (u_mtime > max_mtime) max_mtime = u_mtime;
+          }
         }
 
-        if (u_count || u_size || u_disk) {
-          usersAgg[uname] = { username: uname, count: u_count, size: u_size, disk: u_disk };
-          total_count += u_count;
-          total_size  += u_size;
-          total_disk  += u_disk;
-          if (u_mtime > max_mtime) max_mtime = u_mtime;
-        }
-      }
-
-      return {
-        path: rf.path,
-        total_count,
-        total_size,
-        total_disk,
-        // modified: unixToISO(max_mtime),
-        modified: formatDistanceToNow(new Date(max_mtime * 1000), { addSuffix: true }),
-        users: usersAgg,
-      };
-    }).filter(f => Object.keys(f.users).length > 0); // hide folders with no data after filter
+        return {
+          path: rf.path,
+          total_count,
+          total_size,
+          total_disk,
+          modified: max_mtime,
+          users: usersAgg,
+        };
+      })
+      // hide folders with no data after filter
+      .filter(f => Object.keys(f.users).length > 0);
   }
 
   //#region state
@@ -173,7 +178,7 @@
   let history = $state<string[]>(['/']);
   let histIdx = $state(0);
 
-  type SortKey = "disk" | "size" | "count";
+  type SortKey = "disk" | "count";
   let sortBy = $state<SortKey>("disk");
   let sortOpen = $state(false);
 
@@ -183,7 +188,7 @@
   // /api/users returns a simple string[]
   let users = $state<string[]>([]);
   let userColors = $state(new Map<string, string>()); // cache: username -> color
-  let userDropdown = $state([])
+  let userDropdown = $state<{user:string;color:string}[]>([]);
 
   // Your Svelte 5 component
   let pathInput = $state();
@@ -319,10 +324,6 @@
           aVal = toNum(a?.total_disk);
           bVal = toNum(b?.total_disk);
           break;
-        case "size":
-          aVal = toNum(a?.total_size);
-          bVal = toNum(b?.total_size);
-          break;
         case "count":
           aVal = toNum(a?.total_count);
           bVal = toNum(b?.total_count);
@@ -340,8 +341,6 @@
         switch (key) {
           case "disk":
             return toNum(f?.total_disk);
-          case "size":
-            return toNum(f?.total_size);
           case "count":
             return toNum(f?.total_count);
         }
@@ -357,21 +356,19 @@
     return Math.round(clamped * 10) / 10;
   };
   const displaySortBy = (key: string) => {
-    switch (sortBy) {
+    switch (key) {
       case "disk":
         return 'Disk Usage'
       case "count":
         return 'Total Files'
-      case "size":
-        return 'Total Size'
+      default:
+        return 'Disk Usage'
     }
   }
   const metricValue = (file: FileItem) => {
     switch (sortBy) {
       case "disk":
         return toNum(file?.total_disk);
-      case "size":
-        return toNum(file?.total_size);
       case "count":
         return toNum(file?.total_count);
     }
@@ -382,8 +379,6 @@
     switch (sortBy) {
       case "disk":
         return formatBytes(toNum(file?.total_disk));
-      case "size":
-        return formatBytes(toNum(file?.total_size));
       case "count":
         return toNum(file?.total_count).toLocaleString();
     }
@@ -394,8 +389,6 @@
     switch (sortBy) {
       case "disk":
         return formatBytes(toNum(userData?.disk));
-      case "size":
-        return formatBytes(toNum(userData?.size));
       case "count":
         return toNum(userData?.count).toLocaleString();
     }
@@ -413,32 +406,26 @@
     let total_count = 0;
     let total_size = 0;
     let total_disk = 0;
-    let modified = ""; // ISO string; keep the latest lexicographically
+    let modified = 0; 
     const aggUsers: Record<string, UserStatsJson> = {};
 
     for (const f of foldersArr ?? []) {
       total_count += toNum(f?.total_count);
       total_size  += toNum(f?.total_size);
       total_disk  += toNum(f?.total_disk);
-      if (typeof f?.modified === "string" && f.modified) {
-        if (!modified || f.modified > modified) modified = f.modified;
-      }
-
+      if (f.modified > modified) 
+        modified = f.modified;
+      
       const u = f?.users ?? {};
       for (const [uname, data] of Object.entries(u)) {
-        const key = String(uname);
-        const prev =
-          aggUsers[key] ?? {
-            username: (data as any)?.username || key,
-            count: 0,
-            size: 0,
-            disk: 0,
-          };
-        aggUsers[key] = {
-          username: prev.username,
-          count: prev.count + toNum((data as any)?.count),
-          size:  prev.size  + toNum((data as any)?.size),
-          disk:  prev.disk  + toNum((data as any)?.disk),
+        const d = data as UserStatsJson;
+        const prev = aggUsers[uname] ?? { username: uname, count: 0, size: 0, disk: 0, mtime: 0 };
+        aggUsers[uname] = {
+          username: uname,
+          count: prev.count + toNum(d.count),
+          size:  prev.size  + toNum(d.size),
+          disk:  prev.disk  + toNum(d.disk),
+          mtime: Math.max(prev.mtime, toNum(d.mtime)),
         };
       }
     }
@@ -481,7 +468,6 @@
   function rightValueFile(f: ScannedFile) {
     switch (sortBy) {
       case "disk":
-      case "size":
         return formatBytes(toNum(f.size)); // bytes
       case "count":
         return "1";
@@ -517,7 +503,7 @@
       const raw: RawFolder[] = await api.getFolders(_p, userFilter, ageFilter);
       folders = transformFolders(raw, ageFilter);
 
-      files = await api.getFiles(_p, userFilter, ageFilter); // ← added ageFilter here
+      files = await api.getFiles(_p, userFilter, ageFilter);
       if (users && users.length > 0) seedUserColors(users);
     } finally {
       loading = false;
@@ -543,6 +529,9 @@
   }
   function refresh() {
     fetchFolders(fullPath || path);
+  }
+  function goHome() {
+    navigateTo('/');
   }
   function goUp() {
     const parent = getParent(fullPath || path);
@@ -590,26 +579,31 @@
 
 <div class="flex flex-col h-screen min-h-0 gap-2 p-2">
   <div class="flex gap-2 items-center relative">
-    <button class="btn" onclick={goBack} disabled={histIdx === 0}>
+    <button class="btn" onclick={goHome} title="Go to Root Folder" disabled={histIdx === 0}>
+      <div class="flex items-center">
+      <span class="material-symbols-outlined">home</span>
+      </div>
+    </button>
+    <button class="btn" onclick={goBack} title="Go Back" disabled={histIdx === 0}>
       <div class="flex items-center">
       <span class="material-symbols-outlined">arrow_back_ios</span>
       </div>
     </button>
-    <button class="btn" onclick={goForward} disabled={histIdx >= history.length - 1}>
+    <button class="btn" onclick={goForward} title="Go Forward" disabled={histIdx >= history.length - 1}>
       <div class="flex items-center">
       <span class="material-symbols-outlined">arrow_forward_ios</span>
       </div>
     </button>
-    <button class="btn" onclick={goUp} disabled={getParent(path) === path}>
+    <button class="btn" onclick={goUp} title="Go Up" disabled={getParent(path) === path}>
       <div class="flex items-center">
       <span class="material-symbols-outlined">arrow_upward</span>
       </div>
     </button>
-    <button class="btn" onclick={refresh}>
+    <!-- <button class="btn"  onclick={refresh}>
       <div class="flex items-center">
         <span class="material-symbols-outlined">refresh</span>
       </div>
-    </button>
+    </button> -->
 
     <!-- Sort dropdown -->
     <div class="relative">
@@ -622,7 +616,7 @@
       {#if sortOpen}
         <div
           class="flex flex-col divide-y divide-gray-500 absolute w-36 rounded border
-           border-gray-500 bg-gray-800 shadow-lg z-20 overflow-hidden mt-1"
+           border-gray-500 bg-gray-800 shadow-lg z-20 overflow-hidden mt-0.5"
         >
           <button class="w-full text-left px-3 py-2 hover:bg-gray-700 text-nowrap" onclick={() => chooseSort("disk")}>
             By Disk Usage
@@ -636,39 +630,40 @@
 
     <!-- NEW: Age filter dropdown -->
     <div class="relative">
-      <button class="btn w-48" onclick={() => (ageOpen = !ageOpen)}>
+      <button class="btn w-36" onclick={() => (ageOpen = !ageOpen)}>
         <div class="flex items-center gap-2">
-          <span class="material-symbols-outlined">hourglass</span>
+          <span class="material-symbols-outlined">schedule</span>
           {displayAgeLabel(ageFilter)}
         </div>
       </button>
       {#if ageOpen}
         <div
           class="flex flex-col divide-y divide-gray-500 absolute w-48 rounded border
-           border-gray-500 bg-gray-800 shadow-lg z-20 overflow-hidden mt-1"
+           border-gray-500 bg-gray-800 shadow-lg z-20 overflow-hidden mt-0.5"
         >
           <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge('all')}>
             All Ages
           </button>
           <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge(0)}>
-            Recents (&lt;2m)
+            Recents (2 months)
           </button>
           <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge(1)}>
-            Not too old (&lt;2y)
+            Not too old (2 years)
           </button>
           <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge(2)}>
-            Old files (2y+)
+            Old files
           </button>
         </div>
       {/if}
     </div>
 
-    <Svelecte  bind:value={selectedUser} 
+    <Svelecte
+      bind:value={selectedUser} 
       options={userDropdown}
       valueField="user" 
       renderer="color"
-      onChange={userChanged}
-      class="z-20 min-w-20 h-10 border rounded border-gray-600 bg-gray-800 text-white"
+      on:change={userChanged}
+      class="z-20 min-w-40 h-10 border rounded border-gray-600 bg-gray-800 text-white"
     />
   </div>
   <div class="flex">
@@ -707,10 +702,12 @@
       <div class="relative z-10 pointer-events-none">
         <div class="flex items-center justify-end">
           <p class="text-xs">
-            {pathTotals.total_count} Files 
-            • Changed: {pathTotals.modified || "—"} 
-            • {formatBytes(pathTotals.total_size)}
-             ({formatBytes(pathTotals.total_disk)} on disk)
+            {humanCount(pathTotals.total_count)} Files 
+            • Changed {humanTime(pathTotals.modified)} 
+            • {formatBytes(pathTotals.total_disk)}
+            {#if formatBytes(pathTotals.total_size) !== formatBytes(pathTotals.total_disk)}
+              ({formatBytes(pathTotals.total_size)} on size)
+            {/if}          
           </p>
         </div>
       </div>
@@ -791,10 +788,12 @@
             </div>
             <div class="flex justify-end">
               <p class="text-xs text-gray-300">
-                {file.total_count} Files 
-                • Changed: {file.modified || "—"} 
-                • {formatBytes(file.total_size)} 
-                  ({formatBytes(file.total_disk)} on disk)          
+                {humanCount(file.total_count)} Files 
+                • Changed {humanTime(file.modified)} 
+                • {formatBytes(file.total_disk)} 
+                {#if formatBytes(file.total_size) !== formatBytes(file.total_disk)}
+                  ({formatBytes(file.total_size)} on size)
+                {/if}          
               </p>
             </div>
           </div>
@@ -807,7 +806,7 @@
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div class="flex">
           <span class="material-symbols-outlined text-4xl">subdirectory_arrow_right</span>
-          <div class="flex grow relative px-2 py-1 bg-gray-700 border-gray-600 rounded overflow-hidden text-xs">
+          <div class="flex grow relative px-2 py-1 bg-gray-700 border border-gray-600 rounded overflow-hidden text-xs">
             <div class="flex flex-col w-full">
               <div class="absolute left-0 top-0 bottom-0 z-0 opacity-60" style="width: {filePct(f)}%; background-color: {color};"></div>
               <div class="relative z-10 flex items-center justify-between gap-1">
@@ -816,7 +815,7 @@
               </div>
               <div class="relative z-10 flex justify-between text-gray-300">
                 <div class="">{f.owner}</div>
-                <div class="">Changed: {f.modified}</div>
+                <div class="">Changed {humanTime(f.modified)}</div>
               </div>
             </div>
           </div>
