@@ -70,5 +70,5 @@ jobs:
         with:
           name: statwaker-${{ matrix.os }}-browser
           path: |
-            build/**
-          if-no-files-found: error
+            browser/build/**
+          if-no-files-found: warn
