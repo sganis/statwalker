@@ -1,11 +1,37 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { getParent, humanTime, humanCount, formatBytes, COLORS } from "../js/util";
-  import { api } from "../js/api.svelte";
-  import { API_URL } from "../js/store.svelte";
+  import { getParent, humanTime, humanCount, formatBytes, COLORS } from "../ts/util";
+  import { api } from "../ts/api.svelte";
+  import { API_URL } from "../ts/store.svelte";
   import Svelecte, { addRenderer } from 'svelecte';
+
+  //#region state
   
+  let folders = $state<FileItem[]>([]);
+  let files = $state<ScannedFile[]>([]);
+  let loading = $state(false);
+  let initializing = $state(false);
+  let progress_current = $state(0);
+  let progress_total = $state(0);
+  let progress_percent = $state(0);
+  let history = $state<string[]>(['/']);
+  let histIdx = $state(0);
+  type SortKey = "disk" | "count";
+  let sortBy = $state<SortKey>("disk");
+  let sortOpen = $state(false);
+  let selectedUser = $state<string>("All Users");
+  let users = $state<string[]>([]);
+  let userColors = $state(new Map<string, string>()); // cache: username -> color
+  let userDropdown = $state<{user:string;color:string}[]>([]);
+  let pathInput = $state();
+  let path = $state('/');
+  let fullPath = $state('');
+  let isEditing = $state(false);
+
+  //#endregion
+
   //#region colors
+
   function colorRenderer(item, _isSelection, _inputValue) {
     const base = "width:16px;height:16px;border:1px solid white;border-radius:3px;flex:none;";
     const a = COLORS[0];
@@ -49,29 +75,25 @@
   }
   //#endregion
 
-  // ---------- NEW backend shape (folders → users → ages) ----------
+  //#region types
   type AgeMini = {
     count: number;
     size: number;  // bytes
     disk: number;  // bytes
     mtime: number; // unix seconds
-  };
-
+  }
   type RawFolder = {
     path: string;
     // username -> "0"/"1"/"2" -> AgeMini
     users: Record<string, Record<string, AgeMini>>;
-  };
-
-  // ---------- Types used by existing UI (we'll derive these) ----------
+  }
   type UserStatsJson = {
     username: string;
     count: number;
     size: number; // bytes
     disk: number; // bytes
     mtime: number;
-  };
-
+  }
   type FileItem = {
     path: string;
     total_count: number;
@@ -79,8 +101,7 @@
     total_disk: number; // bytes
     modified: number;   // unix time
     users: Record<string, UserStatsJson>; // keyed by username (aggregated across ages)
-  };
-
+  }
   // Scanned file from /api/files
   type ScannedFile = {
     path: string;
@@ -88,29 +109,150 @@
     modified: number;  // unix
     owner: string;     // username
   }
+  //#endregion
 
-  // ===== Age Filter =====
-  type AgeFilter = 'all' | 0 | 1 | 2;
-  let ageFilter = $state<AgeFilter>('all');
+  //#region age filter
+  type AgeFilter = -1 | 0 | 1 | 2;
+  let ageFilter = $state<AgeFilter>(-1);
   let ageOpen = $state(false);
   const AGE_LABELS: Record<AgeFilter, string> = {
-    all: "All Ages",
+    '-1': "All Ages",
     0: "Recents",
     1: "Not too old",
     2: "Old files",
   }
 
-  function displayAgeLabel(a: AgeFilter) { return AGE_LABELS[a]; }
+  function displayAgeLabel(a: AgeFilter) { 
+    return AGE_LABELS[a]; 
+  }
+
   function chooseAge(a: AgeFilter) {
     ageFilter = a;
     ageOpen = false;
     refresh();
   }
+  //#endregion
 
-  // ---------- derive legacy FileItem from RawFolder (apply ageFilter) ----------
+  //#region input path
+
+  function setPath(newPath) {
+    const displayedPath = displayPath(newPath);
+    fullPath = displayedPath;
+
+    if (!isEditing) {
+      path = truncatePathFromStart(displayedPath);
+    } else {
+      path = displayedPath;
+    }
+  }
+  // Function to truncate path from the beginning
+  function truncatePathFromStart(inputPath, maxLength = 50) {
+    if (!inputPath || inputPath.length <= maxLength) return inputPath;
+
+    const parts = inputPath.split('/');
+    let result = parts[parts.length - 1]; // Start with filename
+
+    // Add directories from the end until we approach maxLength
+    for (let i = parts.length - 2; i >= 0; i--) {
+      const potential = parts[i] + '/' + result;
+      if (('...' + potential).length > maxLength) break;
+      result = potential;
+    }
+
+    return '...' + result;
+  }
+  function onPathFocus() {
+    isEditing = true;
+    if (fullPath) {
+      path = fullPath;
+    }
+  }
+  function onPathBlur() {
+    isEditing = false;
+    if (path && !path.startsWith('...')) {
+      fullPath = path;
+    }
+    if (fullPath) {
+      path = truncatePathFromStart(fullPath);
+    }
+  }
+  function displayPath(p: string): string {
+    if (!p) return "/";
+    let s = p.replace(/\\/g, "/");
+    if (s !== "/") s = s.replace(/\/+$/, "");
+    if (!s.startsWith("/")) s = "/" + s;
+    return s || "/";
+  }
+  function onPathKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      navigateTo(fullPath || path);
+    }
+  }
+
+  //#endregion
+
+  //#region tooltip
+  type Tip = {
+    show: boolean;
+    x: number;
+    y: number;
+    username?: string;
+    value?: string;
+    percent?: number;
+  }
+  let tip = $state<Tip>({ show: false, x: 0, y: 0 });
+
+  let bubbleEl: HTMLDivElement | null = $state(null);
+  const MARGIN = 8;
+  const ARROW_GAP = 10;
+
+  function clampToViewport(rawX: number, rawY: number) {
+    const ww = window.innerWidth;
+    const wh = window.innerHeight;
+
+    const w = bubbleEl?.offsetWidth ?? 200;
+    const h = bubbleEl?.offsetHeight ?? 60;
+
+    const halfW = w / 2;
+
+    const minX = MARGIN + halfW;
+    const maxX = ww - MARGIN - halfW;
+
+    const minY = MARGIN + h + ARROW_GAP;
+    const maxY = wh - MARGIN;
+
+    return {
+      x: Math.min(maxX, Math.max(minX, rawX)),
+      y: Math.min(maxY, Math.max(minY, rawY)),
+    };
+  }
+
+  function showTip(e: MouseEvent, userData: UserStatsJson, percent: number) {
+    const { x, y } = clampToViewport(e.clientX, e.clientY);
+    tip = {
+      show: true,
+      x,
+      y,
+      username: userData.username,
+      value: rightValueForUser(userData),
+      percent: Math.round(percent * 10) / 10,
+    };
+  }
+  function moveTip(e: MouseEvent) {
+    if (!tip.show) return;
+    const { x, y } = clampToViewport(e.clientX, e.clientY);
+    tip = { ...tip, x, y };
+  }
+  function hideTip() {
+    tip = { show: false, x: 0, y: 0 };
+  }
+  //#endregion
+
+  //#region folders and files bars
+  
   function transformFolders(raw: RawFolder[], filter: AgeFilter): FileItem[] {
     // Ages to include
-    const ages: string[] = filter === 'all' ? ["0","1","2"] : [String(filter)];
+    const ages: string[] = filter === -1 ? ["0","1","2"] : [String(filter)];
 
     return (raw ?? [])
       .map((rf) => {
@@ -166,153 +308,10 @@
       // hide folders with no data after filter
       .filter(f => Object.keys(f.users).length > 0);
   }
-
-  //#region state
-  let folders = $state<FileItem[]>([]);
-  let files = $state<ScannedFile[]>([]);
-  let loading = $state(false);
-  let initializing = $state(false);
-  let progress_current = $state(0);
-  let progress_total = $state(0);
-  let progress_percent = $state(0);
-  let history = $state<string[]>(['/']);
-  let histIdx = $state(0);
-
-  type SortKey = "disk" | "count";
-  let sortBy = $state<SortKey>("disk");
-  let sortOpen = $state(false);
-
-  // selection is by username (not uid). Empty string = "All users"
-  let selectedUser = $state<string>("All Users");
-
-  // /api/users returns a simple string[]
-  let users = $state<string[]>([]);
-  let userColors = $state(new Map<string, string>()); // cache: username -> color
-  let userDropdown = $state<{user:string;color:string}[]>([]);
-
-  // Your Svelte 5 component
-  let pathInput = $state();
-  let path = $state('/');
-  let fullPath = $state('');
-  let isEditing = $state(false);
-  //#endregion
-
-  // Function to set path programmatically (use this instead of directly setting path)
-  function setPath(newPath) {
-    const displayedPath = displayPath(newPath);
-    fullPath = displayedPath;
-
-    if (!isEditing) {
-      path = truncatePathFromStart(displayedPath);
-    } else {
-      path = displayedPath;
-    }
-  }
-
-  // Function to truncate path from the beginning
-  function truncatePathFromStart(inputPath, maxLength = 50) {
-    if (!inputPath || inputPath.length <= maxLength) return inputPath;
-
-    const parts = inputPath.split('/');
-    let result = parts[parts.length - 1]; // Start with filename
-
-    // Add directories from the end until we approach maxLength
-    for (let i = parts.length - 2; i >= 0; i--) {
-      const potential = parts[i] + '/' + result;
-      if (('...' + potential).length > maxLength) break;
-      result = potential;
-    }
-
-    return '...' + result;
-  }
-
-  function onPathFocus() {
-    isEditing = true;
-    if (fullPath) {
-      path = fullPath;
-    }
-  }
-
-  function onPathBlur() {
-    isEditing = false;
-    if (path && !path.startsWith('...')) {
-      fullPath = path;
-    }
-    if (fullPath) {
-      path = truncatePathFromStart(fullPath);
-    }
-  }
-
-  // ---------- Helpers ----------
-  function displayPath(p: string): string {
-    if (!p) return "/";
-    let s = p.replace(/\\/g, "/");
-    if (s !== "/") s = s.replace(/\/+$/, "");
-    if (!s.startsWith("/")) s = "/" + s;
-    return s || "/";
-  }
-
-  type Tip = {
-    show: boolean;
-    x: number;
-    y: number;
-    username?: string;
-    value?: string;
-    percent?: number;
-  };
-  let tip = $state<Tip>({ show: false, x: 0, y: 0 });
-
-  // === Tooltip clamping additions ===
-  let bubbleEl: HTMLDivElement | null = $state(null);
-  const MARGIN = 8;
-  const ARROW_GAP = 10;
-
-  function clampToViewport(rawX: number, rawY: number) {
-    const ww = window.innerWidth;
-    const wh = window.innerHeight;
-
-    const w = bubbleEl?.offsetWidth ?? 200;
-    const h = bubbleEl?.offsetHeight ?? 60;
-
-    const halfW = w / 2;
-
-    const minX = MARGIN + halfW;
-    const maxX = ww - MARGIN - halfW;
-
-    const minY = MARGIN + h + ARROW_GAP;
-    const maxY = wh - MARGIN;
-
-    return {
-      x: Math.min(maxX, Math.max(minX, rawX)),
-      y: Math.min(maxY, Math.max(minY, rawY)),
-    };
-  }
-
-  function showTip(e: MouseEvent, userData: UserStatsJson, percent: number) {
-    const { x, y } = clampToViewport(e.clientX, e.clientY);
-    tip = {
-      show: true,
-      x,
-      y,
-      username: userData.username,
-      value: rightValueForUser(userData),
-      percent: Math.round(percent * 10) / 10,
-    };
-  }
-  function moveTip(e: MouseEvent) {
-    if (!tip.show) return;
-    const { x, y } = clampToViewport(e.clientX, e.clientY);
-    tip = { ...tip, x, y };
-  }
-  function hideTip() {
-    tip = { show: false, x: 0, y: 0 };
-  }
-
   const toNum = (v: any) => {
     const n = Number(v);
     return Number.isFinite(n) ? n : 0;
-  };
-
+  }
   // ---------- Sorting (Folders) ----------
   const sortedfolders = $derived.by(() => {
     const key = sortBy;
@@ -331,8 +330,7 @@
       }
       return bVal - aVal;
     });
-  });
-
+  })
   // Folder progress bar max
   let maxMetric = $derived.by(() => {
     const key = sortBy;
@@ -347,14 +345,13 @@
       }) ?? [];
     const max = Math.max(0, ...vals);
     return max > 0 ? max : 1;
-  });
-
+  })
   const pct = (n: any) => {
     const x = toNum(n);
     const p = (x / maxMetric) * 100;
     const clamped = Math.max(0, Math.min(100, p));
     return Math.round(clamped * 10) / 10;
-  };
+  }
   const displaySortBy = (key: string) => {
     switch (key) {
       case "disk":
@@ -365,6 +362,35 @@
         return 'Disk Usage'
     }
   }
+  function clickOutside(
+    node: HTMLElement,
+    cb: (() => void) | { close: () => void }
+  ) {
+    let close: (() => void) | undefined =
+      typeof cb === "function" ? cb : cb?.close;
+
+    const onPointerDown = (e: PointerEvent) => {
+      if (!node.contains(e.target as Node)) close?.();
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" || e.key === "Esc") close?.();
+    };
+
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+
+    return {
+      update(next: typeof cb) {
+        close = typeof next === "function" ? next : next?.close;
+      },
+      destroy() {
+        document.removeEventListener("pointerdown", onPointerDown, true);
+        document.removeEventListener("keydown", onKeyDown, true);
+      },
+    };
+  }
+
   const metricValue = (file: FileItem) => {
     switch (sortBy) {
       case "disk":
@@ -373,7 +399,6 @@
         return toNum(file?.total_count);
     }
   }
-
   // Right label (folders) – sizes already in BYTES
   function rightValue(file: FileItem) {
     switch (sortBy) {
@@ -383,7 +408,6 @@
         return toNum(file?.total_count).toLocaleString();
     }
   }
-
   // Per-user right label – sizes already in BYTES
   function rightValueForUser(userData: UserStatsJson) {
     switch (sortBy) {
@@ -393,14 +417,10 @@
         return toNum(userData?.count).toLocaleString();
     }
   }
-
-  const userMetricFor = (ud: UserStatsJson) =>
-    sortBy === "disk" ? Number(ud.disk) : sortBy === "size" ? Number(ud.size) : Number(ud.count);
-
+  const userMetricFor = (ud: UserStatsJson) => sortBy === "disk" ? Number(ud.disk) : Number(ud.count);
   function sortedUserEntries(file: FileItem) {
     return Object.entries(file?.users ?? {}).sort(([, a], [, b]) => userMetricFor(a) - userMetricFor(b));
   }
-
   // Build an aggregate "file" for the current path: sums of all visible children (bytes)
   function aggregatePathTotals(foldersArr: FileItem[], p: string): FileItem {
     let total_count = 0;
@@ -439,32 +459,26 @@
       users: aggUsers,
     };
   }
-
   const pathTotals = $derived.by(() => aggregatePathTotals(folders, path));
-
   // ---------- Sorting (Files) ----------
   function fileMetricValue(f: ScannedFile) {
     switch (sortBy) {
       case "disk":
-      case "size":
         return toNum(f.size); // bytes
       case "count":
         return 1;
     }
   }
-
   const sortedfiles = $derived.by(() => {
     const arr = files ? [...files] : [];
     return arr.sort((a, b) => fileMetricValue(b) - fileMetricValue(a));
   });
-
   const maxFileMetric = $derived.by(() => {
     const vals = files?.map((f) => fileMetricValue(f)) ?? [];
     const max = Math.max(0, ...vals);
     return max > 0 ? max : 1;
   });
   const filePct = (f: ScannedFile) => Math.round((fileMetricValue(f) / maxFileMetric) * 1000) / 10;
-
   function rightValueFile(f: ScannedFile) {
     switch (sortBy) {
       case "disk":
@@ -473,8 +487,10 @@
         return "1";
     }
   }
+  //#endregion
 
-  // ---- single-flight fetch (usernames) ----
+  //#region fetch data
+  // single-flight fetch
   function createDoItAgain<T extends any[]>(fn: (...args: T) => Promise<void>) {
     let running = false;
     let nextArgs: T | null = null;
@@ -493,7 +509,6 @@
       }
     };
   }
-
   const fetchFolders = createDoItAgain(async (_p: string) => {
     loading = true;
     try {
@@ -508,8 +523,10 @@
     } finally {
       loading = false;
     }
-  });
+  })
+  //#endregion
 
+  //#region menus
 
   function pushHistory(p: string) {
     if (history[histIdx] === p) return;
@@ -517,7 +534,6 @@
     history.push(p);
     histIdx = history.length - 1;
   }
-
   function chooseSort(key: SortKey) {
     sortBy = key;
     sortOpen = false;
@@ -551,30 +567,30 @@
       fetchFolders(history[histIdx]);
     }
   }
-  function onPathKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter") {
-      navigateTo(fullPath || path);
-    }
-  }
   function userChanged() {
     if (!selectedUser)
       selectedUser = 'All Users'
     refresh()
   }
 
+  //#endregion
+
+  //#region keyboard
+
+  //#endregion
+
+
   onMount(async () => {
     console.log("api url:", API_URL);
-    users = await api.getUsers(); // array of usernames
+    users = await api.getUsers(); 
     users.splice(0,0,"All Users")
     selectedUser = 'All Users'
     seedUserColors(users);
-
-    // Initialize the path truncation
     fullPath = path;
     path = truncatePathFromStart(path);
-
-    await refresh();
-  });
+    refresh();
+  })
+  
 </script>
 
 <div class="flex flex-col h-screen min-h-0 gap-2 p-2">
@@ -599,14 +615,9 @@
       <span class="material-symbols-outlined">arrow_upward</span>
       </div>
     </button>
-    <!-- <button class="btn"  onclick={refresh}>
-      <div class="flex items-center">
-        <span class="material-symbols-outlined">refresh</span>
-      </div>
-    </button> -->
 
     <!-- Sort dropdown -->
-    <div class="relative">
+    <div class="relative" use:clickOutside={() => (sortOpen = false)}>
       <button class="btn w-36" onclick={() => (sortOpen = !sortOpen)}>
         <div class="flex items-center gap-2">
           <span class="material-symbols-outlined">sort</span>
@@ -628,8 +639,8 @@
       {/if}
     </div>
 
-    <!-- NEW: Age filter dropdown -->
-    <div class="relative">
+    <!-- Age filter dropdown -->
+    <div class="relative"  use:clickOutside={() => (ageOpen = false)}>
       <button class="btn w-36" onclick={() => (ageOpen = !ageOpen)}>
         <div class="flex items-center gap-2">
           <span class="material-symbols-outlined">schedule</span>
@@ -641,7 +652,7 @@
           class="flex flex-col divide-y divide-gray-500 absolute w-48 rounded border
            border-gray-500 bg-gray-800 shadow-lg z-20 overflow-hidden mt-0.5"
         >
-          <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge('all')}>
+          <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge(-1)}>
             All Ages
           </button>
           <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge(0)}>
@@ -662,7 +673,7 @@
       options={userDropdown}
       valueField="user" 
       renderer="color"
-      on:change={userChanged}
+      onChange={userChanged}
       class="z-20 min-w-40 h-10 border rounded border-gray-600 bg-gray-800 text-white"
     />
   </div>
