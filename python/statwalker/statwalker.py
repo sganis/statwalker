@@ -55,7 +55,6 @@ import datetime
 import stat
 import random
 from multiprocessing import Pool, freeze_support
-import subprocess
 
 is_windows = os.name == 'nt'
 
@@ -76,47 +75,50 @@ def listdir(path):
 		print('Cannot list dir {}: {}'.format(path, ex))
 	return l
 
+def _csv_escape(field: str) -> str:
+    # Quote only when needed for CSV (comma, quote, or newline)
+    if any(ch in field for ch in [',', '"', '\n', '\r']):
+        return '"' + field.replace('"', '""') + '"'
+    return field
 
 def get_stats(path):
-	"""cvs line, see HEADER
-	returns tuple (is_dir, line, disk)
-	HEADER = "INODE,ATIME,MTIME,UID,GID,SIZE,DISK,PATH"
-	"""
-	f = ()
-	blocks = 0
-	uid = 0
-	try:
-		f = os.lstat(path)
-		# python stat struct:
-		# st_mode,st_ino,st_dev,st_nlink,st_uid,st_gid,st_size,st_atime,st_mtime,st_ctime
-		# return DEV,INODE,ATIME,MTIME,UID,GID,MODE,SIZE,BLOKKS
-		if is_windows:
-			uid = getsid.get_sid(path)
-		else:
-			uid = f.st_uid
-			blocks = f.st_blocks
-	except Exception as ex:
-		print('Cannot get stats {}: {}'.format(path, ex))
+    """csv line, see HEADER
+    returns tuple (is_dir, line, disk)
+    HEADER = "INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH"
+    """
+    try:
+        st = os.lstat(path)
+    except Exception as ex:
+        print('Cannot lstat {}: {}'.format(path, ex))
+        return False, '', 0
 
-	if not f:
-		return False,'',0
-	# path = path.encode('utf-8', errors='surrogatepass')
-	mode = f[0]
-	disk = blocks*512
-	size = f[6]
-	# INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH"
-	line = '%s-%s,%s,%s,%s,%s,%s,%s,%s,%s' % (
-			f[2],f[1],f[7],f[8],uid,f[5],f[0],f[6],disk,'"' + path +'"')
-	# try:
-	# 	print(line)
-	# except Exception as ex:
-	# 	for i,e in enumerate(f):
-	# 		print(i, e)
-	# 	print(f)
-	# 	print(path.encode('utf-8', errors='surrogatepass'))
-	return stat.S_ISDIR(mode), line, size
- 
- 
+    # Defaults
+    uid = 0
+    blocks = 0
+
+    if is_windows:
+        try:
+            uid = getsid.get_sid(path)  # best effort; don't fail the record
+        except Exception as ex:
+            print('Cannot get SID for {}: {}'.format(path, ex))
+            uid = 0
+    else:
+        uid = st.st_uid
+        blocks = getattr(st, 'st_blocks', 0)
+
+    mode = st.st_mode
+    disk = blocks * 512
+
+    path_csv = _csv_escape(path)
+
+    # Keep your current layout (DEV-INODE combined as one csv field)
+    line = '{:d}-{:d},{:d},{:d},{:d},{:d},{:d},{:d},{:d},{}'.format(
+        st.st_dev, st.st_ino, int(st.st_atime), int(st.st_mtime), uid,
+        st.st_gid, st.st_mode, st.st_size, disk, path_csv
+    )
+    return stat.S_ISDIR(mode), line, st.st_size
+
+
 SKIP=[]
 def skipit(path):
 	"""skip file if in patter
@@ -280,7 +282,7 @@ def get_param():
 	parser.add_argument('-n', '--processes', default='MAX', help='number of processes to run in parallel')
 	parser.add_argument('-o', '--output', help='csv file to write stats')
 	parser.add_argument('--skip', default=None, help='skip file name pattern list, separated by comma')
-	parser.add_argument('--sort', action='store_true', default=False, help='sort results')
+	
 	args = parser.parse_args()
 	PATH = args.PATH
 	BALANCE = args.balance
@@ -288,14 +290,13 @@ def get_param():
 	NP = args.processes
 	OUTPUT = args.output
 	SKIP = args.skip
-	SORT = args.sort
-	return (PATH,BALANCE,COLOR,NP,OUTPUT,SKIP,SORT)
+	return (PATH,BALANCE,COLOR,NP,OUTPUT,SKIP)
  
  
 def main():
 	# parse parameters
 	global COLOR,SKIP
-	PATH,BALANCE,COLOR,NP,OUTPUT,SKIP,SORT = get_param()			
+	PATH,BALANCE,COLOR,NP,OUTPUT,SKIP = get_param()			
 	PATH = [os.path.abspath(p) for p in PATH.split(',')]
 	if not OUTPUT:
 		if is_windows:
@@ -313,18 +314,6 @@ def main():
 	if SKIP: SKIP=SKIP.split(',')
 	assert BALANCE in range(1,10)
 	
-	# don't overwrite files  
-	# if os.path.isdir(OUTPUT):
-	# 	print 'OUTPUT is a folder: %s' % OUTPUT
-	#	 sys.exit()			
-	# if not os.access(os.path.dirname(OUTPUT), os.W_OK):
-	#	 print 'No write access to %s' % os.path.dirname(OUTPUT)
-	#	 sys.exit()
-	# if os.path.exists(OUTPUT):
-	#	 resp = raw_input(red('Overwrite %s ? [y/n]: ' % OUTPUT))
-	#		 if resp is not "y":
-	#	 		sys.exit()
-	
 	# start  
 	print("/*************** stat_walker.py *************************************/")
 	print("Command: %s" % " ".join(sys.argv[:]))
@@ -332,7 +321,6 @@ def main():
 		print("Input:  %s" % p)
 	print("Output: %s" % OUTPUT)
 	print("Balance: %s" % BALANCE)
-	if SORT: 	print("Sort: %s" % SORT)
 	if SKIP:	print("Skip: %s" % SKIP)
 	
 	start = 0
@@ -408,7 +396,7 @@ def main():
 	total_seconds = seconds_pre + seconds_parallel + seconds_post
 
 	print("Pre-process:  \t\t%s sec" % (round(seconds_pre,2)))
-	worker_total  = report_parallel(procs, seconds_parallel)
+	report_parallel(procs, seconds_parallel)
 	print("Post-process: \t\t%s sec [%s files]" % (round(seconds_post,2), post_total))
 	total += post_total
 	# change permission in output
@@ -423,10 +411,6 @@ def main():
 	report += "/*******************************************************************/"
 	print(report)
 
-	# sort results to compare easily
-	if SORT:
-		import stat_sort
-		stat_sort.sort(OUTPUT, has_header=True, inplace=True)
 	print("Done.\n")
 	
 

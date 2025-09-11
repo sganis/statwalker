@@ -1,7 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{BufWriter, Write, BufReader},
+    io::{self, BufWriter, Write, BufRead, BufReader},
     path::{Path, PathBuf},
 };
 use std::sync::{
@@ -32,6 +32,15 @@ struct Args {
     /// Output CSV path (default: "<canonical-root>.csv")
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
+    /// Number of worker threads (default: 2×CPU, capped 32)
+    #[arg(short = 'j', long)]
+    threads: Option<usize>,
+    /// Sort output lines (for easy diff/testing). Uses memory; avoid for huge scans.
+    #[arg(long)]
+    sort: bool,
+    /// Skip any folder whose full path contains this substring
+    #[arg(long, value_name = "SUBSTR")]
+    skip: Option<String>,
     /// Detect file category (text/binary/image/video/etc), 50% decrease in performance
     #[arg(long)]
     category: bool,
@@ -43,7 +52,7 @@ struct Args {
 #[derive(Debug)]
 enum Task {
     Dir(PathBuf),
-    Files { base: PathBuf, names: Vec<OsString> },
+    Files { base: std::sync::Arc<PathBuf>, names: Vec<OsString> },
     Shutdown,
 }
 
@@ -74,6 +83,7 @@ enum Category {
 struct Config {
     want_category: bool,
     want_hash: bool,
+    skip: Option<String>,
 }
 
 struct Row<'a> {
@@ -94,25 +104,49 @@ struct Row<'a> {
 fn main() -> std::io::Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
-    let folder = PathBuf::from(args.root.clone());
-    let fullpath = fs::canonicalize(&folder)?
-        .into_os_string()
-        .into_string()
-        .unwrap();
-    let final_path: PathBuf = match args.output {
-        Some(p) => p,
-        None => {
-            #[cfg(unix)]
-            let name = fullpath.trim_start_matches('/').replace('/', "-");
-            #[cfg(windows)]
-            let name = fullpath.trim_start_matches("\\\\?\\").replace('\\', "-");
-            PathBuf::from(format!("{name}.csv"))
+    // Canonicalize the provided root so relative inputs like "../some/folder" become absolute.
+    // Use the canonical path everywhere (for scanning and for path strings in CSV).
+    let root = fs::canonicalize(&args.root)?;
+    let root = {
+        #[cfg(windows)]
+        {
+            let s = root.display().to_string();
+            // Hide the verbatim UNC prefix in printed/default-name paths if present
+            if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                stripped.to_string()
+            } else {
+                s
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            root.display().to_string()
         }
     };
-    println!("output: {}", &final_path.display());
+
+    let final_path: PathBuf = match args.output {
+        Some(p) => if p.is_absolute() { p } else { std::env::current_dir()?.join(p) },
+        None => {
+            #[cfg(windows)]
+            {
+                let name = root.strip_prefix(r"\\?\").unwrap_or(&root).replace('\\', "-");
+                std::env::current_dir()?.join(format!("{name}.csv"))
+            }
+            #[cfg(not(windows))]
+            {
+                let name = root.trim_start_matches('/').replace('/', "-");
+                std::env::current_dir()?.join(format!("{name}.csv"))
+            }
+        }
+    };
+
+    println!("Input : {}", &root);
+    println!("Output: {}", &final_path.display());
+
 
     // Use more threads for I/O bound work
-    let threads = (num_cpus::get() * 2).max(4).min(32);
+    // let threads = (num_cpus::get() * 2).max(4).min(32);
+    let threads = args.threads.unwrap_or_else(|| (num_cpus::get() * 2).max(4).min(32));
     let out_dir = PathBuf::from(".");
 
     // ---- work queue + inflight counter ----
@@ -121,7 +155,7 @@ fn main() -> std::io::Result<()> {
 
     // seed roots
     inflight.fetch_add(1, Relaxed);
-    tx.send(Task::Dir(PathBuf::from(folder))).expect("enqueue root");
+    tx.send(Task::Dir(PathBuf::from(root))).expect("enqueue root");
 
     // shutdown notifier: when inflight hits 0, broadcast Shutdown
     {
@@ -141,6 +175,7 @@ fn main() -> std::io::Result<()> {
     let cfg = Config { 
         want_category: args.category,
         want_hash: args.hash,
+        skip: args.skip,
     };
 
     // ---- spawn workers (each returns its local Stats) ----
@@ -163,7 +198,7 @@ fn main() -> std::io::Result<()> {
     }
 
     // ---- merge shards and print summary ----
-    merge_shards(&out_dir, &final_path, threads)?;
+    merge_shards(&out_dir, &final_path, threads, args.sort, cfg.want_category, cfg.want_hash)?;
 
     let elapsed = start_time.elapsed();
     let secs = elapsed.as_secs_f64();
@@ -173,6 +208,15 @@ fn main() -> std::io::Result<()> {
     println!("Files/sec.  : {:.2}", (total.files as f64) / secs);
 
     Ok(())
+}
+
+#[inline]
+fn should_skip(path: &Path, skip: Option<&str>) -> bool {
+    if let Some(s) = skip {
+        path.as_os_str().to_string_lossy().contains(s)
+    } else {
+        false
+    }
 }
 
 fn worker(
@@ -199,9 +243,13 @@ fn worker(
             Task::Shutdown => break,
 
             Task::Dir(dir) => {
+                if should_skip(&dir, cfg.skip.as_deref()) {
+                    let _ = inflight.fetch_sub(1, Relaxed);
+                    continue;
+                }
                 // emit one row for the directory itself
                 if let Some(row) = stat_row(&dir, &cfg) {
-                    write_row(&mut buf, row);
+                    write_row(&mut buf, row, &cfg);
                     stats.files += 1;
 
                     if buf.len() >= FLUSH_BYTES {
@@ -210,17 +258,20 @@ fn worker(
                     }
                 }
 
-                let _child_entries = enum_dir(&dir, &tx, &inflight);
-
+                enum_dir(&dir, &tx, &inflight, cfg.skip.as_deref());
                 inflight.fetch_sub(1, Relaxed);
             }
 
             Task::Files { base, names } => {
+                if should_skip(base.as_ref(), cfg.skip.as_deref()) {
+                    inflight.fetch_sub(1, Relaxed);
+                    continue;
+                }
                 // Process files in batch to reduce overhead
                 for name in names {
                     let full = base.join(&name);
                     if let Some(row) = stat_row(&full, &cfg) {
-                        write_row(&mut buf, row);
+                        write_row(&mut buf, row, &cfg);
                         stats.files += 1;
 
                         if buf.len() >= FLUSH_BYTES {
@@ -242,7 +293,7 @@ fn worker(
     stats
 }
 
-fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize) -> u64 {
+fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<&str>) -> u64 {
     let rd = match fs::read_dir(dir) {
         Ok(it) => it,
         Err(_) => return 0,
@@ -250,6 +301,7 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize) -> u64 {
 
     let mut page: Vec<OsString> = Vec::with_capacity(FILE_CHUNK);
     let mut entry_count: u64 = 0;
+    let base_arc = Arc::new(dir.to_path_buf());
 
     for dent in rd {
         let dent = match dent {
@@ -270,6 +322,7 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize) -> u64 {
             .unwrap_or_else(|_| dent.path().is_dir());
 
         if is_dir {
+            if should_skip(&dent.path(), skip) { continue; }
             inflight.fetch_add(1, Relaxed);
             let _ = tx.send(Task::Dir(dent.path()));
         } else {
@@ -277,7 +330,7 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize) -> u64 {
             if page.len() == FILE_CHUNK {
                 inflight.fetch_add(1, Relaxed);
                 let _ = tx.send(Task::Files {
-                    base: dir.to_path_buf(),
+                    base: base_arc.clone(),
                     names: std::mem::take(&mut page),
                 });
             }
@@ -287,7 +340,7 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize) -> u64 {
     if !page.is_empty() {
         inflight.fetch_add(1, Relaxed);
         let _ = tx.send(Task::Files {
-            base: dir.to_path_buf(),
+            base: base_arc,
             names: page,
         });
     }
@@ -365,9 +418,10 @@ fn detect_category(path: &Path) -> Category {
 
 fn stat_row<'a>(path: &'a Path, cfg: &'a Config) -> Option<Row<'a>> {
     let md = fs::symlink_metadata(path).ok()?;
+    let is_file = md.is_file();
     let mut file_hash = None;
 
-    if cfg.want_hash && md.is_file() && md.len() > 0 { // Skip empty files
+    if cfg.want_hash && is_file && md.len() > 0 { // Skip empty files
         file_hash = Some(hash_file(path).unwrap_or_default());
     }
 
@@ -375,7 +429,7 @@ fn stat_row<'a>(path: &'a Path, cfg: &'a Config) -> Option<Row<'a>> {
     {
         Some(Row {
             path,
-            category: if cfg.want_category { Some(detect_category(path)) } else { None },
+            category: if cfg.want_category && is_file { Some(detect_category(path)) } else { None },
             hash: file_hash,
             dev: md.dev(),
             ino: md.ino(),
@@ -392,7 +446,7 @@ fn stat_row<'a>(path: &'a Path, cfg: &'a Config) -> Option<Row<'a>> {
     {
         Some(Row {
             path,
-            category: if cfg.want_category { Some(detect_category(path)) } else { None },
+            category: if cfg.want_category && is_file { Some(detect_category(path)) } else { None },
             hash: file_hash,
             dev: 0,
             ino: 0,
@@ -414,7 +468,7 @@ thread_local! {
     static I64_BUFFER: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new());
 }
 
-fn write_row(buf: &mut Vec<u8>, r: Row<'_>) {
+fn write_row(buf: &mut Vec<u8>, r: Row<'_>, cfg: &Config) {
     // Reserve space to reduce reallocations
     buf.reserve(256);
     
@@ -447,27 +501,30 @@ fn write_row(buf: &mut Vec<u8>, r: Row<'_>) {
 
     // PATH (quote only if needed)
     csv_push_path_smart_quoted(buf, r.path);
-    push_comma(buf);
-    
-    // CAT
-    if let Some(cat) = r.category {
-        let s = match cat {
-            Category::Jpeg|Category::Png|Category::Gif|Category::Bmp|Category::Tiff|Category::Webp => "image",
-            Category::Zip|Category::Gzip|Category::Bzip2|Category::Xz|Category::SevenZip|Category::Rar|Category::Tar => "zip",
-            Category::Pdf => "pdf",
-            Category::Mp3 => "audio",
-            Category::Mp4|Category::Mkv|Category::Ogg|Category::Mpeg => "video",
-            Category::Elf|Category::PE|Category::Binary => "binary",
-            Category::Text => "text",
-            Category::Unknown => "",
-        };
-        buf.extend_from_slice(s.as_bytes());
-    }
-    push_comma(buf);
 
-    // HASH
-    if let Some(h) = r.hash {
-        buf.extend_from_slice(h.as_bytes());
+    if cfg.want_category {
+        push_comma(buf);
+        if let Some(cat) = r.category {
+            let s = match cat {
+                Category::Jpeg|Category::Png|Category::Gif|Category::Bmp|Category::Tiff|Category::Webp => "image",
+                Category::Zip|Category::Gzip|Category::Bzip2|Category::Xz|Category::SevenZip|Category::Rar|Category::Tar => "zip",
+                Category::Pdf => "pdf",
+                Category::Mp3 => "audio",
+                Category::Mp4|Category::Mkv|Category::Ogg|Category::Mpeg => "video",
+                Category::Elf|Category::PE|Category::Binary => "binary",
+                Category::Text => "text",
+                Category::Unknown => "",
+            };
+            buf.extend_from_slice(s.as_bytes());
+        }
+    }    
+
+    if cfg.want_hash {
+        push_comma(buf);
+        if let Some(h) = r.hash {
+            buf.extend_from_slice(h.as_bytes());
+        }
+    
     }
     buf.push(b'\n');
 }
@@ -549,29 +606,65 @@ fn csv_push_str_smart_quoted(buf: &mut Vec<u8>, s: &str) {
     }
 }
 
-fn merge_shards(out_dir: &Path, final_path: &Path, threads: usize) -> std::io::Result<()> {
+fn merge_shards(out_dir: &Path, 
+    final_path: &Path, 
+    threads: usize, 
+    sort_lines: bool, 
+    include_cat: bool, 
+    include_hash: bool
+) -> std::io::Result<()> {
     let mut out = BufWriter::with_capacity(
         16 * 1024 * 1024, // Larger output buffer
         File::create(&final_path)?
     );
-    out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH,CAT,HASH\n")?;
+    // build the header dynamically (replace the fixed write_all line)
+    let mut header = b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH".to_vec();
+    if include_cat  { header.extend_from_slice(b",CAT"); }
+    if include_hash { header.extend_from_slice(b",HASH"); }
+    header.push(b'\n');
+    out.write_all(&header)?;
 
-    let mut buf = Vec::with_capacity(READ_BUF_SIZE);
+    if !sort_lines {
+        // Stream shards directly to output (low memory)
+        for tid in 0..threads {
+            let shard = out_dir.join(format!("shard_{tid}.csv.tmp"));
+            if !shard.exists() {
+                continue;
+            }
+            let f = File::open(&shard)?;
+            let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
+            io::copy(&mut reader, &mut out)?;
+            let _ = fs::remove_file(shard);
+        }
+        out.flush()?;
+        return Ok(());
+    }
+
+    // Sorting requested: load all lines into memory, sort, and write.
+    // Note: suitable for testing/small runs; avoid for huge datasets.
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+
     for tid in 0..threads {
         let shard = out_dir.join(format!("shard_{tid}.csv.tmp"));
-        if !shard.exists() {
-            continue;
-        }
-        
-        // Use BufReader for better I/O performance
+        if !shard.exists() { continue; }
+
         let f = File::open(&shard)?;
         let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
-        
-        buf.clear();
-        reader.read_to_end(&mut buf)?;
-        out.write_all(&buf)?;
-        
+        let mut line = Vec::<u8>::with_capacity(256);
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if n == 0 { break; }
+            // Keep newline to preserve line boundaries
+            lines.push(line.clone());
+        }
         let _ = fs::remove_file(shard);
+    }
+
+    lines.sort_unstable(); // lexicographic byte-wise
+
+    for l in lines {
+        out.write_all(&l)?;
     }
     out.flush()?;
     Ok(())
