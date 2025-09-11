@@ -37,7 +37,7 @@ struct Args {
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
     /// Number of worker threads (default: 2×CPU, capped 32)
-    #[arg(short = 'j', long)]
+    #[arg(short = 't', long)]
     threads: Option<usize>,
     /// Sort output lines (for easy diff/testing). Uses memory; avoid for huge scans.
     #[arg(long)]
@@ -135,13 +135,14 @@ fn main() -> std::io::Result<()> {
         }
     };
 
-    println!("Input : {}", &root_str);
-    println!("Output: {}", &final_path.display());
+    println!("Input        : {}", &root_str);
+    println!("Output       : {}", &final_path.display());
 
 
     // Use more threads for I/O bound work
-    // let threads = (num_cpus::get() * 2).max(4).min(32);
-    let threads = args.threads.unwrap_or_else(|| (num_cpus::get() * 2).max(4).min(32));
+    let threads = args.threads.unwrap_or_else(|| (num_cpus::get()).max(4).min(32));
+    println!("Threads      : {}", threads);
+
     let out_dir = PathBuf::from(".");
 
     // ---- work queue + inflight counter ----
@@ -199,10 +200,10 @@ fn main() -> std::io::Result<()> {
     let elapsed = start_time.elapsed();
     let secs = elapsed.as_secs_f64();
 
-    println!("Total files : {}", total.files);
-    println!("Failed files: {}", total.errors);  // Add this line
-    println!("Elapsed time: {:.3} seconds", secs);
-    println!("Files/sec.  : {:.2}", (total.files as f64) / secs);
+    println!("Total files  : {}", total.files);
+    println!("Failed files : {}", total.errors);  
+    println!("Elapsed time : {:.2} seconds", secs);
+    println!("Files/sec.   : {:.2}", (total.files as f64) / secs);
 
     Ok(())
 }
