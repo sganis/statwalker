@@ -1,6 +1,12 @@
 import { State, API_URL } from "./store.svelte";
 import { getCache, setCache } from './cache.js';
 
+// NEW: accept optional age filter (0|1|2|'all') and return the new folders→users→ages shape
+type AgeMini = { count: number; size: number; disk: number; mtime: number };
+// Accept optional age filter (0 | 1 | 2 | 'all') and pass it through.
+type ScannedFile = { path: string; size: number; modified: string; owner: string };
+export type RawFolder = { path: string; users: Record<string, Record<'0'|'1'|'2', AgeMini>> };
+
 
 class Api {
   private baseUrl = `${API_URL}/`;
@@ -65,14 +71,29 @@ class Api {
   async getUsers(): Promise<string[] | null> {
     return await this.request<string[]>('users', "GET", undefined, true);
   }
-  async getFolders(path: string, users: string[]): Promise<string[] | null> {
-    let u = users.join(',')
-    return await this.request<string[]>(`folders?path=${path}&users=${u}`, "GET", undefined, true);
+
+  async getFolders(path: string, users: string[], age?: 0 | 1 | 2 | 'all'): Promise<RawFolder[] | null> {
+    const userParam = users.join(',');
+    const ageParam = age !== undefined && age !== 'all' ? `&age=${age}` : '';
+    const url = `folders?path=${encodeURIComponent(path)}&users=${encodeURIComponent(userParam)}${ageParam}`;
+    return await this.request<RawFolder[]>(url, "GET", undefined, true);
   }
-  async getFiles(path: string, users: string[]): Promise<string[] | null> {
-    let u = users.join(',')
-    return await this.request<string[]>(`files?path=${path}&users=${u}`, "GET", undefined, true);
+
+  async getFiles(path: string, users: string[], age?: 0 | 1 | 2 | 'all'): Promise<ScannedFile[] | null> {
+    const u = users.join(',');
+    const ageParam = age !== undefined && age !== 'all' ? `&age=${age}` : '';
+    const url = `files?path=${encodeURIComponent(path)}&users=${encodeURIComponent(u)}${ageParam}`;
+    return await this.request<ScannedFile[]>(url, "GET", undefined, true);
   }
+
+  // async getFolders(path: string, users: string[]): Promise<string[] | null> {
+  //   let u = users.join(',')
+  //   return await this.request<string[]>(`folders?path=${path}&users=${u}`, "GET", undefined, true);
+  // }
+  // async getFiles(path: string, users: string[]): Promise<string[] | null> {
+  //   let u = users.join(',')
+  //   return await this.request<string[]>(`files?path=${path}&users=${u}`, "GET", undefined, true);
+  // }
 
   // async createItem(Item: Partial<Item>): Promise<Item | null> {
   //   return await this.request<Item>("Items", "POST", Item);

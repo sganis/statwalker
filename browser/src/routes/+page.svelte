@@ -4,6 +4,7 @@
   import { api } from "../js/api.svelte";
   import { API_URL } from "../js/store.svelte";
   import Svelecte, { addRenderer } from 'svelecte';
+  import { formatDistanceToNow } from 'date-fns';
 
   //#region colors
   function colorRenderer(item, _isSelection, _inputValue) {
@@ -25,7 +26,7 @@
   }
   addRenderer('color', colorRenderer);
 
-    // Seed colors for known users (optional)
+  // Seed colors for known users (optional)
   function seedUserColors(usernames: string[]) {
     usernames.forEach((uname, index) => {
       if (!userColors.has(uname)) {
@@ -47,11 +48,23 @@
     userColors.set(uname, color);
     return color;
   }
-
   //#endregion
 
-  // ---------- Types from the NEW backend shape (bytes) ----------
-  // Per-user stats embedded in a folder row (sizes in BYTES now)
+  // ---------- NEW backend shape (folders → users → ages) ----------
+  type AgeMini = {
+    count: number;
+    size: number;  // bytes
+    disk: number;  // bytes
+    mtime: number; // unix seconds
+  };
+
+  type RawFolder = {
+    path: string;
+    // username -> "0"/"1"/"2" -> AgeMini
+    users: Record<string, Record<string, AgeMini>>;
+  };
+
+  // ---------- Types used by existing UI (we'll derive these) ----------
   type UserStatsJson = {
     username: string;
     count: number;
@@ -59,14 +72,13 @@
     disk: number; // bytes
   };
 
-  // Folder row from /api/folders (index)
   type FileItem = {
     path: string;
     total_count: number;
     total_size: number; // bytes
     total_disk: number; // bytes
     modified: string;   // ISO date string (e.g., "2025-09-09")
-    users: Record<string, UserStatsJson>; // keyed by username
+    users: Record<string, UserStatsJson>; // keyed by username (aggregated across ages)
   };
 
   // Scanned file from /api/files
@@ -77,9 +89,80 @@
     owner: string;     // username
   };
 
-  //#region state
-//  let path = $state("/");
+  // --- helper to turn unix seconds into YYYY-MM-DD for display only ---
+  function unixToISO(secs: number): string {
+    if (!secs || secs <= 0) return "";
+    try {
+      return new Date(secs * 1000).toISOString().slice(0, 10);
+    } catch {
+      return "";
+    }
+  }
 
+  // ===== Age Filter =====
+  type AgeFilter = 'all' | 0 | 1 | 2;
+  let ageFilter = $state<AgeFilter>('all');
+  let ageOpen = $state(false);
+  const AGE_LABELS: Record<AgeFilter, string> = {
+    all: "All Ages",
+    0: "Recents (<2m)",
+    1: "Not too old (<2y)",
+    2: "Old files (2y+)",
+  };
+  function displayAgeLabel(a: AgeFilter) { return AGE_LABELS[a]; }
+  function chooseAge(a: AgeFilter) {
+    ageFilter = a;
+    ageOpen = false;
+    refresh();
+  }
+
+  // ---------- derive legacy FileItem from RawFolder (apply ageFilter) ----------
+  function transformFolders(raw: RawFolder[], filter: AgeFilter): FileItem[] {
+    // Which ages should we include?
+    const ages: string[] =
+      filter === 'all' ? ["0","1","2"] : [String(filter)];
+
+    return (raw ?? []).map((rf) => {
+      const usersAgg: Record<string, UserStatsJson> = {};
+      let total_count = 0;
+      let total_size  = 0;
+      let total_disk  = 0;
+      let max_mtime   = 0;
+
+      for (const [uname, agesMap] of Object.entries(rf.users ?? {})) {
+        let u_count = 0, u_size = 0, u_disk = 0, u_mtime = 0;
+
+        for (const a of ages) {
+          const s = agesMap?.[a];
+          if (!s) continue;
+          u_count += Number(s.count ?? 0);
+          u_size  += Number(s.size ?? 0);
+          u_disk  += Number(s.disk ?? 0);
+          if (Number(s.mtime ?? 0) > u_mtime) u_mtime = Number(s.mtime);
+        }
+
+        if (u_count || u_size || u_disk) {
+          usersAgg[uname] = { username: uname, count: u_count, size: u_size, disk: u_disk };
+          total_count += u_count;
+          total_size  += u_size;
+          total_disk  += u_disk;
+          if (u_mtime > max_mtime) max_mtime = u_mtime;
+        }
+      }
+
+      return {
+        path: rf.path,
+        total_count,
+        total_size,
+        total_disk,
+        // modified: unixToISO(max_mtime),
+        modified: formatDistanceToNow(new Date(max_mtime * 1000), { addSuffix: true }),
+        users: usersAgg,
+      };
+    }).filter(f => Object.keys(f.users).length > 0); // hide folders with no data after filter
+  }
+
+  //#region state
   let folders = $state<FileItem[]>([]);
   let files = $state<ScannedFile[]>([]);
   let loading = $state(false);
@@ -107,14 +190,13 @@
   let path = $state('/');
   let fullPath = $state('');
   let isEditing = $state(false);
-
   //#endregion
 
   // Function to set path programmatically (use this instead of directly setting path)
   function setPath(newPath) {
     const displayedPath = displayPath(newPath);
     fullPath = displayedPath;
-    
+
     if (!isEditing) {
       path = truncatePathFromStart(displayedPath);
     } else {
@@ -122,51 +204,41 @@
     }
   }
 
-  
   // Function to truncate path from the beginning
   function truncatePathFromStart(inputPath, maxLength = 50) {
     if (!inputPath || inputPath.length <= maxLength) return inputPath;
-    
+
     const parts = inputPath.split('/');
     let result = parts[parts.length - 1]; // Start with filename
-    
-    // Add directories from the end until we approach maxLength  
+
+    // Add directories from the end until we approach maxLength
     for (let i = parts.length - 2; i >= 0; i--) {
       const potential = parts[i] + '/' + result;
       if (('...' + potential).length > maxLength) break;
       result = potential;
     }
-    
+
     return '...' + result;
   }
 
-
-function onPathFocus() {
-  isEditing = true;
-  // Show full path when focused
-  if (fullPath) {
-    path = fullPath;
+  function onPathFocus() {
+    isEditing = true;
+    if (fullPath) {
+      path = fullPath;
+    }
   }
-}
 
-function onPathBlur() {
-  isEditing = false;
-  // Store the full path if it doesn't start with ...
-  if (path && !path.startsWith('...')) {
-    fullPath = path;
+  function onPathBlur() {
+    isEditing = false;
+    if (path && !path.startsWith('...')) {
+      fullPath = path;
+    }
+    if (fullPath) {
+      path = truncatePathFromStart(fullPath);
+    }
   }
-  // Show truncated version
-  if (fullPath) {
-    path = truncatePathFromStart(fullPath);
-  }
-  // Your existing focus logic here
-}
-
- 
-
 
   // ---------- Helpers ----------
-
   function displayPath(p: string): string {
     if (!p) return "/";
     let s = p.replace(/\\/g, "/");
@@ -187,8 +259,8 @@ function onPathBlur() {
 
   // === Tooltip clamping additions ===
   let bubbleEl: HTMLDivElement | null = $state(null);
-  const MARGIN = 8;       // min distance from viewport edges
-  const ARROW_GAP = 10;   // matches translateY calc(-100% - 10px)
+  const MARGIN = 8;
+  const ARROW_GAP = 10;
 
   function clampToViewport(rawX: number, rawY: number) {
     const ww = window.innerWidth;
@@ -199,12 +271,11 @@ function onPathBlur() {
 
     const halfW = w / 2;
 
-    // Because we center horizontally and position ABOVE the pointer
     const minX = MARGIN + halfW;
     const maxX = ww - MARGIN - halfW;
 
-    const minY = MARGIN + h + ARROW_GAP; // enough space to render above the pointer
-    const maxY = wh - MARGIN;            // don't let the anchor go below bottom
+    const minY = MARGIN + h + ARROW_GAP;
+    const maxY = wh - MARGIN;
 
     return {
       x: Math.min(maxX, Math.max(minX, rawX)),
@@ -238,7 +309,6 @@ function onPathBlur() {
   };
 
   // ---------- Sorting (Folders) ----------
-
   const sortedfolders = $derived.by(() => {
     const key = sortBy;
     const arr = folders ? [...folders] : [];
@@ -292,12 +362,16 @@ function onPathBlur() {
         return 'Disk Usage'
       case "count":
         return 'Total Files'
+      case "size":
+        return 'Total Size'
     }
   }
   const metricValue = (file: FileItem) => {
     switch (sortBy) {
       case "disk":
         return toNum(file?.total_disk);
+      case "size":
+        return toNum(file?.total_size);
       case "count":
         return toNum(file?.total_count);
     }
@@ -308,6 +382,8 @@ function onPathBlur() {
     switch (sortBy) {
       case "disk":
         return formatBytes(toNum(file?.total_disk));
+      case "size":
+        return formatBytes(toNum(file?.total_size));
       case "count":
         return toNum(file?.total_count).toLocaleString();
     }
@@ -318,13 +394,15 @@ function onPathBlur() {
     switch (sortBy) {
       case "disk":
         return formatBytes(toNum(userData?.disk));
+      case "size":
+        return formatBytes(toNum(userData?.size));
       case "count":
         return toNum(userData?.count).toLocaleString();
     }
   }
 
   const userMetricFor = (ud: UserStatsJson) =>
-    sortBy === "disk" ? Number(ud.disk) : Number(ud.count);
+    sortBy === "disk" ? Number(ud.disk) : sortBy === "size" ? Number(ud.size) : Number(ud.count);
 
   function sortedUserEntries(file: FileItem) {
     return Object.entries(file?.users ?? {}).sort(([, a], [, b]) => userMetricFor(a) - userMetricFor(b));
@@ -340,8 +418,8 @@ function onPathBlur() {
 
     for (const f of foldersArr ?? []) {
       total_count += toNum(f?.total_count);
-      total_size += toNum(f?.total_size);
-      total_disk += toNum(f?.total_disk);
+      total_size  += toNum(f?.total_size);
+      total_disk  += toNum(f?.total_disk);
       if (typeof f?.modified === "string" && f.modified) {
         if (!modified || f.modified > modified) modified = f.modified;
       }
@@ -359,8 +437,8 @@ function onPathBlur() {
         aggUsers[key] = {
           username: prev.username,
           count: prev.count + toNum((data as any)?.count),
-          size: prev.size + toNum((data as any)?.size),
-          disk: prev.disk + toNum((data as any)?.disk),
+          size:  prev.size  + toNum((data as any)?.size),
+          disk:  prev.disk  + toNum((data as any)?.disk),
         };
       }
     }
@@ -381,6 +459,7 @@ function onPathBlur() {
   function fileMetricValue(f: ScannedFile) {
     switch (sortBy) {
       case "disk":
+      case "size":
         return toNum(f.size); // bytes
       case "count":
         return 1;
@@ -402,6 +481,7 @@ function onPathBlur() {
   function rightValueFile(f: ScannedFile) {
     switch (sortBy) {
       case "disk":
+      case "size":
         return formatBytes(toNum(f.size)); // bytes
       case "count":
         return "1";
@@ -431,16 +511,19 @@ function onPathBlur() {
   const fetchFolders = createDoItAgain(async (_p: string) => {
     loading = true;
     try {
-      const userFilter: string[] = selectedUser ==='All Users'? []: [selectedUser];
-      folders = await api.getFolders(_p, userFilter);
-      files = await api.getFiles(_p, userFilter); // files now include owner + ISO modified
-      // Seed colors for the known users list, but bars use colorForUsername() anyway
-      if (users && users.length > 0) 
-        seedUserColors(users);
+      const userFilter: string[] = selectedUser === 'All Users' ? [] : [selectedUser];
+
+      // Pass age filter to both endpoints
+      const raw: RawFolder[] = await api.getFolders(_p, userFilter, ageFilter);
+      folders = transformFolders(raw, ageFilter);
+
+      files = await api.getFiles(_p, userFilter, ageFilter); // ← added ageFilter here
+      if (users && users.length > 0) seedUserColors(users);
     } finally {
       loading = false;
     }
   });
+
 
   function pushHistory(p: string) {
     if (history[histIdx] === p) return;
@@ -462,21 +545,20 @@ function onPathBlur() {
     fetchFolders(fullPath || path);
   }
   function goUp() {
-    const parent = getParent(fullPath || path);  // ← Use fullPath
+    const parent = getParent(fullPath || path);
     navigateTo(parent);
   }
   function goBack() {
     if (histIdx > 0) {
       histIdx -= 1;
-      setPath(history[histIdx]);  // ← Use setPath to handle truncation properly
+      setPath(history[histIdx]);
       fetchFolders(history[histIdx]);
     }
   }
-
   function goForward() {
     if (histIdx < history.length - 1) {
       histIdx += 1;
-      setPath(history[histIdx]);  // ← Use setPath to handle truncation properly
+      setPath(history[histIdx]);
       fetchFolders(history[histIdx]);
     }
   }
@@ -497,14 +579,12 @@ function onPathBlur() {
     users.splice(0,0,"All Users")
     selectedUser = 'All Users'
     seedUserColors(users);
-    
+
     // Initialize the path truncation
     fullPath = path;
     path = truncatePathFromStart(path);
 
     await refresh();
-
-  
   });
 </script>
 
@@ -549,6 +629,35 @@ function onPathBlur() {
           </button>
           <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseSort("count")}>
             By Total Files
+          </button>
+        </div>
+      {/if}
+    </div>
+
+    <!-- NEW: Age filter dropdown -->
+    <div class="relative">
+      <button class="btn w-48" onclick={() => (ageOpen = !ageOpen)}>
+        <div class="flex items-center gap-2">
+          <span class="material-symbols-outlined">hourglass</span>
+          {displayAgeLabel(ageFilter)}
+        </div>
+      </button>
+      {#if ageOpen}
+        <div
+          class="flex flex-col divide-y divide-gray-500 absolute w-48 rounded border
+           border-gray-500 bg-gray-800 shadow-lg z-20 overflow-hidden mt-1"
+        >
+          <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge('all')}>
+            All Ages
+          </button>
+          <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge(0)}>
+            Recents (&lt;2m)
+          </button>
+          <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge(1)}>
+            Not too old (&lt;2y)
+          </button>
+          <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge(2)}>
+            Old files (2y+)
           </button>
         </div>
       {/if}
@@ -599,8 +708,9 @@ function onPathBlur() {
         <div class="flex items-center justify-end">
           <p class="text-xs">
             {pathTotals.total_count} Files 
-            • Last Modified: {pathTotals.modified || "—"} 
-            • {formatBytes(pathTotals.total_size)} ({formatBytes(pathTotals.total_disk)} on disk)
+            • Changed: {pathTotals.modified || "—"} 
+            • {formatBytes(pathTotals.total_size)}
+             ({formatBytes(pathTotals.total_disk)} on disk)
           </p>
         </div>
       </div>
@@ -657,8 +767,9 @@ function onPathBlur() {
           <!-- Stacked bar background -->
           <div class="absolute left-0 top-0 bottom-0 flex z-0" style="width: {pct(metricValue(file))}%">
             {#each sortedUserEntries(file) as [uname, userData]}
-              {@const userMetric = sortBy === "disk" ? userData.disk : userData.count}
-              {@const totalMetric = sortBy === "disk" ? file.total_disk : file.total_count}
+              {@const userMetric = sortBy === "disk" ? userData.disk : sortBy === "size" ? userData.size : userData.count}
+              {@const totalMetric =
+                sortBy === "disk" ? file.total_disk : sortBy === "size" ? file.total_size : file.total_count}
               {@const userPercent = totalMetric > 0 ? (userMetric / totalMetric) * 100 : 0}
               <div
                 class="h-full transition-all duration-300 min-w-[0.5px] hover:opacity-90"
@@ -681,7 +792,7 @@ function onPathBlur() {
             <div class="flex justify-end">
               <p class="text-xs text-gray-300">
                 {file.total_count} Files 
-                • Last Modified: {file.modified || "—"} 
+                • Changed: {file.modified || "—"} 
                 • {formatBytes(file.total_size)} 
                   ({formatBytes(file.total_disk)} on disk)          
               </p>
@@ -705,7 +816,7 @@ function onPathBlur() {
               </div>
               <div class="relative z-10 flex justify-between text-gray-300">
                 <div class="">{f.owner}</div>
-                <div class="">Last Modified: {f.modified}</div>
+                <div class="">Changed: {f.modified}</div>
               </div>
             </div>
           </div>
