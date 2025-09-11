@@ -3,6 +3,7 @@ use std::{
     fs::{self, File},
     io::{self, BufWriter, Write, BufRead, BufReader},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering::Relaxed},
@@ -17,6 +18,11 @@ use std::os::unix::fs::MetadataExt;
 use itoa::Buffer;
 use clap::{Parser, ColorChoice};
 use blake3::Hasher;
+
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+
+
 
 // Increased chunk sizes for better batching
 const FILE_CHUNK: usize = 8192;      // entries per work unit (doubled)
@@ -101,46 +107,36 @@ struct Row<'a> {
     mtime: i64,
 }
 
+
 fn main() -> std::io::Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
     // Canonicalize the provided root so relative inputs like "../some/folder" become absolute.
     // Use the canonical path everywhere (for scanning and for path strings in CSV).
     let root = fs::canonicalize(&args.root)?;
-    let root = {
-        #[cfg(windows)]
-        {
-            let s = root.display().to_string();
-            // Hide the verbatim UNC prefix in printed/default-name paths if present
-            if let Some(stripped) = s.strip_prefix(r"\\?\") {
-                stripped.to_string()
-            } else {
-                s
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            root.display().to_string()
-        }
-    };
+    let root_normalized = strip_verbatim_prefix(&root);
+    let root_str = root_normalized.display().to_string();
 
     let final_path: PathBuf = match args.output {
         Some(p) => if p.is_absolute() { p } else { std::env::current_dir()?.join(p) },
         None => {
             #[cfg(windows)]
             {
-                let name = root.strip_prefix(r"\\?\").unwrap_or(&root).replace('\\', "-");
+                let normalized = strip_verbatim_prefix(&root);
+                let name = normalized.to_string_lossy().replace('\\', "-");
+                // Remove drive colon if present (C: -> C)
+                let name = name.replace(':', "");
                 std::env::current_dir()?.join(format!("{name}.csv"))
             }
             #[cfg(not(windows))]
             {
-                let name = root.trim_start_matches('/').replace('/', "-");
+                let name = root_normalized.to_string_lossy().trim_start_matches('/').replace('/', "-");
                 std::env::current_dir()?.join(format!("{name}.csv"))
             }
         }
     };
 
-    println!("Input : {}", &root);
+    println!("Input : {}", &root_str);
     println!("Output: {}", &final_path.display());
 
 
@@ -209,6 +205,32 @@ fn main() -> std::io::Result<()> {
 
     Ok(())
 }
+
+
+#[cfg(windows)]
+fn strip_verbatim_prefix(p: &std::path::Path) -> std::path::PathBuf {
+    // Best-effort: only if the path is UTF-8. For non-UTF8, just return as-is.
+    let s = match p.to_str() {
+        Some(s) => s,
+        None => return p.to_path_buf(),
+    };
+
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        // \\?\UNC\server\share\foo -> \\server\share\foo
+        PathBuf::from(format!(r"\\{}", rest))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        // \\?\C:\foo -> C:\foo
+        PathBuf::from(rest)
+    } else {
+        p.to_path_buf()
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(p: &std::path::Path) -> std::path::PathBuf {
+    p.to_path_buf()
+}
+
 
 #[inline]
 fn should_skip(path: &Path, skip: Option<&str>) -> bool {
@@ -416,6 +438,7 @@ fn detect_category(path: &Path) -> Category {
     if has_null || printable < sample_size / 2 { Binary } else { Text }
 }
 
+
 fn stat_row<'a>(path: &'a Path, cfg: &'a Config) -> Option<Row<'a>> {
     let md = fs::symlink_metadata(path).ok()?;
     let is_file = md.is_file();
@@ -427,6 +450,8 @@ fn stat_row<'a>(path: &'a Path, cfg: &'a Config) -> Option<Row<'a>> {
 
     #[cfg(unix)]
     {
+        use std::os::unix::fs::MetadataExt;
+        
         Some(Row {
             path,
             category: if cfg.want_category && is_file { Some(detect_category(path)) } else { None },
@@ -442,7 +467,73 @@ fn stat_row<'a>(path: &'a Path, cfg: &'a Config) -> Option<Row<'a>> {
             mtime: md.mtime(),
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Convert SystemTime to Unix timestamp
+        let to_unix_timestamp = |time: SystemTime| -> i64 {
+            time.duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        };
+
+        // Get Windows-specific metadata
+        let atime = md.accessed().ok()
+            .map(to_unix_timestamp)
+            .unwrap_or(0);
+        
+        let mtime = md.modified().ok()
+            .map(to_unix_timestamp)
+            .unwrap_or(0);
+
+        // Calculate blocks (approximate, based on 512-byte blocks)
+        let blocks = (md.len() + 511) / 512;
+
+        // Simple mode calculation for Windows
+        let file_attributes = md.file_attributes();
+        const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+        
+        let mut mode = if is_file { 0o100000 } else { 0o040000 }; // S_IFREG or S_IFDIR
+        
+        // Owner permissions (always readable)
+        mode |= 0o400; // Owner read
+        
+        // Check if file is read-only
+        if (file_attributes & FILE_ATTRIBUTE_READONLY) == 0 {
+            mode |= 0o200; // Owner write
+        }
+        
+        // Executable bit for files
+        if is_file {
+            if let Some(ext) = path.extension() {
+                match ext.to_str().unwrap_or("").to_lowercase().as_str() {
+                    "exe" | "bat" | "cmd" | "com" | "scr" | "ps1" | "vbs" => mode |= 0o100,
+                    _ => {}
+                }
+            }
+        } else {
+            mode |= 0o100; // Directories are executable
+        }
+        
+        // Copy owner permissions to group and other
+        let owner_perms = mode & 0o700;
+        mode |= (owner_perms >> 3) | (owner_perms >> 6);
+
+        Some(Row {
+            path,
+            category: if cfg.want_category && is_file { Some(detect_category(path)) } else { None },
+            hash: file_hash,
+            dev: 0, // Windows doesn't have a direct equivalent
+            ino: 0, // Windows file index would require additional API calls
+            mode,
+            uid: 0, // Windows uses SIDs instead of UIDs
+            gid: 0, // Windows uses SIDs instead of GIDs
+            size: md.len(),
+            blocks,
+            atime,
+            mtime,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Some(Row {
             path,
@@ -460,6 +551,7 @@ fn stat_row<'a>(path: &'a Path, cfg: &'a Config) -> Option<Row<'a>> {
         })
     }
 }
+
 
 // Pre-allocate formatters to avoid repeated allocation
 thread_local! {
@@ -574,26 +666,39 @@ fn csv_push_bytes_smart_quoted(buf: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn csv_push_str_smart_quoted(buf: &mut Vec<u8>, s: &str) {
+    // For paths, normalize them first
+    let normalized = if s.starts_with(r"\\?\") {
+        if s.starts_with(r"\\?\UNC\") {
+            format!(r"\\{}", &s[8..])
+        } else {
+            s[4..].to_string()
+        }
+    } else {
+        s.to_string()
+    };
+    
+    let display_str = normalized.as_str();
+    
     // Check if we need quoting at all
-    let needs_quoting = s.chars().any(|c| c == '"' || c == ',' || c == '\n' || c == '\r');
+    let needs_quoting = display_str.chars().any(|c| c == '"' || c == ',' || c == '\n' || c == '\r');
     
     if !needs_quoting {
         // Fast path - no quoting needed at all
-        buf.extend_from_slice(s.as_bytes());
+        buf.extend_from_slice(display_str.as_bytes());
     } else {
         // Need quoting - check if we also need escaping
         buf.push(b'"');
-        if !s.contains('"') {
+        if !display_str.contains('"') {
             // Quotes needed but no escaping required
-            buf.extend_from_slice(s.as_bytes());
+            buf.extend_from_slice(display_str.as_bytes());
         } else {
             // Need both quoting and escaping
-            let quote_count = s.matches('"').count();
-            buf.reserve(s.len() + quote_count);
+            let quote_count = display_str.matches('"').count();
+            buf.reserve(display_str.len() + quote_count);
             
-            for b in s.bytes() {
+            for b in display_str.bytes() {
                 if b == b'"' {
                     buf.push(b'"');
                     buf.push(b'"');
@@ -605,6 +710,7 @@ fn csv_push_str_smart_quoted(buf: &mut Vec<u8>, s: &str) {
         buf.push(b'"');
     }
 }
+
 
 fn merge_shards(out_dir: &Path, 
     final_path: &Path, 
