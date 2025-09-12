@@ -54,8 +54,8 @@ fn main() -> Result<()> {
 
     // Caches
     let mut time_cache: HashMap<i64, String> = HashMap::new(); // TIMES
-    let mut user_cache: HashMap<i64, String> = HashMap::new(); // USERS
-    let mut group_cache: HashMap<i64, String> = HashMap::new(); // GROUPS
+    let mut user_cache: HashMap<u32, String> = HashMap::new(); // USERS
+    let mut group_cache: HashMap<u32, String> = HashMap::new(); // GROUPS
     let mut type_cache: HashMap<u32, String> = HashMap::new(); // TYPES
     let mut perm_cache: HashMap<u32, String> = HashMap::new(); // PERMS
 
@@ -67,13 +67,13 @@ fn main() -> Result<()> {
 
         // IN: b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH"
         let inode_b = r.get(0).unwrap_or(b"");
-        let atime   = parse_i64_bytes(r.get(1), "ATIME", line_no)?;
-        let mtime   = parse_i64_bytes(r.get(2), "MTIME", line_no)?;
-        let uid     = parse_i64_bytes(r.get(3), "UID", line_no)?;
-        let gid     = parse_i64_bytes(r.get(4), "GID", line_no)?;
-        let mode    = parse_u32_bytes(r.get(5), "MODE", line_no)?;
-        let size  = r.get(6).unwrap_or(b"0");
-        let disk  = r.get(7).unwrap_or(b"0");
+        let atime   = parse_i64_bytes(r.get(1));
+        let mtime   = parse_i64_bytes(r.get(2));
+        let uid     = parse_u32_bytes(r.get(3));
+        let gid     = parse_u32_bytes(r.get(4));
+        let mode    = parse_u32_bytes(r.get(5));
+        let size    = r.get(6).unwrap_or(b"0");
+        let disk    = r.get(7).unwrap_or(b"0");
         let path_b  = r.get(8).unwrap_or(b""); // raw bytes (may be non-UTF-8)
 
         // Humanized fields (Strings)
@@ -110,13 +110,23 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_i64_bytes(b: Option<&[u8]>, field: &str, line: usize) -> Result<i64> {
-    let s = std::str::from_utf8(b.unwrap_or(b"0")).unwrap_or("0").trim();
-    s.parse::<i64>().with_context(|| format!("parsing {}='{}' at line {}", field, s, line))
+#[inline]
+fn parse_i64_bytes(b: Option<&[u8]>) -> i64 {
+    let s = trim_ascii(b.unwrap_or(b"0"));
+    atoi::atoi::<i64>(s).unwrap_or(0)
 }
-fn parse_u32_bytes(b: Option<&[u8]>, field: &str, line: usize) -> Result<u32> {
-    let s = std::str::from_utf8(b.unwrap_or(b"0")).unwrap_or("0").trim();
-    s.parse::<u32>().with_context(|| format!("parsing {}='{}' at line {}", field, s, line))
+
+#[inline]
+fn parse_u32_bytes(b: Option<&[u8]>) -> u32 {
+    let s = trim_ascii(b.unwrap_or(b"0"));
+    atoi::atoi::<u32>(s).unwrap_or(0)
+}
+
+#[inline]
+fn trim_ascii(mut s: &[u8]) -> &[u8] {
+    while !s.is_empty() && s[0].is_ascii_whitespace() { s = &s[1..]; }
+    while !s.is_empty() && s[s.len() - 1].is_ascii_whitespace() { s = &s[..s.len() - 1]; }
+    s
 }
 
 
@@ -143,7 +153,7 @@ fn _bytes_to_gb(b: u128) -> String {
     format!("{:.6}", gb)
 }
 
-fn resolve_user(uid: i64, cache: &mut HashMap<i64, String>) -> String {
+fn resolve_user(uid: u32, cache: &mut HashMap<u32, String>) -> String {
     if let Some(u) = cache.get(&uid) {
         return u.clone();
     }
@@ -152,7 +162,7 @@ fn resolve_user(uid: i64, cache: &mut HashMap<i64, String>) -> String {
     name
 }
 
-fn resolve_group(gid: i64, cache: &mut HashMap<i64, String>) -> String {
+fn resolve_group(gid: u32, cache: &mut HashMap<u32, String>) -> String {
     if let Some(g) = cache.get(&gid) {
         return g.clone();
     }
@@ -198,12 +208,12 @@ fn get_groupname_from_gid(gid: u32) -> String {
 }
 
 #[cfg(not(unix))]
-fn get_username_from_uid(uid: i64) -> String { 
+fn get_username_from_uid(uid: u32) -> String { 
     uid.to_string() 
 }
 
 #[cfg(not(unix))]
-fn get_groupname_from_gid(gid: i64) -> String { 
+fn get_groupname_from_gid(gid: u32) -> String { 
     gid.to_string() 
 }
 

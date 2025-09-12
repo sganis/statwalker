@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 crossbeam = "0.8"
 itoa = "1"
+atoi = "2"
 num_cpus = "1.17"
 clap = { version = "4.5", features = ["derive", "env", "color"] }
 csv = "1.3"
