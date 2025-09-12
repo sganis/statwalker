@@ -10,6 +10,18 @@ use chrono::Utc;
 #[cfg(unix)]
 use std::ffi::CStr;
 
+// POSIX-style type masks as encoded by Statwalker in MODE
+#[cfg(unix)]
+const S_IFMT:  u32 = 0o170000;
+#[cfg(unix)]
+const S_IFDIR: u32 = 0o040000;
+
+#[cfg(not(unix))]
+const S_IFMT:  u32 = 0o170000;
+#[cfg(not(unix))]
+const S_IFDIR: u32 = 0o040000;
+
+
 #[derive(Parser, Debug)]
 #[command(author, version, color = ColorChoice::Always, 
     about = "Aggregate statwalker CSV into per-(folder, user, age) rows")]
@@ -25,13 +37,17 @@ struct Args {
 struct UserStats {
     file_count: u64,
     disk_usage: u64,    // integer bytes
+    latest_atime: i64,  // seconds since Unix epoch
     latest_mtime: i64,  // seconds since Unix epoch
 }
 
 impl UserStats {
-    fn update(&mut self, disk: u64, mtime_secs: i64) {
+    fn update(&mut self, disk: u64, atime_secs: i64, mtime_secs: i64) {
         self.file_count = self.file_count.saturating_add(1);
         self.disk_usage = self.disk_usage.saturating_add(disk);
+        if atime_secs > self.latest_atime {
+            self.latest_atime = atime_secs;
+        }
         if mtime_secs > self.latest_mtime {
             self.latest_mtime = mtime_secs;
         }
@@ -98,8 +114,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Columns: INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH
+        let mode      = parse_field_as_u32(record.get(5));
+        let is_dir    = (mode & S_IFMT) == S_IFDIR;
+        let raw_atime = parse_field_as_i64(record.get(1));
         let raw_mtime = parse_field_as_i64(record.get(2));
-        let sanitized_mtime = sanitize_mtime(now_ts, raw_mtime);
+        let mut sanitized_atime = sanitize_mtime(now_ts, raw_atime);
+        let mut sanitized_mtime = sanitize_mtime(now_ts, raw_mtime);
+
+        if is_dir {
+            sanitized_atime = 0;
+            sanitized_mtime = 0; // ignore folder times
+        }
 
         let uid = parse_field_as_u32(record.get(3));
         let user = resolve_user(uid, &mut user_cache);
@@ -122,7 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             aggregated_data
                 .entry(key)
                 .or_default()
-                .update(disk_usage, sanitized_mtime);
+                .update(disk_usage, sanitized_atime, sanitized_mtime);
         }
 
         // Show progress (approx 10% steps)
@@ -294,6 +319,7 @@ fn write_results(
         "age",
         "files",
         "disk",
+        "accessed",
         "modified",
     ])?;
 
@@ -306,6 +332,7 @@ fn write_results(
             &age.to_string(),
             &stats.file_count.to_string(),
             &stats.disk_usage.to_string(),
+            &stats.latest_atime.to_string(),
             &stats.latest_mtime.to_string(),
         ])?;
     }
@@ -406,7 +433,7 @@ mod tests {
         let mut map: HashMap<(Vec<u8>, String, u8), UserStats> = HashMap::new();
         let key = (vec![b'/', 0xFFu8, b'a'], "user".to_string(), 0u8);
         let mut s = UserStats::default();
-        s.update(512, 1_700_000_000);
+        s.update(512, 1_700_000_000, 1_700_000_000);
         map.insert(key, s);
 
         let tmp = std::env::temp_dir().join(format!("agg_out_{}.csv", std::process::id()));
@@ -419,7 +446,7 @@ mod tests {
         // Should contain replacement char for 0xFF and the rest intact
         assert!(contents.contains('�'));
         assert!(contents.contains("/a") || contents.contains("/�a"));
-        assert!(contents.lines().next().unwrap().contains("path,user,age,files,disk,modified"));
+        assert!(contents.lines().next().unwrap().contains("path,user,age,files,disk,accessed,modified"));
     }
 
     #[test]
@@ -449,9 +476,9 @@ mod tests {
         let mut map: HashMap<(Vec<u8>, String, u8), UserStats> = HashMap::new();
 
         // Insert in scrambled order
-        map.insert((b"/a/b".to_vec(), "user2".to_string(), 1), UserStats { file_count: 2, disk_usage: 200, latest_mtime: 20 });
-        map.insert((b"/a".to_vec(),   "user1".to_string(), 0), UserStats { file_count: 1, disk_usage: 100, latest_mtime: 10 });
-        map.insert((b"/a".to_vec(),   "user0".to_string(), 2), UserStats { file_count: 3, disk_usage: 300, latest_mtime: 30 });
+        map.insert((b"/a/b".to_vec(), "user2".to_string(), 1), UserStats { file_count: 2, disk_usage: 200, latest_atime: 20, latest_mtime: 20 });
+        map.insert((b"/a".to_vec(),   "user1".to_string(), 0), UserStats { file_count: 1, disk_usage: 100, latest_atime: 20, latest_mtime: 10 });
+        map.insert((b"/a".to_vec(),   "user0".to_string(), 2), UserStats { file_count: 3, disk_usage: 300, latest_atime: 20, latest_mtime: 30 });
 
         let tmp = NamedTempFile::new().unwrap();
         write_results(tmp.path(), &map).unwrap();
@@ -459,7 +486,7 @@ mod tests {
         let contents = fs::read_to_string(tmp.path()).unwrap();
         let mut lines = contents.lines();
         // header
-        assert_eq!(lines.next().unwrap(), "path,user,age,files,disk,modified");
+        assert_eq!(lines.next().unwrap(), "path,user,age,files,disk,accessed,modified");
 
         // Expected order: path (/a, /a, /a/b), then user (user0, user1), then age
         let row1 = lines.next().unwrap().to_string();
