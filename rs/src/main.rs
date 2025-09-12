@@ -194,7 +194,6 @@ fn main() -> std::io::Result<()> {
     println!("Files/sec.   : {:.2}", (total.files as f64) / secs);
     println!("{}","------------------------------------------------".cyan().bold());
     println!("Done.");
-
     Ok(())
 }
 
@@ -387,7 +386,6 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
 
 fn stat_row<'a>(path: &'a Path) -> Option<Row<'a>> {
     let md = fs::symlink_metadata(path).ok()?;
-    let is_file = md.is_file();
 
     #[cfg(unix)]
     {
@@ -408,6 +406,8 @@ fn stat_row<'a>(path: &'a Path) -> Option<Row<'a>> {
     }
     #[cfg(windows)]
     {
+        let is_file = md.is_file();
+
         // Convert SystemTime to Unix timestamp
         let to_unix_timestamp = |time: SystemTime| -> i64 {
             time.duration_since(SystemTime::UNIX_EPOCH)

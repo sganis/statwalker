@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .trim(Trim::All)
         .from_path(&args.input)?;
 
-    println!("Processing {}", args.input.display());
+    println!("Aggregating {}...", args.input.display());
 
     // path, user, age -> stats
     let mut aggregated_data: HashMap<(Vec<u8>, String, u8), UserStats> = HashMap::new();
@@ -96,13 +96,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Use Local::now() instead of deprecated Utc::now()
     let now_ts = Utc::now().timestamp();
-
-
-    // fn epoch_secs_to_iso_date(secs: i64) -> String {
-    //     chrono::DateTime::<Utc>::from_timestamp(secs, 0)
-    //         .map(|dt| dt.date_naive().to_string()) // "YYYY-MM-DD"
-    //         .unwrap_or_else(|| "1970-01-01".to_string())
-    // }
 
     // Process each record
     for (index, record_result) in reader.byte_records().enumerate() {
@@ -158,16 +151,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_unknown_uids(&unk_path, &unk_uids)?;
 
     let duration = start_time.elapsed();
-    println!("✓ Aggregation complete!");
-    println!("  Output: {}", output_path.display());
-    println!("  Unknown UIDs: {} -> {}", unk_uids.len(), unk_path.display());
+    println!("Output       : {}", output_path.display());
+    println!("Unknown UIDs : {} (total: {})", unk_path.display(), unk_uids.len());
     let percent_unique = if data_lines > 0 { ((aggregated_data.len() as f64 / data_lines as f64) * 100.0) as i32 } else { 0 };
-    println!(
-        "  Unique (folder, user, age) triples: {} - {}%",
-        aggregated_data.len(), percent_unique
-    );
-    println!("  Time: {:.2} seconds", duration.as_secs_f64());
-
+    println!("Total lines  : {} ({}% of input)",aggregated_data.len(), percent_unique);
+    println!("Elapsed time : {:.2} seconds", duration.as_secs_f64());
     Ok(())
 }
 

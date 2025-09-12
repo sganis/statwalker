@@ -103,9 +103,8 @@ fn main() -> Result<()> {
     }
 
     wtr.flush().context("flushing output csv")?;
-    println!("Resolved          -> {}", output.display());
-
-    println!("Total resolve time: {:.3} sec.", start.elapsed().as_secs_f64());
+    println!("Output       : {}", output.display());
+    println!("Elapsed time : {:.3} sec.", start.elapsed().as_secs_f64());
     Ok(())
 }
 
