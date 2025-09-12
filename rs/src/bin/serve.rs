@@ -44,6 +44,23 @@ pub struct FsItemOut {
     pub modified: i64    // unix
 }
 
+// ----------- Output shapes for /api/folders -----------
+#[derive(Serialize, Debug, Clone)]
+pub struct Age {
+    pub count: u64,
+    pub disk:  u64,  // bytes
+    pub atime: i64,  // Unix seconds
+    pub mtime: i64,  // Unix seconds
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct FolderOut {
+    pub path: String,
+    pub users: HashMap<String, HashMap<String, Age>>, // username -> age_string -> stats
+}
+
+static FS_INDEX: OnceLock<InMemoryFSIndex> = OnceLock::new();
+static USERS: OnceLock<Vec<String>> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -212,8 +229,8 @@ pub fn count_lines(path: &Path) -> std::io::Result<usize> {
 #[derive(Default, Debug, Clone)]
 struct Stats {
     file_count: u64,
-    size_bytes: u64,   // mirrored from disk
     disk_bytes: u64,   // from CSV
+    latest_atime: i64, // Unix seconds
     latest_mtime: i64, // Unix seconds
 }
 
@@ -278,7 +295,8 @@ impl InMemoryFSIndex {
             let age: u8            = record.get(2).unwrap_or("0").parse().unwrap_or(0);
             let file_count: u64    = record.get(3).unwrap_or("0").parse().unwrap_or(0);
             let disk_bytes: u64    = record.get(4).unwrap_or("0").parse().unwrap_or(0);
-            let latest_mtime: i64  = record.get(5).unwrap_or("0").parse().unwrap_or(0);
+            let latest_atime: i64  = record.get(5).unwrap_or("0").parse().unwrap_or(0);
+            let latest_mtime: i64  = record.get(6).unwrap_or("0").parse().unwrap_or(0);
 
             if path_str.is_empty() || username.is_empty() {
                 continue;
@@ -296,8 +314,10 @@ impl InMemoryFSIndex {
             // Single index: (path, user, age)
             let entry = self.per_user_age.entry((pkey, username, age)).or_insert_with(Stats::default);
             entry.file_count = entry.file_count.saturating_add(file_count);
-            entry.size_bytes = entry.size_bytes.saturating_add(disk_bytes); // mirror size=disk
             entry.disk_bytes = entry.disk_bytes.saturating_add(disk_bytes);
+            if latest_atime > entry.latest_atime {
+                entry.latest_atime = latest_atime;
+            }
             if latest_mtime > entry.latest_mtime {
                 entry.latest_mtime = latest_mtime;
             }
@@ -379,29 +399,31 @@ impl InMemoryFSIndex {
             }
 
             // Build users -> username -> ages map and compute totals for this folder
-            let mut users_map: HashMap<String, HashMap<String, AgeMini>> = HashMap::new();
+            let mut users_map: HashMap<String, HashMap<String, Age>> = HashMap::new();
             let mut total_count: u64 = 0;
-            let mut total_size:  u64 = 0;
             let mut total_disk:  u64 = 0;
+            let mut accessed:    i64 = 0;
             let mut modified:    i64 = 0;
 
             let ages_to_consider: Vec<u8> = if let Some(a) = age_filter { vec![a] } else { vec![0,1,2] };
 
             for uname in &users_to_show {
-                let mut age_map: HashMap<String, AgeMini> = HashMap::new();
+                let mut age_map: HashMap<String, Age> = HashMap::new();
 
                 for a in &ages_to_consider {
                     if let Some(s) = self.per_user_age.get(&(pkey.clone(), uname.clone(), *a)) {
-                        age_map.insert(a.to_string(), AgeMini {
+                        age_map.insert(a.to_string(), Age {
                             count: s.file_count,
-                            size:  s.size_bytes,
                             disk:  s.disk_bytes,
+                            atime: s.latest_atime,
                             mtime: s.latest_mtime,
                         });
 
                         total_count = total_count.saturating_add(s.file_count);
-                        total_size  = total_size.saturating_add(s.size_bytes);
                         total_disk  = total_disk.saturating_add(s.disk_bytes);
+                        if s.latest_atime > accessed {
+                            accessed = s.latest_atime;
+                        }
                         if s.latest_mtime > modified {
                             modified = s.latest_mtime;
                         }
@@ -453,27 +475,6 @@ impl InMemoryFSIndex {
         n
     }
 }
-
-// ----------- Output shapes for /api/folders -----------
-
-#[derive(Serialize, Debug, Clone)]
-pub struct AgeMini {
-    pub count: u64,
-    pub size:  u64,  // bytes (mirrored from disk)
-    pub disk:  u64,  // bytes
-    pub mtime: i64,  // Unix seconds
-}
-
-#[derive(Serialize, Debug, Clone)]
-pub struct FolderOut {
-    pub path: String,
-    pub users: HashMap<String, HashMap<String, AgeMini>>, // username -> age_string -> stats
-}
-
-// ===================== Globals =====================
-
-static FS_INDEX: OnceLock<InMemoryFSIndex> = OnceLock::new();
-static USERS: OnceLock<Vec<String>> = OnceLock::new();
 
 fn get_users() -> &'static Vec<String> {
     USERS.get().expect("User list not initialized")
