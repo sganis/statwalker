@@ -41,7 +41,8 @@ pub struct FsItemOut {
     pub path: String,
     pub owner: String,   // username
     pub size: u64,       // bytes
-    pub modified: i64    // unix
+    pub accessed: i64,    // unix
+    pub modified: i64,    // unix
 }
 
 // ----------- Output shapes for /api/folders -----------
@@ -162,6 +163,7 @@ pub fn get_items<P: AsRef<std::path::Path>>(
     let dir = fs::read_dir(&folder)
         .with_context(|| format!("read_dir({}) failed", folder.as_ref().display()))?;
 
+    
     for entry_res in dir {
         let entry = match entry_res { Ok(e) => e, Err(_) => continue };
         let path = entry.path();
@@ -174,6 +176,7 @@ pub fn get_items<P: AsRef<std::path::Path>>(
             if !allow.contains(&owner) { continue; }
         }
 
+        let atime = md.atime();
         let mtime = md.mtime();
 
         if let Some(af) = age_filter {
@@ -187,6 +190,7 @@ pub fn get_items<P: AsRef<std::path::Path>>(
             path: path.to_string_lossy().into_owned(),
             owner,
             size: md.size(),
+            accessed: atime,
             modified: mtime,
         });
     }

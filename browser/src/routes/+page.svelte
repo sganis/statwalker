@@ -396,7 +396,6 @@
       },
     };
   }
-
   const metricValue = (file: FileItem) => {
     switch (sortBy) {
       case "disk":
@@ -430,27 +429,29 @@
   // Build an aggregate "file" for the current path: sums of all visible children (bytes)
   function aggregatePathTotals(foldersArr: FileItem[], p: string): FileItem {
     let total_count = 0;
-    let total_size = 0;
     let total_disk = 0;
+    let accessed = 0; 
     let modified = 0; 
     const aggUsers: Record<string, UserStatsJson> = {};
 
     for (const f of foldersArr ?? []) {
       total_count += toNum(f?.total_count);
-      total_size  += toNum(f?.total_size);
       total_disk  += toNum(f?.total_disk);
+      if (f.accessed > accessed) 
+        accessed = f.accessed;
       if (f.modified > modified) 
         modified = f.modified;
       
       const u = f?.users ?? {};
       for (const [uname, data] of Object.entries(u)) {
         const d = data as UserStatsJson;
-        const prev = aggUsers[uname] ?? { username: uname, count: 0, size: 0, disk: 0, mtime: 0 };
+        const prev = aggUsers[uname] ?? { 
+          username: uname, count: 0, disk: 0, atime: 0, mtime: 0 };
         aggUsers[uname] = {
           username: uname,
           count: prev.count + toNum(d.count),
-          size:  prev.size  + toNum(d.size),
           disk:  prev.disk  + toNum(d.disk),
+          atime: Math.max(prev.atime, toNum(d.atime)),
           mtime: Math.max(prev.mtime, toNum(d.mtime)),
         };
       }
@@ -459,8 +460,8 @@
     return {
       path: p,
       total_count,
-      total_size,
       total_disk,
+      accessed,
       modified,
       users: aggUsers,
     };
@@ -601,7 +602,7 @@
 
 <div class="flex flex-col h-screen min-h-0 gap-2 p-2">
   <div class="flex gap-2 items-center relative">
-    <button class="btn" onclick={goHome} title="Go to Root Folder" disabled={histIdx === 0}>
+    <button class="btn" onclick={goHome} title="Go to Root Folder" disabled={histIdx === 0 || fullPath === '/'}>
       <div class="flex items-center">
       <span class="material-symbols-outlined">home</span>
       </div>
@@ -721,10 +722,7 @@
           <p class="text-xs">
             {humanCount(pathTotals.total_count)} Files 
             • Changed {humanTime(pathTotals.modified)} 
-            • {formatBytes(pathTotals.total_disk)}
-            {#if formatBytes(pathTotals.total_size) !== formatBytes(pathTotals.total_disk)}
-              ({formatBytes(pathTotals.total_size)} on size)
-            {/if}          
+            • {formatBytes(pathTotals.total_disk)}                  
           </p>
         </div>
       </div>
@@ -804,13 +802,12 @@
               <span class="text-nowrap font-bold">{rightValue(file)}</span>
             </div>
             <div class="flex justify-end">
-              <p class="text-xs text-gray-300">
+              <p class="text-sm">
                 {humanCount(file.total_count)} Files 
-                • Changed {humanTime(file.modified)} 
-                • {formatBytes(file.total_disk)} 
-                {#if formatBytes(file.total_size) !== formatBytes(file.total_disk)}
-                  ({formatBytes(file.total_size)} on size)
-                {/if}          
+                • Updated {humanTime(file.modified)} 
+                {#if humanTime(file.accessed) > humanTime(file.modified)}
+                • Last file read {humanTime(file.accessed)} 
+                {/if}                      
               </p>
             </div>
           </div>
@@ -832,7 +829,8 @@
               </div>
               <div class="relative z-10 flex justify-between text-gray-300">
                 <div class="">{f.owner}</div>
-                <div class="">Changed {humanTime(f.modified)}</div>
+                <div class="">Updated {humanTime(f.modified)}</div>
+                <div class="">Read {humanTime(f.accessed)}</div>
               </div>
             </div>
           </div>

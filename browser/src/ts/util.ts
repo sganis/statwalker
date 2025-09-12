@@ -1,20 +1,12 @@
-
 import { fromUnixTime, formatDistanceToNow, isFuture, format } from "date-fns";
 
-export function humanTime(unixTs: number): string {
-  const d = fromUnixTime(unixTs);
-
+export function humanTime(unix: number): string {
+  const d = fromUnixTime(unix);
   if (isFuture(d)) {
-    // Date only in ISO format
-    return `future? ${format(d, "yyyy-MM-dd")}`;
+    return `in the future? (${format(d, "yyyy-MM-dd")})`;
   }
-
   return formatDistanceToNow(d, { addSuffix: true });
 }
-
-
-export const humanCount = (n, maxFrac = 1, locale = 'en') =>
-  new Intl.NumberFormat(locale, { notation: 'compact', compactDisplay: 'short', maximumFractionDigits: maxFrac }).format(n);
 
 
 export function formatBytes(bytes, decimals = 1) {
@@ -28,6 +20,11 @@ export function formatBytes(bytes, decimals = 1) {
 
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${units[i]}`;
 }
+
+export const humanCount = (n, maxFrac = 1, locale = 'en') =>
+  new Intl.NumberFormat(locale, { notation: 'compact', compactDisplay: 'short', maximumFractionDigits: maxFrac }).format(n);
+// compact(1234) -> "1.2K"
+
 
 // Examples:
 // formatBytes(1000) → "1 KB"
