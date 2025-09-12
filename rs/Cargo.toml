@@ -3,10 +3,6 @@ name = "statwalker"
 version = "2.0.0"
 edition = "2024"
 
-[[bin]]
-name = "walk"
-path = "src/main.rs"
-
 [dependencies]
 crossbeam = "0.8"
 itoa = "1"
@@ -20,8 +16,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 memchr = "2.7"
 axum = { version = "0.8.4", features = ["macros", "json"] }   # ← bumped
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors","fs"] }          # ← keep current; 0.6 works fine with axum 0.8
+tower-http = { version = "0.6", features = ["cors","fs"] } 
 colored = "3.0.0"
+tempfile = "3.22.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

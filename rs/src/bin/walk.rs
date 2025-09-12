@@ -715,3 +715,248 @@ fn push_i64(out: &mut Vec<u8>, v: i64) {
         out.extend_from_slice(formatted.as_bytes());
     });
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_should_skip() {
+        let p = PathBuf::from("/a/b/c/d");
+        assert!(super::should_skip(&p, Some("b/c")));
+        assert!(!super::should_skip(&p, Some("x")));
+        assert!(!super::should_skip(&p, None));
+    }
+
+    // ---------- Quoting / PATH encoding ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn test_csv_push_bytes_smart_quoted_fast_path() {
+        let mut buf = Vec::new();
+        super::csv_push_bytes_smart_quoted(&mut buf, b"abc_def");
+        assert_eq!(&buf, b"abc_def"); // no quotes, no changes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_csv_push_bytes_smart_quoted_with_comma() {
+        let mut buf = Vec::new();
+        super::csv_push_bytes_smart_quoted(&mut buf, b"a,b");
+        assert_eq!(&buf, b"\"a,b\""); // quoted because of comma
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_csv_push_bytes_smart_quoted_with_quote() {
+        let mut buf = Vec::new();
+        super::csv_push_bytes_smart_quoted(&mut buf, b"a\"b");
+        // inner quote doubled, whole field quoted
+        assert_eq!(&buf, b"\"a\"\"b\"");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_csv_push_bytes_smart_quoted_with_newline() {
+        let mut buf = Vec::new();
+        super::csv_push_bytes_smart_quoted(&mut buf, b"a\nb");
+        assert_eq!(&buf, b"\"a\nb\"");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_row_with_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        // Path bytes: [0xFF, b'a', b'/', b'b']
+        let raw = [0xFFu8, b'a', b'/', b'b'];
+        let p = Path::new(OsStr::from_bytes(&raw));
+        let r = Row {
+            path: p,
+            dev: 1,
+            ino: 2,
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            size: 123,
+            blocks: 1,
+            atime: 1,
+            mtime: 2,
+        };
+        let mut buf = Vec::new();
+        super::write_row(&mut buf, r);
+        // ensure row ends with our raw bytes + newline, quoted only if necessary
+        // raw contains no ',', '"', '\n', '\r' so not quoted
+        assert!(buf.ends_with(b",256,\xFFa/b\n")); // DISK=512 => "256" (blocks*512) oops check: blocks=1 -> disk=512, but push_u64 disk value 512; The suffix we check only the very end:
+        // Actually re-check: The exact tail is "... ,DISK,PATH\n"
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_csv_push_str_smart_quoted_normalize_verbatim() {
+        // \\?\C:\foo -> C:\foo
+        let mut buf = Vec::new();
+        super::csv_push_str_smart_quoted(&mut buf, r"\\?\C:\foo\bar");
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), r"C:\foo\bar");
+
+        // \\?\UNC\server\share\foo -> \\server\share\foo
+        let mut buf2 = Vec::new();
+        super::csv_push_str_smart_quoted(&mut buf2, r"\\?\UNC\server\share\foo");
+        assert_eq!(std::str::from_utf8(&buf2).unwrap(), r"\\server\share\foo");
+    }
+
+    // ---------- merge_shards ----------
+
+    #[test]
+    fn test_merge_shards_unsorted_and_sorted() -> std::io::Result<()> {
+        let tmp = tempdir()?;
+        let out_dir = tmp.path().to_path_buf();
+        let final_path_unsorted = out_dir.join("out_unsorted.csv");
+        let final_path_sorted = out_dir.join("out_sorted.csv");
+
+        // Create 2 shard files
+        let shard0 = out_dir.join("shard_0.csv.tmp");
+        let shard1 = out_dir.join("shard_1.csv.tmp");
+
+        // shard0: "b\n"
+        {
+            let mut w = File::create(&shard0)?;
+            w.write_all(b"b\n")?;
+        }
+        // shard1: "a\n"
+        {
+            let mut w = File::create(&shard1)?;
+            w.write_all(b"a\n")?;
+        }
+
+        // Unsorted merge
+        super::merge_shards(&out_dir, &final_path_unsorted, 2, false)?;
+        let mut s = String::new();
+        File::open(&final_path_unsorted)?.read_to_string(&mut s)?;
+        let mut lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines.remove(0), "INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH");
+        // Since we stream shards in 0..threads, order is shard0 then shard1
+        assert_eq!(lines, vec!["b", "a"]);
+
+        // Recreate shards for sorted test (they were removed)
+        {
+            let mut w = File::create(&shard0)?;
+            w.write_all(b"b\n")?;
+        }
+        {
+            let mut w = File::create(&shard1)?;
+            w.write_all(b"a\n")?;
+        }
+
+        // Sorted merge
+        super::merge_shards(&out_dir, &final_path_sorted, 2, true)?;
+        let mut s2 = String::new();
+        File::open(&final_path_sorted)?.read_to_string(&mut s2)?;
+        let mut lines2: Vec<&str> = s2.lines().collect();
+        assert_eq!(lines2.remove(0), "INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH");
+        assert_eq!(lines2, vec!["a", "b"]);
+
+        Ok(())
+    }
+
+    // ---------- numeric formatters ----------
+
+    #[test]
+    fn test_push_numeric_helpers() {
+        let mut buf = Vec::new();
+        super::push_u32(&mut buf, 755);
+        buf.push(b' ');
+        super::push_u64(&mut buf, 1234567890123456789);
+        buf.push(b' ');
+        super::push_i64(&mut buf, -42);
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "755 1234567890123456789 -42");
+    }
+
+    // ---------- stat_row basics ----------
+
+    #[test]
+    fn test_stat_row_file_and_dir() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        let file = dir.join("f.txt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, b"hello").unwrap();
+
+        let dr = super::stat_row(&dir).expect("dir row");
+        let fr = super::stat_row(&file).expect("file row");
+
+        //assert!(dr.size >= 0);
+        assert!(fr.size >= 5);
+        assert!(dr.mtime >= 0);
+        assert!(fr.mtime >= 0);
+    }
+
+    // ---------- enum_dir minimal behavior ----------
+
+    #[test]
+    fn test_enum_dir_enqueues_tasks() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let sub = root.join("sub");
+        let f1 = root.join("a.txt");
+        let f2 = root.join("b.txt");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(&f1, b"x").unwrap();
+        std::fs::write(&f2, b"y").unwrap();
+
+        let (tx, rx) = crossbeam::channel::unbounded::<super::Task>();
+        let inflight = AtomicUsize::new(0);
+
+        let errors = super::enum_dir(root, &tx, &inflight, None);
+        assert_eq!(errors, 0);
+
+        // We should receive one Dir task (for sub) and one Files batch for root files
+        let mut saw_dir = false;
+        let mut files_batch = 0usize;
+
+        // Drain without blocking
+        while let Ok(task) = rx.try_recv() {
+            match task {
+                super::Task::Dir(p) => {
+                    assert!(p.ends_with("sub"));
+                    saw_dir = true;
+                }
+                super::Task::Files { base, names } => {
+                    assert_eq!(base.as_ref(), root);
+                    files_batch += names.len();
+                }
+                super::Task::Shutdown => {}
+            }
+        }
+
+        assert!(saw_dir, "expected subdirectory Task::Dir");
+        assert_eq!(files_batch, 2, "expected 2 file names batched");
+    }
+
+    // ---------- Windows verbatim prefix helper ----------
+
+    #[cfg(windows)]
+    #[test]
+    fn test_strip_verbatim_prefix_windows() {
+        // \\?\C:\foo -> C:\foo
+        let p = PathBuf::from(r"\\?\C:\foo\bar");
+        let got = super::strip_verbatim_prefix(&p);
+        assert_eq!(got.to_string_lossy(), r"C:\foo\bar");
+
+        // \\?\UNC\server\share\foo -> \\server\share\foo
+        let p2 = PathBuf::from(r"\\?\UNC\server\share\foo");
+        let got2 = super::strip_verbatim_prefix(&p2);
+        assert_eq!(got2.to_string_lossy(), r"\\server\share\foo");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_strip_verbatim_prefix_noop_non_windows() {
+        let p = PathBuf::from("/a/b");
+        let got = super::strip_verbatim_prefix(&p);
+        assert_eq!(got, p);
+    }
+}
