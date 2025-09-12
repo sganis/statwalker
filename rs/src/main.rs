@@ -23,10 +23,10 @@ use std::os::windows::fs::MetadataExt;
 use std::time::SystemTime;
 
 
-// Increased chunk sizes for better batching
-const FILE_CHUNK: usize = 8192;      // entries per work unit (doubled)
-const FLUSH_BYTES: usize = 4 * 1024 * 1024; // 4MB buffer (doubled)
+// chunk sizes
 const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2MB for file reads
+const FILE_CHUNK: usize = 16384;     // 16k entries per batch (was 8192)
+const FLUSH_BYTES: usize = 8 * 1024 * 1024; // 8MB buffer (was 4MB)
 
 #[derive(Parser, Debug)]
 #[command(author, version, color = ColorChoice::Always,
@@ -242,10 +242,11 @@ fn worker(
 ) -> Stats {
     let shard_path = out_dir.join(format!("shard_{tid}.csv.tmp"));
     let mut shard = BufWriter::with_capacity(
-        16 * 1024 * 1024, // Increased buffer size
+        32 * 1024 * 1024, // 32MB
         File::create(&shard_path).expect("open shard")
-    );
-    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024 * 1024); // Pre-allocate larger buffer
+    );    
+    // Pre-allocate larger buffer
+    let mut buf: Vec<u8> = Vec::with_capacity(32 * 1024 * 1024); 
 
     let mut stats = Stats {
         files: 0,
@@ -327,8 +328,11 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
     let mut error_count: u64 = 0;
     let mut page: Vec<OsString> = Vec::with_capacity(FILE_CHUNK);
     let base_arc = Arc::new(dir.to_path_buf());
+    
+    // Collect entries in larger batches to reduce channel overhead
+    let entries: Vec<_> = rd.collect();
 
-    for dent in rd {
+    for dent in entries {
         let dent = match dent {
             Ok(d) => d,
             Err(_) => { error_count += 1; continue; }

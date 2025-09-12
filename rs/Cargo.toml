@@ -29,8 +29,8 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 anstyle-wincon = "3"
 
-# [profile.release]
-# lto = "thin"
-# codegen-units = 1
-# panic = "abort"
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
 # opt-level = 3
