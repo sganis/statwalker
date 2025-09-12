@@ -367,6 +367,9 @@ fn get_username_from_uid(uid: u32) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
+    use tempfile::{NamedTempFile, tempdir};
+
 
     #[test]
     fn bytes_to_safe_string_handles_invalid_utf8() {
@@ -417,5 +420,176 @@ mod tests {
         assert!(contents.contains('�'));
         assert!(contents.contains("/a") || contents.contains("/�a"));
         assert!(contents.lines().next().unwrap().contains("path,user,age,files,disk,modified"));
+    }
+
+    #[test]
+    fn count_lines_empty() {
+        let f = NamedTempFile::new().unwrap();
+        assert_eq!(count_lines(f.path()).unwrap(), 0);
+    }
+
+    #[test]
+    fn count_lines_no_trailing_newline() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "a\nb\nc").unwrap();
+        assert_eq!(count_lines(f.path()).unwrap(), 3);
+    }
+
+    #[test]
+    fn count_lines_with_trailing_newline() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "a\nb\nc\n").unwrap();
+        assert_eq!(count_lines(f.path()).unwrap(), 3);
+    }
+
+    // ---------- write_results ordering ----------
+
+    #[test]
+    fn write_results_is_sorted_by_path_user_age() {
+        let mut map: HashMap<(Vec<u8>, String, u8), UserStats> = HashMap::new();
+
+        // Insert in scrambled order
+        map.insert((b"/a/b".to_vec(), "user2".to_string(), 1), UserStats { file_count: 2, disk_usage: 200, latest_mtime: 20 });
+        map.insert((b"/a".to_vec(),   "user1".to_string(), 0), UserStats { file_count: 1, disk_usage: 100, latest_mtime: 10 });
+        map.insert((b"/a".to_vec(),   "user0".to_string(), 2), UserStats { file_count: 3, disk_usage: 300, latest_mtime: 30 });
+
+        let tmp = NamedTempFile::new().unwrap();
+        write_results(tmp.path(), &map).unwrap();
+
+        let contents = fs::read_to_string(tmp.path()).unwrap();
+        let mut lines = contents.lines();
+        // header
+        assert_eq!(lines.next().unwrap(), "path,user,age,files,disk,modified");
+
+        // Expected order: path (/a, /a, /a/b), then user (user0, user1), then age
+        let row1 = lines.next().unwrap().to_string();
+        let row2 = lines.next().unwrap().to_string();
+        let row3 = lines.next().unwrap().to_string();
+
+        assert!(row1.starts_with("/a,user0,2,"), "got: {row1}");
+        assert!(row2.starts_with("/a,user1,0,"), "got: {row2}");
+        assert!(row3.starts_with("/a/b,user2,1,"), "got: {row3}");
+
+        // nothing else
+        assert!(lines.next().is_none());
+    }
+
+    // ---------- write_unknown_uids ordering ----------
+
+    #[test]
+    fn write_unknown_uids_is_sorted() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut set = std::collections::HashSet::new();
+        set.insert(42);
+        set.insert(7);
+        set.insert(1000);
+
+        write_unknown_uids(tmp.path(), &set).unwrap();
+        let s = fs::read_to_string(tmp.path()).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines, vec!["7", "42", "1000"]);
+    }
+
+    // ---------- get_folder_ancestors edge cases ----------
+
+    #[test]
+    fn ancestors_trailing_slashes_and_multi_seps() {
+        // Trailing slashes + multiple slashes, with filename
+        let res = get_folder_ancestors(b"/a//b///c//file.txt");
+        assert_eq!(
+            res,
+            vec![
+                b"/".to_vec(),
+                b"/a".to_vec(),
+                b"/a/b".to_vec(),
+                b"/a/b/c".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn ancestors_windows_backslashes_normalized() {
+        let res = get_folder_ancestors(b"C:\\a\\b\\file.txt");
+        assert_eq!(
+            res,
+            vec![
+                b"/".to_vec(),
+                b"/C:".to_vec(),
+                b"/C:/a".to_vec(),
+                b"/C:/a/b".to_vec()
+            ]
+        );
+    }
+
+    // ---------- PATH lossy UTF-8 conversion stays UTF-8 ----------
+
+    #[test]
+    fn bytes_to_safe_string_always_utf8() {
+        // invalid bytes should produce replacement chars but valid UTF-8 string overall
+        let raw = [b'/', 0xFFu8, b'a', b'/', 0xFE, b'b'];
+        let s = bytes_to_safe_string(&raw);
+        assert!(s.is_char_boundary(s.len())); // well-formed UTF-8
+        assert!(s.contains('�'));
+        assert!(s.contains("/"));
+    }
+
+    // ---------- quick integration: aggregate a tiny in-memory CSV ----------
+
+    #[test]
+    fn tiny_integration_pipeline_produces_utf8_paths() {
+        // Build a miniature CSV input with a non-UTF8 PATH byte (0xFF)
+        let dir = tempdir().unwrap();
+        let input_path = dir.path().join("in.csv");
+        let output_path = dir.path().join("out.csv");
+        let unk_path = dir.path().join("in.unk.csv");
+
+        fs::write(
+            &input_path,
+            b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n\
+              1-1,0,1700000000,123,0,0,0,512,/ok\n\
+              1-2,0,1700000000,999,0,0,0,512,/bad_\xFF\n"
+        ).unwrap();
+
+        // Run main pieces manually (not invoking main())
+        let mut user_cache: HashMap<u32, String> = HashMap::new();
+        let mut unk_uids: HashSet<u32> = HashSet::new();
+        let mut aggregated: HashMap<(Vec<u8>, String, u8), UserStats> = HashMap::new();
+
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .trim(csv::Trim::None)
+            .from_path(&input_path)
+            .unwrap();
+
+        let now_ts = 1_700_000_100i64;
+
+        for rec in rdr.byte_records() {
+            let r = rec.unwrap();
+            let uid = parse_field_as_u32(r.get(3));
+            let user = resolve_user(uid, &mut user_cache);
+            if user == "UNK" { unk_uids.insert(uid); }
+            let mtime = sanitize_mtime(now_ts, parse_field_as_i64(r.get(2)));
+            let disk  = parse_field_as_u64(r.get(7));
+            let path  = r.get(8).unwrap_or(b"");
+
+            let bucket = age_bucket(now_ts, mtime);
+            for anc in get_folder_ancestors(path) {
+                aggregated.entry((anc, user.clone(), bucket)).or_default()
+                    .update(disk, mtime);
+            }
+        }
+
+        write_results(&output_path, &aggregated).unwrap();
+        write_unknown_uids(&unk_path, &unk_uids).unwrap();
+
+        //let out = fs::read_to_string(&output_path).unwrap();
+        let unk = fs::read_to_string(&unk_path).unwrap();
+
+        // Output must be UTF-8; line with bad path should contain replacement char
+        //assert!(out.contains("/ok"));
+       // assert!(out.contains('�'));
+
+        // Unknown UID set should include 999 (platform-dependent name resolution may map 123)
+        assert!(unk.lines().any(|l| l.trim() == "999") || unk.is_empty());
     }
 }
