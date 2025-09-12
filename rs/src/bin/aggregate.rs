@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Counting lines in {}", args.input.display());
     let total_lines = count_lines(&args.input)?;
     let data_lines = total_lines.saturating_sub(1);
-    println!("Total lines: {} (data: {})", total_lines, data_lines);
+    println!("Total lines: {}", total_lines);
 
     // Set up CSV reader
     // IMPORTANT: Trim::None so we never alter raw PATH bytes.
@@ -122,8 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut sanitized_mtime = sanitize_mtime(now_ts, raw_mtime);
 
         if is_dir {
-            sanitized_atime = 0;
-            sanitized_mtime = 0; // ignore folder times
+            sanitized_atime = 0; // ignore folder accessed times
         }
 
         let uid = parse_field_as_u32(record.get(3));

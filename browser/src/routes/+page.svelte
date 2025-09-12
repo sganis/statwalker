@@ -76,29 +76,29 @@
   //#endregion
 
   //#region types
-  type AgeMini = {
+  type Age = {
     count: number;
-    size: number;  // bytes
     disk: number;  // bytes
+    atime: number; // unix seconds
     mtime: number; // unix seconds
   }
   type RawFolder = {
     path: string;
-    // username -> "0"/"1"/"2" -> AgeMini
-    users: Record<string, Record<string, AgeMini>>;
+    // username -> "0"/"1"/"2" -> Age
+    users: Record<string, Record<string, Age>>;
   }
   type UserStatsJson = {
     username: string;
     count: number;
-    size: number; // bytes
     disk: number; // bytes
+    atime: number;
     mtime: number;
   }
   type FileItem = {
     path: string;
     total_count: number;
-    total_size: number; // bytes
     total_disk: number; // bytes
+    accessed: number;   // unix time
     modified: number;   // unix time
     users: Record<string, UserStatsJson>; // keyed by username (aggregated across ages)
   }
@@ -106,6 +106,7 @@
   type ScannedFile = {
     path: string;
     size: number;      // bytes
+    accessed: number;  // unix
     modified: number;  // unix
     owner: string;     // username
   }
@@ -258,49 +259,54 @@
       .map((rf) => {
         const usersAgg: Record<string, UserStatsJson> = {};
         let total_count = 0;
-        let total_size  = 0;
         let total_disk  = 0;
+        let max_atime   = 0;
         let max_mtime   = 0;
 
         const userEntries = Object.entries(rf.users ?? {});
         for (const [uname, agesMap] of userEntries) {
-          let u_count = 0, u_size = 0, u_disk = 0, u_mtime = 0;
+          let u_count = 0, u_disk = 0, u_atime = 0, u_mtime = 0;
 
           for (const a of ages) {
             const s = agesMap?.[a];
-            if (!s) continue;
+            if (!s) 
+              continue;
             // coerce defensively
             const c = Number(s.count ?? 0);
-            const sz = Number(s.size ?? 0);
             const dk = Number(s.disk ?? 0);
+            const at = Number(s.mtime ?? 0);
             const mt = Number(s.mtime ?? 0);
 
             u_count += Number.isFinite(c) ? c : 0;
-            u_size  += Number.isFinite(sz) ? sz : 0;
             u_disk  += Number.isFinite(dk) ? dk : 0;
-            if (Number.isFinite(mt) && mt > u_mtime) u_mtime = mt;
+            if (Number.isFinite(at) && at > u_atime) 
+              u_atime = at;
+            if (Number.isFinite(mt) && mt > u_mtime) 
+              u_mtime = mt;
           }
 
-          if (u_count || u_size || u_disk) {
+          if (u_count || u_disk) {
             usersAgg[uname] = {
               username: uname,
               count: u_count,
-              size:  u_size,
               disk:  u_disk,
+              atime: u_atime,
               mtime: u_mtime,
             };
             total_count += u_count;
-            total_size  += u_size;
             total_disk  += u_disk;
-            if (u_mtime > max_mtime) max_mtime = u_mtime;
+            if (u_atime > max_atime) 
+              max_atime = u_atime;
+            if (u_mtime > max_mtime) 
+              max_mtime = u_mtime;
           }
         }
 
         return {
           path: rf.path,
           total_count,
-          total_size,
           total_disk,
+          accessed: max_atime,
           modified: max_mtime,
           users: usersAgg,
         };
