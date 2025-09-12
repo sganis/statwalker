@@ -147,12 +147,6 @@ fn fmt_day(ts: i64, cache: &mut HashMap<i64, String>) -> String {
     s
 }
 
-fn _bytes_to_gb(b: u128) -> String {
-    // 1 GiB = 1073741824 bytes
-    let gb = (b as f64) / 1073741824.0;
-    format!("{:.6}", gb)
-}
-
 fn resolve_user(uid: u32, cache: &mut HashMap<u32, String>) -> String {
     if let Some(u) = cache.get(&uid) {
         return u.clone();
