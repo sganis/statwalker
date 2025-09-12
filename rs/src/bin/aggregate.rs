@@ -118,12 +118,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let is_dir    = (mode & S_IFMT) == S_IFDIR;
         let raw_atime = parse_field_as_i64(record.get(1));
         let raw_mtime = parse_field_as_i64(record.get(2));
-        let mut sanitized_atime = sanitize_mtime(now_ts, raw_atime);
-        let mut sanitized_mtime = sanitize_mtime(now_ts, raw_mtime);
-
-        if is_dir {
-            sanitized_atime = 0; // ignore folder accessed times
-        }
+        let sanitized_atime = if is_dir { 0 } else { sanitize_mtime(now_ts, raw_atime) };
+        let sanitized_mtime = sanitize_mtime(now_ts, raw_mtime);
 
         let uid = parse_field_as_u32(record.get(3));
         let user = resolve_user(uid, &mut user_cache);
