@@ -3,17 +3,18 @@ use std::{
     fs::{self, File},
     io::{self, BufWriter, Write, BufRead, BufReader},
     path::{Path, PathBuf},
+    time::Instant,
+    thread,
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering::Relaxed},
     Arc,
 };
-use std::{thread, time::Instant, io::Read};
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use num_cpus;
 use itoa::Buffer;
 use clap::{Parser, ColorChoice};
-use blake3::Hasher;
+use colored::Colorize;
 
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
@@ -28,7 +29,8 @@ const FLUSH_BYTES: usize = 4 * 1024 * 1024; // 4MB buffer (doubled)
 const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2MB for file reads
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Super Fast FS Scanner", color = ColorChoice::Always)]
+#[command(author, version, color = ColorChoice::Always,
+     about = "Statwalker: Super Fast FS Scanner")]
 struct Args {
     /// Root folder to scan
     #[arg(default_value = ".")]
@@ -45,12 +47,6 @@ struct Args {
     /// Skip any folder whose full path contains this substring
     #[arg(long, value_name = "SUBSTR")]
     skip: Option<String>,
-    /// Detect file category (text/binary/image/video/etc), 50% decrease in performance
-    #[arg(long)]
-    category: bool,
-    /// Hash files (slow!)
-    #[arg(long)]
-    hash: bool,
 }
 
 #[derive(Debug)]
@@ -66,35 +62,13 @@ struct Stats {
     errors: u64,
 }
 
-// Packed category enum for better cache efficiency
-#[derive(Debug, Copy, Clone)]
-#[repr(u8)]
-enum Category {
-    // images
-    Jpeg = 1, Png, Gif, Bmp, Tiff, Webp,
-    // documents
-    Pdf,
-    // archives/compressed
-    Zip, Gzip, Bzip2, Xz, Rar, SevenZip, Tar,
-    // audio/video
-    Mp3, Mp4, Mkv, Ogg, Mpeg,
-    // executables
-    Elf, PE,
-    // fallback
-    Text, Binary, Unknown = 0,
-}
-
 #[derive(Clone)]
 struct Config {
-    want_category: bool,
-    want_hash: bool,
     skip: Option<String>,
 }
 
 struct Row<'a> {
     path: &'a Path,
-    category: Option<Category>,
-    hash: Option<String>,
     dev: u64,
     ino: u64,
     mode: u32,
@@ -108,6 +82,21 @@ struct Row<'a> {
 
 
 fn main() -> std::io::Result<()> {
+    // Enable colors on Windows (this is automatic on Unix-like systems)
+    #[cfg(windows)]
+    colored::control::set_virtual_terminal(true).unwrap_or(());
+
+    // println!(
+    //     "{}, {}, {}, {}, {}, and some normal text.",
+    //     "Bold".bold(),
+    //     "Red".red().bold(),
+    //     "Yellow".yellow(),
+    //     "Green".green().bold(),
+    //     "Blue".blue().bold(),
+    // );
+    println!("{}","------------------------------------------------".cyan().bold());
+    println!("{}", "Statlaker: Super fast filesystem scanner".cyan().bold());
+    println!("{}","------------------------------------------------".cyan().bold());
     let start_time = Instant::now();
     let args = Args::parse();
     // Canonicalize the provided root so relative inputs like "../some/folder" become absolute.
@@ -135,13 +124,14 @@ fn main() -> std::io::Result<()> {
         }
     };
 
+    let cmd: Vec<String> = std::env::args().collect();    
+    println!("Command      : {}", cmd.join(" "));
     println!("Input        : {}", &root_str);
     println!("Output       : {}", &final_path.display());
 
-
     // Use more threads for I/O bound work
-    let threads = args.threads.unwrap_or_else(|| (num_cpus::get()).max(4).min(32));
-    println!("Threads      : {}", threads);
+    let threads = args.threads.unwrap_or_else(|| (num_cpus::get()*2).max(4).min(48));
+    println!("Processes    : {}", threads);
 
     let out_dir = PathBuf::from(".");
 
@@ -169,8 +159,6 @@ fn main() -> std::io::Result<()> {
     }
 
     let cfg = Config { 
-        want_category: args.category,
-        want_hash: args.hash,
         skip: args.skip,
     };
 
@@ -195,7 +183,7 @@ fn main() -> std::io::Result<()> {
     }
 
     // ---- merge shards and print summary ----
-    merge_shards(&out_dir, &final_path, threads, args.sort, cfg.want_category, cfg.want_hash)?;
+    merge_shards(&out_dir, &final_path, threads, args.sort)?;
 
     let elapsed = start_time.elapsed();
     let secs = elapsed.as_secs_f64();
@@ -204,6 +192,8 @@ fn main() -> std::io::Result<()> {
     println!("Failed files : {}", total.errors);  
     println!("Elapsed time : {:.2} seconds", secs);
     println!("Files/sec.   : {:.2}", (total.files as f64) / secs);
+    println!("{}","------------------------------------------------".cyan().bold());
+    println!("Done.");
 
     Ok(())
 }
@@ -273,9 +263,9 @@ fn worker(
                     continue;
                 }
                 // emit one row for the directory itself
-                match stat_row(&dir, &cfg) {
+                match stat_row(&dir) {
                     Some(row) => {
-                        write_row(&mut buf, row, &cfg);
+                        write_row(&mut buf, row);
                         stats.files += 1;
                     }
                     None => {
@@ -301,9 +291,9 @@ fn worker(
                 // Process files in batch to reduce overhead
                 for name in names {
                     let full = base.join(&name);
-                    match stat_row(&full, &cfg) {
+                    match stat_row(&full) {
                         Some(row) => {
-                            write_row(&mut buf, row, &cfg);
+                            write_row(&mut buf, row);
                             stats.files += 1;
                         }
                         None => {
@@ -395,83 +385,9 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
     error_count
 }
 
-// Optimized category detection with lookup table
-fn detect_category(path: &Path) -> Category {
-    use Category::*;
-    
-    // Fast extension-based detection first
-    if let Some(ext) = path.extension() {
-        let ext_lower = ext.to_ascii_lowercase();
-        match ext_lower.to_str() {
-            Some("jpg") | Some("jpeg") => return Jpeg,
-            Some("png") => return Png,
-            Some("gif") => return Gif,
-            Some("bmp") => return Bmp,
-            Some("tiff") | Some("tif") => return Tiff,
-            Some("webp") => return Webp,
-            Some("pdf") => return Pdf,
-            Some("zip") => return Zip,
-            Some("gz") => return Gzip,
-            Some("bz2") => return Bzip2,
-            Some("xz") => return Xz,
-            Some("rar") => return Rar,
-            Some("7z") => return SevenZip,
-            Some("tar") => return Tar,
-            Some("mp3") => return Mp3,
-            Some("mp4") => return Mp4,
-            Some("mkv") => return Mkv,
-            Some("ogg") => return Ogg,
-            Some("mpeg") | Some("mpg") => return Mpeg,
-            Some("txt") | Some("md") | Some("rs") | Some("c") | Some("cpp") | Some("py") => return Text,
-            _ => {} // Fall through to magic number detection
-        }
-    }
-    
-    // Magic number detection for files without extensions or unknown extensions
-    let mut f = match File::open(path) { Ok(f) => f, Err(_) => return Unknown };
-    let mut hdr = [0u8; 32]; // Reduced header size for faster reads
-    let n = match f.read(&mut hdr) { Ok(n) => n, Err(_) => 0 };
-    
-    if n == 0 { return Unknown; }
-    let h = &hdr[..n];
-
-    // Optimized magic number checks - most common first
-    if n >= 4 && h[0] == 0xFF && h[1] == 0xD8 && h[2] == 0xFF { return Jpeg }
-    if n >= 8 && &h[0..4] == &[0x89,b'P',b'N',b'G'] { return Png }
-    if n >= 4 && &h[0..4] == b"GIF8" { return Gif }
-    if n >= 4 && &h[0..2] == b"BM" { return Bmp }
-    if n >= 4 && &h[0..4] == b"%PDF" { return Pdf }
-    if n >= 4 && &h[0..4] == &[0x50,0x4B,0x03,0x04] { return Zip }
-    if n >= 3 && &h[0..2] == &[0x1F,0x8B] { return Gzip }
-    if n >= 3 && &h[0..3] == &[0x42,0x5A,0x68] { return Bzip2 }
-    if n >= 4 && &h[0..4] == &[0x7F,b'E',b'L',b'F'] { return Elf }
-    if n >= 2 && &h[0..2] == &[0x4D,0x5A] { return PE }
-
-    // Quick text/binary heuristic - sample fewer bytes
-    let sample_size = n.min(32);
-    let mut printable = 0;
-    let mut has_null = false;
-    
-    for &b in &h[..sample_size] {
-        match b {
-            0x20..=0x7E | b'\t' | b'\n' | b'\r' => printable += 1,
-            0 => { has_null = true; break; }
-            _ => {}
-        }
-    }
-    
-    if has_null || printable < sample_size / 2 { Binary } else { Text }
-}
-
-
-fn stat_row<'a>(path: &'a Path, cfg: &'a Config) -> Option<Row<'a>> {
+fn stat_row<'a>(path: &'a Path) -> Option<Row<'a>> {
     let md = fs::symlink_metadata(path).ok()?;
     let is_file = md.is_file();
-    let mut file_hash = None;
-
-    if cfg.want_hash && is_file && md.len() > 0 { // Skip empty files
-        file_hash = Some(hash_file(path).unwrap_or_default());
-    }
 
     #[cfg(unix)]
     {
@@ -479,8 +395,6 @@ fn stat_row<'a>(path: &'a Path, cfg: &'a Config) -> Option<Row<'a>> {
         
         Some(Row {
             path,
-            category: if cfg.want_category && is_file { Some(detect_category(path)) } else { None },
-            hash: file_hash,
             dev: md.dev(),
             ino: md.ino(),
             mode: md.mode(),
@@ -545,8 +459,6 @@ fn stat_row<'a>(path: &'a Path, cfg: &'a Config) -> Option<Row<'a>> {
 
         Some(Row {
             path,
-            category: if cfg.want_category && is_file { Some(detect_category(path)) } else { None },
-            hash: file_hash,
             dev: 0, // Windows doesn't have a direct equivalent
             ino: 0, // Windows file index would require additional API calls
             mode,
@@ -562,8 +474,6 @@ fn stat_row<'a>(path: &'a Path, cfg: &'a Config) -> Option<Row<'a>> {
     {
         Some(Row {
             path,
-            category: if cfg.want_category && is_file { Some(detect_category(path)) } else { None },
-            hash: file_hash,
             dev: 0,
             ino: 0,
             mode: 0,
@@ -585,64 +495,39 @@ thread_local! {
     static I64_BUFFER: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new());
 }
 
-fn write_row(buf: &mut Vec<u8>, r: Row<'_>, cfg: &Config) {
+fn write_row(buf: &mut Vec<u8>, r: Row<'_>) {
     // Reserve space to reduce reallocations
     buf.reserve(256);
     
     // INODE
-    push_u64_fast(buf, r.dev);
+    push_u64(buf, r.dev);
     buf.push(b'-');
-    push_u64_fast(buf, r.ino);
+    push_u64(buf, r.ino);
     push_comma(buf);
 
     // ATIME, MTIME
-    push_i64_fast(buf, r.atime); 
+    push_i64(buf, r.atime); 
     push_comma(buf);
-    push_i64_fast(buf, r.mtime); 
+    push_i64(buf, r.mtime); 
     push_comma(buf);
 
     // UID, GID, MODE
-    push_u32_fast(buf, r.uid);   
+    push_u32(buf, r.uid);   
     push_comma(buf);
-    push_u32_fast(buf, r.gid);   
+    push_u32(buf, r.gid);   
     push_comma(buf);
-    push_u32_fast(buf, r.mode);  
+    push_u32(buf, r.mode);  
     push_comma(buf);
 
     // SIZE, DISK
-    push_u64_fast(buf, r.size);  
+    push_u64(buf, r.size);  
     push_comma(buf);
     let disk = r.blocks * 512;
-    push_u64_fast(buf, disk); 
+    push_u64(buf, disk); 
     push_comma(buf);
 
     // PATH (quote only if needed)
     csv_push_path_smart_quoted(buf, r.path);
-
-    if cfg.want_category {
-        push_comma(buf);
-        if let Some(cat) = r.category {
-            let s = match cat {
-                Category::Jpeg|Category::Png|Category::Gif|Category::Bmp|Category::Tiff|Category::Webp => "image",
-                Category::Zip|Category::Gzip|Category::Bzip2|Category::Xz|Category::SevenZip|Category::Rar|Category::Tar => "zip",
-                Category::Pdf => "pdf",
-                Category::Mp3 => "audio",
-                Category::Mp4|Category::Mkv|Category::Ogg|Category::Mpeg => "video",
-                Category::Elf|Category::PE|Category::Binary => "binary",
-                Category::Text => "text",
-                Category::Unknown => "",
-            };
-            buf.extend_from_slice(s.as_bytes());
-        }
-    }    
-
-    if cfg.want_hash {
-        push_comma(buf);
-        if let Some(h) = r.hash {
-            buf.extend_from_slice(h.as_bytes());
-        }
-    
-    }
     buf.push(b'\n');
 }
 
@@ -740,20 +625,14 @@ fn csv_push_str_smart_quoted(buf: &mut Vec<u8>, s: &str) {
 fn merge_shards(out_dir: &Path, 
     final_path: &Path, 
     threads: usize, 
-    sort_lines: bool, 
-    include_cat: bool, 
-    include_hash: bool
+    sort_lines: bool
 ) -> std::io::Result<()> {
     let mut out = BufWriter::with_capacity(
         16 * 1024 * 1024, // Larger output buffer
         File::create(&final_path)?
     );
     // build the header dynamically (replace the fixed write_all line)
-    let mut header = b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH".to_vec();
-    if include_cat  { header.extend_from_slice(b",CAT"); }
-    if include_hash { header.extend_from_slice(b",HASH"); }
-    header.push(b'\n');
-    out.write_all(&header)?;
+    out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n")?;
 
     if !sort_lines {
         // Stream shards directly to output (low memory)
@@ -801,27 +680,13 @@ fn merge_shards(out_dir: &Path,
     Ok(())
 }
 
-#[inline]
-fn hash_file(path: &Path) -> Option<String> {
-    let f = File::open(path).ok()?;
-    let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
-    let mut hasher = Hasher::new();
-    let mut buf = vec![0u8; READ_BUF_SIZE]; // Larger buffer for hashing
-    
-    loop {
-        let n = reader.read(&mut buf).ok()?;
-        if n == 0 { break; }
-        hasher.update(&buf[..n]);
-    }
-    Some(hasher.finalize().to_hex().to_string())
-}
 
 #[inline] 
 fn push_comma(buf: &mut Vec<u8>) { buf.push(b','); }
 
 // Optimized number formatting with thread-local buffers
 #[inline]
-fn push_u32_fast(out: &mut Vec<u8>, v: u32) {
+fn push_u32(out: &mut Vec<u8>, v: u32) {
     U32_BUFFER.with(|b| {
         let mut binding = b.borrow_mut();
         let formatted = binding.format(v);
@@ -830,7 +695,7 @@ fn push_u32_fast(out: &mut Vec<u8>, v: u32) {
 }
 
 #[inline]
-fn push_u64_fast(out: &mut Vec<u8>, v: u64) {
+fn push_u64(out: &mut Vec<u8>, v: u64) {
     U64_BUFFER.with(|b| {
         let mut binding = b.borrow_mut();
         let formatted = binding.format(v);
@@ -839,7 +704,7 @@ fn push_u64_fast(out: &mut Vec<u8>, v: u64) {
 }
 
 #[inline]
-fn push_i64_fast(out: &mut Vec<u8>, v: i64) {
+fn push_i64(out: &mut Vec<u8>, v: i64) {
     I64_BUFFER.with(|b| {
         let mut binding = b.borrow_mut();
         let formatted = binding.format(v);

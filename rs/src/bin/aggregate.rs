@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use clap::Parser;
+use clap::{Parser, ColorChoice};
 use csv::{ReaderBuilder, Trim, WriterBuilder};
 use memchr::memchr_iter;
 use chrono::Utc;
@@ -19,7 +19,8 @@ use chrono::Utc;
 use std::ffi::CStr;
 
 #[derive(Parser, Debug)]
-#[command(about = "Aggregate statwalker CSV into per-(folder, user, age) rows")]
+#[command(author, version, color = ColorChoice::Always, 
+    about = "Aggregate statwalker CSV into per-(folder, user, age) rows")]
 struct Args {
     /// Input CSV file path
     input: PathBuf,
@@ -43,6 +44,131 @@ impl UserStats {
             self.latest_mtime = mtime_secs;
         }
     }
+}
+
+
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let start_time = std::time::Instant::now();
+    let args = Args::parse();
+
+    // Determine output path
+    let output_path = args.output.clone().unwrap_or_else(|| {
+        let stem = args
+            .input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        PathBuf::from(format!("{}.agg.csv", stem))
+    });
+
+    // Unknown UID output path is always derived from INPUT stem (per request)
+    let unk_path = {
+        let stem = args
+            .input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        PathBuf::from(format!("{}.unk.csv", stem))
+    };
+
+    let mut user_cache: HashMap<u32, String> = HashMap::new(); // UID -> username cache
+    let mut unk_uids: HashSet<u32> = HashSet::new(); // collect UIDs that resolve to UNK
+
+    // Count total lines for progress tracking
+    println!("Counting lines in {}", args.input.display());
+    let total_lines = count_lines(&args.input)?;
+    let data_lines = total_lines.saturating_sub(1);
+    println!("Total lines: {} (data: {})", total_lines, data_lines);
+
+    // Set up CSV reader
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .trim(Trim::All)
+        .from_path(&args.input)?;
+
+    println!("Processing {}", args.input.display());
+
+    // path, user, age -> stats
+    let mut aggregated_data: HashMap<(Vec<u8>, String, u8), UserStats> = HashMap::new();
+    let progress_interval = if data_lines >= 10 { data_lines / 10 } else { 0 };
+
+    // Use Local::now() instead of deprecated Utc::now()
+    let now_ts = Utc::now().timestamp();
+
+
+    // fn epoch_secs_to_iso_date(secs: i64) -> String {
+    //     chrono::DateTime::<Utc>::from_timestamp(secs, 0)
+    //         .map(|dt| dt.date_naive().to_string()) // "YYYY-MM-DD"
+    //         .unwrap_or_else(|| "1970-01-01".to_string())
+    // }
+
+    // Process each record
+    for (index, record_result) in reader.byte_records().enumerate() {
+        let record = match record_result {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Warning: Skipping malformed row {}: {}", index + 1, e);
+                continue;
+            }
+        };
+
+        // Parse required fields
+        // Columns (as used here): INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH
+        let raw_mtime = parse_field_as_i64(record.get(2));
+        let sanitized_mtime = sanitize_mtime(now_ts, raw_mtime);
+        
+        let uid = parse_field_as_u32(record.get(3));
+        let user = resolve_user(uid, &mut user_cache);
+
+        // track unknowns
+        if user == "UNK" {
+            unk_uids.insert(uid);
+        }
+
+        let disk_usage = parse_field_as_u64(record.get(7)); // integer bytes
+        let path_bytes = record.get(8).unwrap_or(b"");
+
+        if user.is_empty() || path_bytes.is_empty() {
+            continue;
+        }
+
+        let bucket = age_bucket(now_ts, sanitized_mtime);
+
+        // Update statistics for each ancestor folder
+        for folder_path in get_folder_ancestors(path_bytes) {
+            let key = (folder_path, user.clone(), bucket);
+            aggregated_data
+                .entry(key)
+                .or_default()
+                .update(disk_usage, sanitized_mtime);
+        }
+
+        // Show progress (approx 10% steps)
+        if progress_interval > 0 && (index + 1) % progress_interval == 0 {
+            let percent = ((index + 1) as f64 * 100.0 / data_lines.max(1) as f64).ceil() as u32;
+            println!("{}%", percent.min(100));
+        }
+    }
+
+    // Write results
+    write_results(&output_path, &aggregated_data)?;
+    // Write unknown UIDs list
+    write_unknown_uids(&unk_path, &unk_uids)?;
+
+    let duration = start_time.elapsed();
+    println!("✓ Aggregation complete!");
+    println!("  Output: {}", output_path.display());
+    println!("  Unknown UIDs: {} -> {}", unk_uids.len(), unk_path.display());
+    let percent_unique = if data_lines > 0 { ((aggregated_data.len() as f64 / data_lines as f64) * 100.0) as i32 } else { 0 };
+    println!(
+        "  Unique (folder, user, age) triples: {} - {}%",
+        aggregated_data.len(), percent_unique
+    );
+    println!("  Time: {:.2} seconds", duration.as_secs_f64());
+
+    Ok(())
 }
 
 /// Convert path bytes into a list of ancestor folder paths:
@@ -263,128 +389,6 @@ fn get_username_from_uid(uid: u32) -> String {
     uid.to_string()
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let start_time = std::time::Instant::now();
-    let args = Args::parse();
-
-    // Determine output path
-    let output_path = args.output.clone().unwrap_or_else(|| {
-        let stem = args
-            .input
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("output");
-        PathBuf::from(format!("{}.agg.csv", stem))
-    });
-
-    // Unknown UID output path is always derived from INPUT stem (per request)
-    let unk_path = {
-        let stem = args
-            .input
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("output");
-        PathBuf::from(format!("{}.unk.csv", stem))
-    };
-
-    let mut user_cache: HashMap<u32, String> = HashMap::new(); // UID -> username cache
-    let mut unk_uids: HashSet<u32> = HashSet::new(); // collect UIDs that resolve to UNK
-
-    // Count total lines for progress tracking
-    println!("Counting lines in {}", args.input.display());
-    let total_lines = count_lines(&args.input)?;
-    let data_lines = total_lines.saturating_sub(1);
-    println!("Total lines: {} (data: {})", total_lines, data_lines);
-
-    // Set up CSV reader
-    let mut reader = ReaderBuilder::new()
-        .has_headers(true)
-        .flexible(true)
-        .trim(Trim::All)
-        .from_path(&args.input)?;
-
-    println!("Processing {}", args.input.display());
-
-    // path, user, age -> stats
-    let mut aggregated_data: HashMap<(Vec<u8>, String, u8), UserStats> = HashMap::new();
-    let progress_interval = if data_lines >= 10 { data_lines / 10 } else { 0 };
-
-    // Use Local::now() instead of deprecated Utc::now()
-    let now_ts = Utc::now().timestamp();
-
-
-    // fn epoch_secs_to_iso_date(secs: i64) -> String {
-    //     chrono::DateTime::<Utc>::from_timestamp(secs, 0)
-    //         .map(|dt| dt.date_naive().to_string()) // "YYYY-MM-DD"
-    //         .unwrap_or_else(|| "1970-01-01".to_string())
-    // }
-
-    // Process each record
-    for (index, record_result) in reader.byte_records().enumerate() {
-        let record = match record_result {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Warning: Skipping malformed row {}: {}", index + 1, e);
-                continue;
-            }
-        };
-
-        // Parse required fields
-        // Columns (as used here): INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH
-        let raw_mtime = parse_field_as_i64(record.get(2));
-        let sanitized_mtime = sanitize_mtime(now_ts, raw_mtime);
-        
-        let uid = parse_field_as_u32(record.get(3));
-        let user = resolve_user(uid, &mut user_cache);
-
-        // track unknowns
-        if user == "UNK" {
-            unk_uids.insert(uid);
-        }
-
-        let disk_usage = parse_field_as_u64(record.get(7)); // integer bytes
-        let path_bytes = record.get(8).unwrap_or(b"");
-
-        if user.is_empty() || path_bytes.is_empty() {
-            continue;
-        }
-
-        let bucket = age_bucket(now_ts, sanitized_mtime);
-
-        // Update statistics for each ancestor folder
-        for folder_path in get_folder_ancestors(path_bytes) {
-            let key = (folder_path, user.clone(), bucket);
-            aggregated_data
-                .entry(key)
-                .or_default()
-                .update(disk_usage, sanitized_mtime);
-        }
-
-        // Show progress (approx 10% steps)
-        if progress_interval > 0 && (index + 1) % progress_interval == 0 {
-            let percent = ((index + 1) as f64 * 100.0 / data_lines.max(1) as f64).ceil() as u32;
-            println!("{}%", percent.min(100));
-        }
-    }
-
-    // Write results
-    write_results(&output_path, &aggregated_data)?;
-    // Write unknown UIDs list
-    write_unknown_uids(&unk_path, &unk_uids)?;
-
-    let duration = start_time.elapsed();
-    println!("✓ Aggregation complete!");
-    println!("  Output: {}", output_path.display());
-    println!("  Unknown UIDs: {} -> {}", unk_uids.len(), unk_path.display());
-    let percent_unique = if data_lines > 0 { ((aggregated_data.len() as f64 / data_lines as f64) * 100.0) as i32 } else { 0 };
-    println!(
-        "  Unique (folder, user, age) triples: {} - {}%",
-        aggregated_data.len(), percent_unique
-    );
-    println!("  Time: {:.2} seconds", duration.as_secs_f64());
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

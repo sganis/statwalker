@@ -1,15 +1,16 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ColorChoice};
 use csv::{ReaderBuilder, WriterBuilder};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use time::{OffsetDateTime, UtcOffset};
+use chrono::{Local, TimeZone, Utc};
 
 #[cfg(unix)]
 use std::ffi::CStr;
 
 #[derive(Parser, Debug)]
-#[command(about = "Resolve statwalker CSV into human fields with aggregation + redb index")]
+#[command(author, version, color = ColorChoice::Always, 
+    about = "Resolve statwalker CSV into human fields")]
 struct Args {
     /// Input CSV produced by statwalker.py
     input: PathBuf,
@@ -19,7 +20,7 @@ struct Args {
 }
 
 const OUT_HEADER: &[&str] = &[
-    "INODE","ACCESSED","MODIFIED","USER","GROUP","TYPE","PERM","SIZE","DISK","PATH","CATEGORY","HASH"
+    "INODE","ACCESSED","MODIFIED","USER","GROUP","TYPE","PERM","SIZE","DISK","PATH"
 ];
 
 fn main() -> Result<()> {
@@ -58,12 +59,6 @@ fn main() -> Result<()> {
     let mut type_cache: HashMap<u32, String> = HashMap::new(); // TYPES
     let mut perm_cache: HashMap<u32, String> = HashMap::new(); // PERMS
 
-    // Inode dedup for disk usage
-    //let mut inodes_seen: HashSet<String> = HashSet::new();
-
-    // local tz or UTC fallback
-    let local_off = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-
     for (idx, rec) in rdr.records().enumerate() {
         let line_no = idx + 2; // header + 1-based
         let r = rec.with_context(|| format!("reading csv record at line {}", line_no))?;
@@ -82,11 +77,8 @@ fn main() -> Result<()> {
         // Unquote the path if it's already quoted (from input CSV)
         let path = unquote_csv_field(path_raw);
 
-        let category = r.get(9).unwrap_or("").to_string();
-        let hash = r.get(10).unwrap_or("").to_string();
-
-        let accessed = fmt_day(atime, &mut time_cache, local_off);
-        let modified = fmt_day(mtime, &mut time_cache, local_off);
+        let accessed = fmt_day(atime, &mut time_cache);
+        let modified = fmt_day(mtime, &mut time_cache);
 
         let user = resolve_user(uid, &mut user_cache);
         let group = resolve_group(gid, &mut group_cache);
@@ -94,21 +86,6 @@ fn main() -> Result<()> {
         let ftype = filetype_from_mode(mode_raw, &mut type_cache);
         let perm = octal_perm(mode_raw, &mut perm_cache);
 
-        // dedup disk by inode
-        // if inodes_seen.contains(&inode) {
-        //     disk_b = 0;
-        // } else {
-        //     inodes_seen.insert(inode.clone());
-        // }
-
-        // aggregation - use unquoted path
-        //aggregate_folder_stats(&path, size_b, disk_b, mtime, uid, &mut agg_data);
-
-        // let size_gb = bytes_to_gb(size_b);
-        // let disk_gb = bytes_to_gb(disk_b);
-
-        // Smart quoting - only quote if needed
-        //let quoted_path = csv_quote_if_needed(&path);
 
         wtr.write_record(&[
             &inode,
@@ -121,8 +98,6 @@ fn main() -> Result<()> {
             &size_b.to_string(),
             &disk_b.to_string(),
             &path,
-            &category,
-            &hash,
         ])
         .with_context(|| format!("writing output csv line {} (path: {})", line_no, path))?;
     }
@@ -167,16 +142,17 @@ fn parse_u64(s: Option<&str>, field: &str, line: usize) -> Result<u64> {
         .with_context(|| format!("parsing field `{}`='{}' at line {}", field, raw, line))
 }
 
-fn fmt_day(ts: i64, cache: &mut HashMap<i64, String>, off: time::UtcOffset) -> String {
+fn fmt_day(ts: i64, cache: &mut HashMap<i64, String>) -> String {
     if let Some(s) = cache.get(&ts) {
         return s.clone();
     }
     let s = if ts <= 0 {
         "0001-01-01".to_string()
     } else {
-        match OffsetDateTime::from_unix_timestamp(ts) {
-            Ok(t) => t.to_offset(off).date().to_string(), // YYYY-MM-DD
-            Err(_) => "0001-01-01".to_string(),
+        // Build UTC from the UNIX seconds, then convert to local and format.
+        match Utc.timestamp_opt(ts, 0).single() {
+            Some(t) => t.with_timezone(&Local).format("%Y-%m-%d").to_string(),
+            None => "0001-01-01".to_string(),
         }
     };
     cache.insert(ts, s.clone());

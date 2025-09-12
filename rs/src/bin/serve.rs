@@ -19,13 +19,87 @@ use std::{
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use memchr::memchr_iter;
+use clap::{Parser, ColorChoice};
 
 #[cfg(unix)]
 use std::ffi::CStr;
 
+#[derive(Parser, Debug)]
+#[command(author, version, color = ColorChoice::Always,
+    about = "Statwalker web server and UI")]
+struct Args {
+    /// Input CSV file path
+    input: PathBuf,
+    /// UI folder (defaults to STATIC_DIR env var or local public directory)
+    #[arg(long, value_name="DIR", env="STATIC_DIR")]
+    static_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FsItemOut {
+    pub path: String,
+    pub owner: String,   // username
+    pub size: u64,       // bytes
+    pub modified: i64    // unix
+}
+
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    
+    // CSV path
+    let csv_path = args.input.clone();
+
+    let static_dir: String = args
+        .static_dir
+        .or_else(|| std::env::var("STATIC_DIR").ok())
+        .unwrap_or_else(default_static_dir);
+
+    // ServeDir directly; SPA fallback to index.html
+    let frontend = ServeDir::new(&static_dir)
+        .not_found_service(ServeFile::new(format!("{}/index.html", static_dir)));
+
+    let mut idx = InMemoryFSIndex::new();
+    let users = idx.load_from_csv(Path::new(&csv_path))?;
+    FS_INDEX.set(idx).expect("FS_INDEX already set");
+    USERS.set(users).expect("USERS already set");
+
+    
+
+    // CORS (dev)
+    let cors = CorsLayer::new()
+        .allow_origin([
+            "http://localhost:8080".parse().unwrap(),
+            "http://localhost:5173".parse().unwrap(),
+            "http://127.0.0.1:5173".parse().unwrap(),
+        ])
+        .allow_methods([Method::GET, Method::OPTIONS])
+        .allow_headers(Any);
+
+    // API
+    let api = Router::new()
+        .route("/users", get(users_handler))         // Vec<String> usernames
+        .route("/folders", get(get_folders_handler)) // query: path, optional users/uids, optional age
+        .route("/files", get(get_files_handler));    // path + optional users/uids
+
+    // App
+    let app = Router::new()
+        .nest("/api", api)        // frontend calls /api/...
+        .fallback_service(frontend)
+        .layer(cors);
+
+    // Bind
+    let port: u16 = std::env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
+    let addr: SocketAddr = ([0, 0, 0, 0], port).into();
+
+    println!("Serving on http://{addr}  (static dir: {static_dir})");
+    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+    Ok(())
+}
+
 
 // ===================== Helpers =====================
-
 #[cfg(unix)]
 fn username_from_uid(uid: u32) -> String {
     unsafe {
@@ -42,21 +116,6 @@ fn username_from_uid(uid: u32) -> String {
             Err(_) => "UNK".to_string(),
         }
     }
-}
-
-// #[cfg(not(unix))]
-// fn username_from_uid(_uid: u32) -> String {
-//     "UNK".to_string()
-// }
-
-// ===================== File scan output (for /api/files) =====================
-
-#[derive(Debug, Clone, Serialize)]
-pub struct FsItemOut {
-    pub path: String,
-    pub owner: String,   // username
-    pub size: u64,       // bytes
-    pub modified: i64    // unix
 }
 
 #[cfg(unix)]
@@ -128,12 +187,6 @@ pub fn get_items<P: AsRef<std::path::Path>>(
 }
 
 // ===================== Aggregated index (folders) =====================
-// CSV shape (header):
-//   path,user,age,files,disk,modified
-// - 'disk' is integer bytes (u64)
-// - 'modified' is Unix epoch seconds (i64)
-// - 'size' is not present in CSV; we mirror size=disk to keep UI compatibility.
-
 pub fn count_lines(path: &Path) -> std::io::Result<usize> {
     let mut file = File::open(path)?;
     let mut buf = [0u8; 128 * 1024]; // 128 KiB is plenty; adjust if you like
@@ -509,55 +562,3 @@ fn default_static_dir() -> String {
     static_dir.to_string_lossy().into_owned()
 }
 
-// ===================== Bootstrap =====================
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // CSV path: first CLI arg, or env CSV_PATH
-    let csv_path = std::env::args()
-        .nth(1)
-        .or_else(|| std::env::var("CSV_PATH").ok())
-        .expect("Provide CSV path as first arg or set CSV_PATH env var");
-
-    let mut idx = InMemoryFSIndex::new();
-    let users = idx.load_from_csv(Path::new(&csv_path))?;
-    FS_INDEX.set(idx).expect("FS_INDEX already set");
-    USERS.set(users).expect("USERS already set");
-
-    // static dir (frontend build)
-    let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| default_static_dir());
-
-    // ServeDir directly; SPA fallback to index.html
-    let frontend = ServeDir::new(&static_dir)
-        .not_found_service(ServeFile::new(format!("{}/index.html", static_dir)));
-
-    // CORS (dev)
-    let cors = CorsLayer::new()
-        .allow_origin([
-            "http://localhost:8080".parse().unwrap(),
-            "http://localhost:5173".parse().unwrap(),
-            "http://127.0.0.1:5173".parse().unwrap(),
-        ])
-        .allow_methods([Method::GET, Method::OPTIONS])
-        .allow_headers(Any);
-
-    // API
-    let api = Router::new()
-        .route("/users", get(users_handler))         // Vec<String> usernames
-        .route("/folders", get(get_folders_handler)) // query: path, optional users/uids, optional age
-        .route("/files", get(get_files_handler));    // path + optional users/uids
-
-    // App
-    let app = Router::new()
-        .nest("/api", api)        // frontend calls /api/...
-        .fallback_service(frontend)
-        .layer(cors);
-
-    // Bind
-    let port: u16 = std::env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
-    let addr: SocketAddr = ([0, 0, 0, 0], port).into();
-
-    println!("Serving on http://{addr}  (static dir: {static_dir})");
-    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
-    Ok(())
-}
