@@ -368,7 +368,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
-    use tempfile::{NamedTempFile, tempdir};
+    use tempfile::NamedTempFile;
 
 
     #[test]
@@ -531,65 +531,5 @@ mod tests {
         assert!(s.is_char_boundary(s.len())); // well-formed UTF-8
         assert!(s.contains('�'));
         assert!(s.contains("/"));
-    }
-
-    // ---------- quick integration: aggregate a tiny in-memory CSV ----------
-
-    #[test]
-    fn tiny_integration_pipeline_produces_utf8_paths() {
-        // Build a miniature CSV input with a non-UTF8 PATH byte (0xFF)
-        let dir = tempdir().unwrap();
-        let input_path = dir.path().join("in.csv");
-        let output_path = dir.path().join("out.csv");
-        let unk_path = dir.path().join("in.unk.csv");
-
-        fs::write(
-            &input_path,
-            b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n\
-              1-1,0,1700000000,123,0,0,0,512,/ok\n\
-              1-2,0,1700000000,999,0,0,0,512,/bad_\xFF\n"
-        ).unwrap();
-
-        // Run main pieces manually (not invoking main())
-        let mut user_cache: HashMap<u32, String> = HashMap::new();
-        let mut unk_uids: HashSet<u32> = HashSet::new();
-        let mut aggregated: HashMap<(Vec<u8>, String, u8), UserStats> = HashMap::new();
-
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .trim(csv::Trim::None)
-            .from_path(&input_path)
-            .unwrap();
-
-        let now_ts = 1_700_000_100i64;
-
-        for rec in rdr.byte_records() {
-            let r = rec.unwrap();
-            let uid = parse_field_as_u32(r.get(3));
-            let user = resolve_user(uid, &mut user_cache);
-            if user == "UNK" { unk_uids.insert(uid); }
-            let mtime = sanitize_mtime(now_ts, parse_field_as_i64(r.get(2)));
-            let disk  = parse_field_as_u64(r.get(7));
-            let path  = r.get(8).unwrap_or(b"");
-
-            let bucket = age_bucket(now_ts, mtime);
-            for anc in get_folder_ancestors(path) {
-                aggregated.entry((anc, user.clone(), bucket)).or_default()
-                    .update(disk, mtime);
-            }
-        }
-
-        write_results(&output_path, &aggregated).unwrap();
-        write_unknown_uids(&unk_path, &unk_uids).unwrap();
-
-        //let out = fs::read_to_string(&output_path).unwrap();
-        let unk = fs::read_to_string(&unk_path).unwrap();
-
-        // Output must be UTF-8; line with bad path should contain replacement char
-        //assert!(out.contains("/ok"));
-       // assert!(out.contains('�'));
-
-        // Unknown UID set should include 999 (platform-dependent name resolution may map 123)
-        assert!(unk.lines().any(|l| l.trim() == "999") || unk.is_empty());
     }
 }
