@@ -18,7 +18,10 @@ const config = {
       strict: false
     }),
     // leave base empty since we’re serving at /
-    paths: { base: '' }
+    paths: { base: '' },
+    output: {
+       bundleStrategy: 'inline'
+    }
   },
 };
 
