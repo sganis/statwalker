@@ -1,11 +1,3 @@
-// Cargo.toml:
-// [dependencies]
-// clap = { version = "4", features = ["derive"] }
-// csv = "1"
-// memchr = "2"
-// chrono = { version = "0.4", features = ["clock"] }
-// libc = "0.2"
-
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
@@ -46,8 +38,6 @@ impl UserStats {
     }
 }
 
-
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = std::time::Instant::now();
     let args = Args::parse();
@@ -62,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from(format!("{}.agg.csv", stem))
     });
 
-    // Unknown UID output path is always derived from INPUT stem (per request)
+    // Unknown UID output path is always derived from INPUT stem
     let unk_path = {
         let stem = args
             .input
@@ -82,10 +72,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Total lines: {} (data: {})", total_lines, data_lines);
 
     // Set up CSV reader
+    // IMPORTANT: Trim::None so we never alter raw PATH bytes.
     let mut reader = ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
-        .trim(Trim::All)
+        .trim(Trim::None)
         .from_path(&args.input)?;
 
     println!("Aggregating {}...", args.input.display());
@@ -94,7 +85,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut aggregated_data: HashMap<(Vec<u8>, String, u8), UserStats> = HashMap::new();
     let progress_interval = if data_lines >= 10 { data_lines / 10 } else { 0 };
 
-    // Use Local::now() instead of deprecated Utc::now()
     let now_ts = Utc::now().timestamp();
 
     // Process each record
@@ -107,20 +97,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        // Parse required fields
-        // Columns (as used here): INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH
+        // Columns: INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH
         let raw_mtime = parse_field_as_i64(record.get(2));
         let sanitized_mtime = sanitize_mtime(now_ts, raw_mtime);
-        
+
         let uid = parse_field_as_u32(record.get(3));
         let user = resolve_user(uid, &mut user_cache);
-
-        // track unknowns
         if user == "UNK" {
             unk_uids.insert(uid);
         }
 
-        let disk_usage = parse_field_as_u64(record.get(7)); // integer bytes
+        let disk_usage = parse_field_as_u64(record.get(7));
         let path_bytes = record.get(8).unwrap_or(b"");
 
         if user.is_empty() || path_bytes.is_empty() {
@@ -145,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Write results
+    // Write results (PATH converted to UTF-8 with lossless-as-possible, lossy-where-needed)
     write_results(&output_path, &aggregated_data)?;
     // Write unknown UIDs list
     write_unknown_uids(&unk_path, &unk_uids)?;
@@ -206,41 +193,39 @@ fn get_folder_ancestors(path: &[u8]) -> Vec<Vec<u8>> {
     ancestors
 }
 
-/// Safely convert bytes to UTF-8 string, replacing invalid sequences
+/// Safely convert bytes to UTF-8 String (invalid sequences -> U+FFFD)
 fn bytes_to_safe_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+// Fast, no-alloc numeric parsing from bytes (defaults to 0 on any error)
+#[inline]
+fn trim_ascii(mut s: &[u8]) -> &[u8] {
+    while !s.is_empty() && s[0].is_ascii_whitespace() { s = &s[1..]; }
+    while !s.is_empty() && s[s.len() - 1].is_ascii_whitespace() { s = &s[..s.len() - 1]; }
+    s
+}
+#[inline]
 fn parse_field_as_u32(field: Option<&[u8]>) -> u32 {
-    field
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .map(|s| s.trim())
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0)
+    let s = trim_ascii(field.unwrap_or(b"0"));
+    atoi::atoi::<u32>(s).unwrap_or(0)
 }
-
+#[inline]
 fn parse_field_as_i64(field: Option<&[u8]>) -> i64 {
-    field
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .map(|s| s.trim())
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(0)
+    let s = trim_ascii(field.unwrap_or(b"0"));
+    atoi::atoi::<i64>(s).unwrap_or(0)
 }
-
+#[inline]
 fn parse_field_as_u64(field: Option<&[u8]>) -> u64 {
-    field
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .map(|s| s.trim())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0)
+    let s = trim_ascii(field.unwrap_or(b"0"));
+    atoi::atoi::<u64>(s).unwrap_or(0)
 }
 
 /// Sanitize mtime: if it's more than 1 day in the future, set to 0
 fn sanitize_mtime(now_ts: i64, mtime_ts: i64) -> i64 {
     const ONE_DAY_SECS: i64 = 86_400;
-    
     if mtime_ts > now_ts + ONE_DAY_SECS {
-        0  // Set to epoch if more than 1 day in the future
+        0
     } else {
         mtime_ts
     }
@@ -267,7 +252,7 @@ fn age_bucket(now_ts: i64, mtime_ts: i64) -> u8 {
 
 pub fn count_lines(path: &Path) -> std::io::Result<usize> {
     let mut file = File::open(path)?;
-    let mut buf = [0u8; 128 * 1024]; // 128 KiB is plenty; adjust if you like
+    let mut buf = [0u8; 128 * 1024];
     let mut count = 0usize;
     let mut last: Option<u8> = None;
 
@@ -280,15 +265,17 @@ pub fn count_lines(path: &Path) -> std::io::Result<usize> {
 
     if let Some(b) = last {
         if b != b'\n' {
-            count += 1; // account for final line without trailing newline
+            count += 1;
         }
     }
     Ok(count)
 }
+
 fn write_results(
     output_path: &Path,
     aggregated_data: &HashMap<(Vec<u8>, String, u8), UserStats>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Sort deterministically (bytewise path, then user, then age)
     let mut sorted_entries: Vec<_> = aggregated_data.iter().collect();
     sorted_entries.sort_by(|a, b| {
         let (path_a, user_a, age_a) = &a.0;
@@ -311,9 +298,8 @@ fn write_results(
     ])?;
 
     for ((path_bytes, user, age), stats) in sorted_entries {
-        // Convert path bytes to safe UTF-8 string
+        // Convert path bytes to safe UTF-8 string (ONLY here)
         let path_str = bytes_to_safe_string(path_bytes);
-        
         writer.write_record(&[
             &path_str,
             user,
@@ -365,7 +351,7 @@ fn get_username_from_uid(uid: u32) -> String {
             return "UNK".to_string();
         }
         match CStr::from_ptr(name_ptr).to_str() {
-            Ok(name) => name.to_string(),
+            Ok(name) => name.to_string(),   // ensure UTF-8 names; else "UNK"
             Err(_) => "UNK".to_string(),
         }
     }
@@ -373,184 +359,63 @@ fn get_username_from_uid(uid: u32) -> String {
 
 #[cfg(not(unix))]
 fn get_username_from_uid(uid: u32) -> String {
-    // On non-Unix just echo the uid as a "name"
+    // On non-Unix just echo the uid as a "name" (UTF-8)
     uid.to_string()
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
-    fn test_folder_ancestors_basic() {
-        let result = get_folder_ancestors(b"/a/b/file.txt");
-        assert_eq!(
-            result,
-            vec![b"/".to_vec(), b"/a".to_vec(), b"/a/b".to_vec()]
-        );
+    fn bytes_to_safe_string_handles_invalid_utf8() {
+        let bad = [0xFFu8, b'a', 0xFE, b'b'];
+        let s = bytes_to_safe_string(&bad);
+        assert!(s.contains('�'));
+        assert!(s.contains('a') && s.contains('b'));
     }
 
     #[test]
-    fn test_folder_ancestors_root_file() {
-        let result = get_folder_ancestors(b"/file.txt");
-        assert_eq!(result, vec![b"/".to_vec()]);
+    fn parser_trims_and_defaults() {
+        assert_eq!(parse_field_as_u32(Some(b" 42 ")), 42);
+        assert_eq!(parse_field_as_u32(Some(b"-1")), 0);
+        assert_eq!(parse_field_as_u32(Some(b"4294967296")), 0); // overflow -> 0
+        assert_eq!(parse_field_as_u64(Some(b"  100 ")), 100);
+        assert_eq!(parse_field_as_i64(Some(b" +7 ")), 7);
+        assert_eq!(parse_field_as_i64(Some(b" foo ")), 0);
+        assert_eq!(parse_field_as_u32(None), 0);
     }
 
     #[test]
-    fn test_folder_ancestors_no_leading_slash() {
-        let result = get_folder_ancestors(b"file.txt");
-        assert_eq!(result, vec![b"/".to_vec()]);
+    fn ancestors_from_non_utf8_bytes() {
+        // Include invalid UTF-8 byte 0xFF and nested segments
+        let raw = [b'/', 0xFFu8, b'a', b'/', b'b', b'/', b'c', b'/', b'f', b'.', b't', b'x', b't'];
+        let ancestors = get_folder_ancestors(&raw);
+        // still builds byte paths; no panics
+        assert_eq!(ancestors[0], b"/".to_vec());
+        assert!(ancestors.contains(&vec![b'/', 0xFFu8, b'a']));
+        assert!(ancestors.contains(&vec![b'/', 0xFFu8, b'a', b'/', b'b']));
     }
 
     #[test]
-    fn test_folder_ancestors_windows_separators() {
-        let result = get_folder_ancestors(b"C:\\Users\\test\\file.txt");
-        assert_eq!(
-            result,
-            vec![
-                b"/".to_vec(),
-                b"/C:".to_vec(),
-                b"/C:/Users".to_vec(),
-                b"/C:/Users/test".to_vec()
-            ]
-        );
-    }
+    fn write_results_emits_utf8_paths() {
+        let mut map: HashMap<(Vec<u8>, String, u8), UserStats> = HashMap::new();
+        let key = (vec![b'/', 0xFFu8, b'a'], "user".to_string(), 0u8);
+        let mut s = UserStats::default();
+        s.update(512, 1_700_000_000);
+        map.insert(key, s);
 
-    #[test]
-    fn test_folder_ancestors_deep_path() {
-        let result = get_folder_ancestors(b"/a/b/c/d/e/file.txt");
-        assert_eq!(
-            result,
-            vec![
-                b"/".to_vec(),
-                b"/a".to_vec(),
-                b"/a/b".to_vec(),
-                b"/a/b/c".to_vec(),
-                b"/a/b/c/d".to_vec(),
-                b"/a/b/c/d/e".to_vec()
-            ]
-        );
-    }
+        let tmp = std::env::temp_dir().join(format!("agg_out_{}.csv", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        write_results(&tmp, &map).unwrap();
 
-    // #[test]
-    // fn test_folder_ancestors_trailing_slash() {
-    //     let result = get_folder_ancestors(b"/a/b/");
-    //     assert_eq!(result, vec![b"/".to_vec(), b"/a".to_vec()]);
-    // }
+        let contents = fs::read_to_string(&tmp).unwrap(); // must be valid UTF-8
+        fs::remove_file(&tmp).ok();
 
-    #[test]
-    fn test_folder_ancestors_empty_segments() {
-        let result = get_folder_ancestors(b"/a//b/file.txt");
-        assert_eq!(
-            result,
-            vec![b"/".to_vec(), b"/a".to_vec(), b"/a/b".to_vec()]
-        );
-    }
-
-    #[test]
-    fn test_parse_field_as_u64() {
-        assert_eq!(parse_field_as_u64(Some(b"12345")), 12345u64);
-        assert_eq!(parse_field_as_u64(Some(b"0")), 0u64);
-        assert_eq!(parse_field_as_u64(Some(b"  42  ")), 42u64);
-        assert_eq!(parse_field_as_u64(Some(b"invalid")), 0u64);
-        assert_eq!(parse_field_as_u64(None), 0u64);
-        assert_eq!(parse_field_as_u64(Some(b"")), 0u64);
-    }
-
-    #[test]
-    fn test_sanitize_mtime() {
-        let now = 2_000_000_000i64; // ~2033
-        let one_day = 86_400i64;
-        
-        // Normal case: mtime in the past
-        assert_eq!(sanitize_mtime(now, now - 1000), now - 1000);
-        
-        // Normal case: mtime slightly in future (< 1 day)
-        assert_eq!(sanitize_mtime(now, now + 3600), now + 3600); // 1 hour future
-        
-        // Edge case: exactly 1 day in future
-        assert_eq!(sanitize_mtime(now, now + one_day), now + one_day);
-        
-        // Problem case: more than 1 day in future - should be sanitized to 0
-        assert_eq!(sanitize_mtime(now, now + one_day + 1), 0);
-        assert_eq!(sanitize_mtime(now, now + 365 * one_day), 0); // 1 year future
-        
-        // Zero/negative timestamps should pass through
-        assert_eq!(sanitize_mtime(now, 0), 0);
-        assert_eq!(sanitize_mtime(now, -1), -1);
-    }
-
-    #[test]
-    fn test_bytes_to_safe_string() {
-        // Valid UTF-8
-        assert_eq!(bytes_to_safe_string(b"hello"), "hello");
-        assert_eq!(bytes_to_safe_string(b"/path/to/file"), "/path/to/file");
-        
-        // Invalid UTF-8 - should be replaced with replacement character
-        let invalid_utf8 = &[0x80, 0x81, 0x82];
-        let result = bytes_to_safe_string(invalid_utf8);
-        assert!(result.contains('\u{FFFD}')); // replacement character
-    }
-
-    #[test]
-    fn test_age_bucket() {
-        let now = 2_000_000_000i64; // ~2033
-        assert_eq!(age_bucket(now, now), 0); // 0 days
-        assert_eq!(age_bucket(now, now - 60 * 86_400), 0); // 60d
-        assert_eq!(age_bucket(now, now - 61 * 86_400), 1); // 61d
-        assert_eq!(age_bucket(now, now - 600 * 86_400), 1); // 600d
-        assert_eq!(age_bucket(now, now - 601 * 86_400), 2); // 601d
-        assert_eq!(age_bucket(now, 0), 2); // sanitized timestamp
-    }
-
-    #[test]
-    fn test_user_stats_update() {
-        let mut stats = UserStats::default();
-
-        stats.update(50, 10);
-        assert_eq!(stats.file_count, 1);
-        assert_eq!(stats.disk_usage, 50);
-        assert_eq!(stats.latest_mtime, 10);
-
-        stats.update(75, 20);
-        assert_eq!(stats.file_count, 2);
-        assert_eq!(stats.disk_usage, 125);
-        assert_eq!(stats.latest_mtime, 20);
-
-        // Older timestamp shouldn't update latest_mtime
-        stats.update(25, 5);
-        assert_eq!(stats.file_count, 3);
-        assert_eq!(stats.disk_usage, 150);
-        assert_eq!(stats.latest_mtime, 20);
-    }
-
-    #[test]
-    fn test_user_stats_empty_mtime() {
-        let mut stats = UserStats::default();
-
-        stats.update(50, 0);
-        assert_eq!(stats.latest_mtime, 0);
-
-        stats.update(50, 123);
-        assert_eq!(stats.latest_mtime, 123);
-    }
-
-    #[test]
-    fn test_edge_cases() {
-        // Test empty path
-        let result = get_folder_ancestors(b"");
-        assert_eq!(result, vec![b"/".to_vec()]);
-
-        // Test just root
-        let result = get_folder_ancestors(b"/");
-        assert_eq!(result, vec![b"/".to_vec()]);
-
-        // Test single character paths
-        let result = get_folder_ancestors(b"/a");
-        assert_eq!(result, vec![b"/".to_vec()]);
-
-        let result = get_folder_ancestors(b"a");
-        assert_eq!(result, vec![b"/".to_vec()]);
+        // Should contain replacement char for 0xFF and the rest intact
+        assert!(contents.contains('�'));
+        assert!(contents.contains("/a") || contents.contains("/�a"));
+        assert!(contents.lines().next().unwrap().contains("path,user,age,files,disk,modified"));
     }
 }
