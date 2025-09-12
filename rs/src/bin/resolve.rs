@@ -54,52 +54,54 @@ fn main() -> Result<()> {
 
     // Caches
     let mut time_cache: HashMap<i64, String> = HashMap::new(); // TIMES
-    let mut user_cache: HashMap<u32, String> = HashMap::new(); // USERS
-    let mut group_cache: HashMap<u32, String> = HashMap::new(); // GROUPS
+    let mut user_cache: HashMap<i64, String> = HashMap::new(); // USERS
+    let mut group_cache: HashMap<i64, String> = HashMap::new(); // GROUPS
     let mut type_cache: HashMap<u32, String> = HashMap::new(); // TYPES
     let mut perm_cache: HashMap<u32, String> = HashMap::new(); // PERMS
 
-    for (idx, rec) in rdr.records().enumerate() {
+    let mut out_rec = csv::ByteRecord::new();
+
+    for (idx, rec) in rdr.byte_records().enumerate() {
         let line_no = idx + 2; // header + 1-based
         let r = rec.with_context(|| format!("reading csv record at line {}", line_no))?;
 
-        // IN: "INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH"
-        let inode = r.get(0).unwrap_or("").to_string();
-        let atime = parse_i64(r.get(1), "ATIME", line_no)?;
-        let mtime = parse_i64(r.get(2), "MTIME", line_no)?;
-        let uid = parse_u32(r.get(3), "UID", line_no)?;
-        let gid = parse_u32(r.get(4), "GID", line_no)?;
-        let mode_raw = parse_u32(r.get(5), "MODE", line_no)?;
-        let size_b = parse_u64(r.get(6), "SIZE", line_no)?;
-        let disk_b = parse_u64(r.get(7), "DISK", line_no)?;
-        let path_raw = r.get(8).unwrap_or("");
-        
-        // Unquote the path if it's already quoted (from input CSV)
-        let path = unquote_csv_field(path_raw);
+        // IN: b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH"
+        let inode_b = r.get(0).unwrap_or(b"");
+        let atime   = parse_i64_bytes(r.get(1), "ATIME", line_no)?;
+        let mtime   = parse_i64_bytes(r.get(2), "MTIME", line_no)?;
+        let uid     = parse_i64_bytes(r.get(3), "UID", line_no)?;
+        let gid     = parse_i64_bytes(r.get(4), "GID", line_no)?;
+        let mode    = parse_u32_bytes(r.get(5), "MODE", line_no)?;
+        let size  = r.get(6).unwrap_or(b"0");
+        let disk  = r.get(7).unwrap_or(b"0");
+        let path_b  = r.get(8).unwrap_or(b""); // raw bytes (may be non-UTF-8)
 
+        // Humanized fields (Strings)
         let accessed = fmt_day(atime, &mut time_cache);
         let modified = fmt_day(mtime, &mut time_cache);
+        let user     = resolve_user(uid,  &mut user_cache);
+        let group    = resolve_group(gid, &mut group_cache);
+        let ftype    = filetype_from_mode(mode, &mut type_cache);
+        let perm     = octal_perm(mode, &mut perm_cache);
 
-        let user = resolve_user(uid, &mut user_cache);
-        let group = resolve_group(gid, &mut group_cache);
+        // Convert PATH to UTF-8, ignoring errors (invalid bytes -> U+FFFD)
+        let path_utf8 = std::string::String::from_utf8_lossy(path_b); // Cow<str>
 
-        let ftype = filetype_from_mode(mode_raw, &mut type_cache);
-        let perm = octal_perm(mode_raw, &mut perm_cache);
+        // Build output record (mix of original bytes + our UTF-8 strings)
+        out_rec.clear();
+        out_rec.push_field(inode_b);
+        out_rec.push_field(accessed.as_bytes());
+        out_rec.push_field(modified.as_bytes());
+        out_rec.push_field(user.as_bytes());
+        out_rec.push_field(group.as_bytes());
+        out_rec.push_field(ftype.as_bytes());
+        out_rec.push_field(perm.as_bytes());
+        out_rec.push_field(size);
+        out_rec.push_field(disk);
+        out_rec.push_field(path_utf8.as_bytes()); // UTF-8 path only
 
-
-        wtr.write_record(&[
-            &inode,
-            &accessed,
-            &modified,
-            &user,
-            &group,
-            &ftype,
-            &perm,
-            &size_b.to_string(),
-            &disk_b.to_string(),
-            &path,
-        ])
-        .with_context(|| format!("writing output csv line {} (path: {})", line_no, path))?;
+        wtr.write_byte_record(&out_rec)
+            .with_context(|| format!("writing output csv line {} (path utf8)", line_no))?;
     }
 
     wtr.flush().context("flushing output csv")?;
@@ -108,38 +110,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-// Unquote CSV field if it's wrapped in quotes
-fn unquote_csv_field(field: &str) -> String {
-    let trimmed = field.trim();
-    
-    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        // Remove outer quotes and unescape inner quotes
-        let inner = &trimmed[1..trimmed.len()-1];
-        inner.replace("\"\"", "\"")
-    } else {
-        // Not quoted, return as-is
-        trimmed.to_string()
-    }
+fn parse_i64_bytes(b: Option<&[u8]>, field: &str, line: usize) -> Result<i64> {
+    let s = std::str::from_utf8(b.unwrap_or(b"0")).unwrap_or("0").trim();
+    s.parse::<i64>().with_context(|| format!("parsing {}='{}' at line {}", field, s, line))
+}
+fn parse_u32_bytes(b: Option<&[u8]>, field: &str, line: usize) -> Result<u32> {
+    let s = std::str::from_utf8(b.unwrap_or(b"0")).unwrap_or("0").trim();
+    s.parse::<u32>().with_context(|| format!("parsing {}='{}' at line {}", field, s, line))
 }
 
-// ---------- helpers ----------
-fn parse_i64(s: Option<&str>, field: &str, line: usize) -> Result<i64> {
-    let raw = s.unwrap_or("0").trim();
-    raw.parse::<i64>()
-        .with_context(|| format!("parsing field `{}`='{}' at line {}", field, raw, line))
-}
-
-fn parse_u32(s: Option<&str>, field: &str, line: usize) -> Result<u32> {
-    let raw = s.unwrap_or("0").trim();
-    raw.parse::<u32>()
-        .with_context(|| format!("parsing field `{}`='{}' at line {}", field, raw, line))
-}
-
-fn parse_u64(s: Option<&str>, field: &str, line: usize) -> Result<u64> {
-    let raw = s.unwrap_or("0").trim();
-    raw.parse::<u64>()
-        .with_context(|| format!("parsing field `{}`='{}' at line {}", field, raw, line))
-}
 
 fn fmt_day(ts: i64, cache: &mut HashMap<i64, String>) -> String {
     if let Some(s) = cache.get(&ts) {
@@ -164,7 +143,7 @@ fn _bytes_to_gb(b: u128) -> String {
     format!("{:.6}", gb)
 }
 
-fn resolve_user(uid: u32, cache: &mut HashMap<u32, String>) -> String {
+fn resolve_user(uid: i64, cache: &mut HashMap<i64, String>) -> String {
     if let Some(u) = cache.get(&uid) {
         return u.clone();
     }
@@ -173,7 +152,7 @@ fn resolve_user(uid: u32, cache: &mut HashMap<u32, String>) -> String {
     name
 }
 
-fn resolve_group(gid: u32, cache: &mut HashMap<u32, String>) -> String {
+fn resolve_group(gid: i64, cache: &mut HashMap<i64, String>) -> String {
     if let Some(g) = cache.get(&gid) {
         return g.clone();
     }
@@ -219,12 +198,12 @@ fn get_groupname_from_gid(gid: u32) -> String {
 }
 
 #[cfg(not(unix))]
-fn get_username_from_uid(uid: u32) -> String { 
+fn get_username_from_uid(uid: i64) -> String { 
     uid.to_string() 
 }
 
 #[cfg(not(unix))]
-fn get_groupname_from_gid(gid: u32) -> String { 
+fn get_groupname_from_gid(gid: i64) -> String { 
     gid.to_string() 
 }
 

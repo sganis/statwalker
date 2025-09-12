@@ -1,420 +1,282 @@
-# Statwalker: High-Performance Filesystem Scanner
-## A Technical White Paper on Architecture, Design, and Performance Optimizations
+Here’s a quick pass on what was missing or inconsistent, then the full, final white paper.
 
-**Version:** 2.0  
-**Date:** September 2025  
+## What I fixed/added versus your draft (at a glance)
+
+* **Actual constants**: Updated to match code (`FILE_CHUNK = 16384`, `FLUSH_BYTES = 8 MiB`, worker shard writer = 32 MiB, merge writer = 16 MiB).
+* **Concurrency wording**: It’s an **MPMC queue** (`crossbeam::channel`) with an **in-flight atomic** for termination—not true work-stealing.
+* **Directory rows**: Code **emits one CSV row per directory** (via `stat_row(&dir)`); added explicitly.
+* **Symlink semantics**: Uses `symlink_metadata` → **does not follow symlinks**; added.
+* **CSV schema details**: Clarified that **INODE = “dev-inode”** (two numbers separated by `-`), **timestamps are Unix seconds**, **DISK = blocks×512**; added.
+* **Windows specifics**: `dev/ino/uid/gid` are synthetic (`0`), **mode is approximated**, **blocks approximated as len/512**, **path normalization** strips verbatim prefixes; added.
+* **Path encoding/quoting**: On Unix we write **raw bytes** (even if not UTF-8). Smart quoting for commas/quotes/newlines with correct double-quote escaping; added.
+* **Sorting semantics**: `--sort` does a **full in-memory lexicographic sort of entire lines** (header already written once); added caution.
+* **Termination mechanics**: Dedicated thread broadcasts `Shutdown` when **in-flight hits 0**; rationale and safety notes added.
+* **Error reporting**: Code tracks **aggregate error count only** (not types); adjusted monitoring section accordingly.
+* **Output finalization**: Merge **writes directly to final file**; **no atomic temp-rename** currently (draft had claimed atomic rename) — corrected and suggested improvement.
+* **CLI defaults**: Threads default to `min(48, max(4, 2×CPU))`; skip is substring; root is canonicalized; output default naming rules per-OS; added.
+* **Tiny nits in code banners**: “Statlaker” vs “Statwalker” and “Processes” label—called out in appendix as known UX nits.
+
+---
+
+# Statwalker: High-Performance Filesystem Scanner
+
+## Architecture, Design, and Performance Techniques
+
+**Version:** 2.0
+**Date:** September 2025
 **Author:** SAG
 
 ---
 
 ## Executive Summary
 
-Statwalker is a high-performance filesystem scanning tool designed to rapidly traverse and catalog filesystem metadata across large directory structures. Built in Rust with a focus on concurrent processing and memory efficiency, Statwalker addresses the critical need for fast, reliable filesystem auditing in enterprise environments where traditional tools often fall short in terms of performance and scalability.
+Statwalker is a cross-platform, high-throughput filesystem scanner implemented in Rust. It traverses large directory trees, collects POSIX-like metadata for **both files and directories**, and streams it to a compact CSV with careful attention to throughput, memory stability, and cross-platform fidelity. The design uses a single **MPMC task queue**, batched work units, large buffered writers, zero-copy path handling on Unix, and platform-specific metadata extraction. Typical scenarios include compliance inventories, storage analytics, dedup/DFIR pre-staging, and cost governance.
 
-The tool achieves significant performance improvements over conventional filesystem scanners through advanced parallelization techniques, optimized memory management, and platform-specific optimizations while maintaining cross-platform compatibility and data integrity.
+---
 
-## 1. Introduction and Problem Statement
+## 1. Problem Context
 
-### 1.1 The Challenge
+Modern estates regularly exceed **tens of millions** of path entries across mixed media (NVMe, HDD, network mounts). Traditional tools often:
 
-Modern computing environments generate massive filesystem hierarchies containing millions of files. Traditional filesystem scanning tools suffer from several critical limitations:
+* Under-utilize cores with largely sequential traversal
+* Suffer syscall + synchronization overhead from per-entry writes
+* Inflate memory via eager buffering or string conversions
+* Produce platform-inconsistent metadata
 
-- **Sequential Processing**: Most scanners process directories sequentially, underutilizing modern multi-core processors
-- **Memory Inefficiency**: Poor memory management leads to excessive allocation overhead and cache misses
-- **I/O Bottlenecks**: Inadequate buffering and batching strategies result in suboptimal disk utilization
-- **Scalability Issues**: Performance degrades significantly with large datasets
-- **Platform Inconsistency**: Cross-platform tools often sacrifice performance for compatibility
+Statwalker addresses those limits with **batched directory processing**, **streamed CSV emission**, and low-allocation hot paths.
 
-### 1.2 Business Requirements
+---
 
-Enterprise environments require filesystem scanning tools that can:
+## 2. System Overview
 
-- Process millions of files in minutes rather than hours
-- Generate comprehensive metadata reports for compliance and auditing
-- Operate efficiently across different operating systems and storage types
-- Minimize system resource consumption during scanning operations
-- Provide reliable, consistent output formats for downstream processing
+### 2.1 Data Model (CSV)
 
-## 2. Architecture and Design Philosophy
+A single header precedes rows. **Directories and files both appear as rows.**
 
-### 2.1 Core Design Principles
-
-Statwalker's architecture is built upon four fundamental principles:
-
-1. **Parallelism First**: Leverage all available CPU cores through work-stealing concurrency
-2. **Memory Efficiency**: Minimize allocations and maximize cache locality
-3. **Batched Processing**: Group operations to reduce syscall and synchronization overhead
-4. **Stream Processing**: Process data in streams to maintain constant memory usage regardless of dataset size
-
-### 2.2 High-Level Architecture
-
-```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Main Thread   │────│  Work Queue      │────│  Worker Threads │
-│   - Argument    │    │  - Task dispatch │    │  - Dir scanning │
-│     parsing     │    │  - Load balancing│    │  - File stating │
-│   - Output mgmt │    │  - Coordination  │    │  - CSV writing  │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-         │                       │                       │
-         │              ┌────────▼────────┐             │
-         │              │ Inflight Counter│             │
-         │              │ (Atomic)        │             │
-         │              └─────────────────┘             │
-         │                                              │
-         ▼                                              ▼
-┌─────────────────┐                           ┌─────────────────┐
-│ Output Merging  │                           │ Shard Files     │
-│ - Shard collect │                           │ - Thread-local  │
-│ - Sorting (opt) │                           │ - Buffered I/O  │
-│ - Final CSV     │                           │ - CSV format    │
-└─────────────────┘                           └─────────────────┘
-```
-
-### 2.3 Concurrency Model
-
-Statwalker employs a **producer-consumer** pattern with **work-stealing** characteristics:
-
-- **Task Types**: Directory traversal and file batch processing tasks
-- **Work Distribution**: Lock-free queue using `crossbeam::channel`
-- **Load Balancing**: Dynamic work distribution prevents thread starvation
-- **Coordination**: Atomic reference counting for inflight work tracking
-
-## 3. Technical Implementation
-
-### 3.1 Data Structures and Task Model
-
-#### Task Enumeration
-```rust
-enum Task {
-    Dir(PathBuf),                    // Directory to traverse
-    Files { 
-        base: Arc<PathBuf>, 
-        names: Vec<OsString> 
-    },                               // Batch of files to process
-    Shutdown,                        // Termination signal
-}
-```
-
-#### Metadata Row Structure
-The tool captures comprehensive filesystem metadata:
-- **INODE**: Device ID and inode number combination
-- **Timestamps**: Access time (atime) and modification time (mtime)
-- **Ownership**: User ID (uid) and group ID (gid)
-- **Permissions**: File mode bits
-- **Size Information**: File size and disk blocks used
-- **Path**: Full filesystem path with smart CSV escaping
-
-### 3.2 Worker Thread Architecture
-
-Each worker thread operates in a continuous loop:
-
-1. **Task Acquisition**: Receive tasks from the shared queue
-2. **Processing**: Execute directory traversal or file metadata extraction
-3. **Output Generation**: Write CSV data to thread-local shard files
-4. **Work Generation**: Create new tasks for discovered subdirectories
-5. **Coordination**: Update inflight counters for termination detection
-
-### 3.3 Memory Management Strategy
-
-#### Buffer Management
-- **Large Pre-allocated Buffers**: 16-32MB buffers reduce allocation frequency
-- **Thread-local Storage**: Per-thread buffers eliminate lock contention
-- **Batch Flushing**: Write operations triggered by buffer thresholds rather than per-file
-
-#### String and Number Formatting
-- **Thread-local Number Formatters**: Reusable `itoa::Buffer` instances
-- **Smart CSV Quoting**: Conditional quoting reduces output size and processing time
-- **Platform-optimized Path Handling**: Direct byte manipulation on Unix systems
-
-### 3.4 Cross-Platform Compatibility
-
-#### Unix Systems (Linux, macOS, BSD)
-- Direct access to POSIX metadata via `std::os::unix::fs::MetadataExt`
-- Efficient byte-level path processing using `OsStrExt`
-- Native inode and device ID support
-
-#### Windows Systems
-- Emulated Unix-style metadata using Windows file attributes
-- Path normalization to handle verbatim prefixes (`\\?\`)
-- Timestamp conversion from Windows `FILETIME` to Unix epochs
-- Approximate block calculation for disk usage reporting
-
-#### Fallback Implementation
-- Generic metadata extraction for unsupported platforms
-- Graceful degradation with zero values for unavailable fields
-
-## 4. Performance Optimizations
-
-### 4.1 Algorithmic Optimizations
-
-#### Work Batching
-Files within directories are processed in batches rather than individually:
-```rust
-const FILE_CHUNK: usize = 8192;  // Files per batch
-```
-
-**Benefits**:
-- Reduced task queue operations (8192:1 ratio)
-- Better CPU cache utilization
-- Lower synchronization overhead
-
-#### Directory-First Processing
-Directories are processed immediately while files are batched:
-- Enables early parallelization of deep directory structures
-- Maintains work queue saturation
-- Reduces memory pressure from large flat directories
-
-### 4.2 I/O Optimizations
-
-#### Buffered Writing Strategy
-```rust
-const FLUSH_BYTES: usize = 4 * 1024 * 1024;  // 4MB flush threshold
-const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2MB read buffer
-```
-
-**Multi-level Buffering**:
-1. **Application Level**: In-memory CSV assembly
-2. **Writer Level**: `BufWriter` with large capacity
-3. **OS Level**: Leverage OS page cache
-
-#### Shard-based Output
-- Each worker writes to separate temporary files
-- Final merge operation combines shards
-- Eliminates lock contention during intensive writing phases
-
-### 4.3 CPU Optimizations
-
-#### Thread Pool Sizing
-```rust
-let threads = (num_cpus::get() * 2).max(4).min(48);
-```
-
-**Rationale**:
-- 2x CPU cores optimal for I/O-bound workloads
-- Minimum 4 threads ensures parallelization on low-core systems
-- Maximum 48 threads prevents excessive context switching
-
-#### Hot Path Optimizations
-- `#[inline]` attributes on frequently called functions
-- Thread-local static data to avoid repeated allocations
-- Conditional compilation for platform-specific optimizations
-
-### 4.4 Memory Optimizations
-
-#### Allocation Reduction
-- Pre-allocated vectors with generous capacity
-- Reuse of formatters and buffers
-- Smart string handling with minimal conversions
-
-#### Cache Efficiency
-- Sequential access patterns where possible
-- Batch processing improves spatial locality
-- Reduced pointer chasing through direct data structures
-
-## 5. Performance Analysis
-
-### 5.1 Benchmarking Methodology
-
-Performance testing conducted on:
-- **Hardware**: 16-core Intel Xeon, 64GB RAM, NVMe SSD
-- **Test Dataset**: 2.5M files across 180K directories
-- **Comparison**: GNU `find`, `fd-find`, and custom implementations
-
-### 5.2 Performance Results
-
-| Tool | Time (seconds) | Files/sec | Memory (GB) | CPU Usage |
-|------|----------------|-----------|-------------|-----------|
-| GNU find | 847 | 2,951 | 0.1 | 12% |
-| fd-find | 156 | 16,025 | 0.3 | 85% |
-| **Statwalker** | **68** | **36,764** | **0.8** | **92%** |
-
-### 5.3 Scalability Analysis
-
-Statwalker demonstrates excellent scalability characteristics:
-
-- **Linear scaling** up to available CPU cores
-- **Constant memory usage** regardless of dataset size (streaming architecture)
-- **Minimal performance degradation** with deep directory hierarchies
-- **Efficient handling** of mixed workloads (many small files vs. few large directories)
-
-### 5.4 Resource Utilization
-
-#### CPU Utilization
-- Achieves 92% CPU utilization across all cores
-- Minimal idle time through effective work distribution
-- Low context switching overhead
-
-#### Memory Footprint
-- Constant memory usage (~800MB regardless of dataset size)
-- No memory leaks or unbounded growth
-- Efficient buffer reuse patterns
-
-#### I/O Characteristics
-- High sequential read throughput
-- Minimal random access patterns
-- Effective OS page cache utilization
-
-## 6. Advanced Features and Configurations
-
-### 6.1 Filtering and Selection
-
-#### Path-based Filtering
-```bash
-statwalker --skip "node_modules" /project/root
-```
-Substring-based filtering enables skipping of known irrelevant directories.
-
-#### Output Format Control
-The tool generates CSV output with the following schema:
 ```
 INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH
 ```
 
-### 6.2 Sorting and Post-processing
+* **INODE**: `"<dev>-<ino>"` (two unsigned integers joined by `-`).
 
-#### Optional Sorting
-```bash
-statwalker --sort /data/directory
+  * On Windows: `0-0` (no native ino/dev without extra APIs).
+* **ATIME**, **MTIME**: Unix epoch seconds (`i64`).
+
+  * Windows: converted from `SystemTime` to seconds.
+* **UID**, **GID**: On Unix from `MetadataExt`; on Windows `0,0` (SIDs not mapped).
+* **MODE**: POSIX style `u32`.
+
+  * Unix: direct from `MetadataExt`.
+  * Windows: **approximated** from attributes and extension heuristics.
+* **SIZE**: File length in bytes; for directories this is whatever the platform returns.
+* **DISK**: **blocks × 512**.
+
+  * Unix: from `st_blocks`.
+  * Windows: **approximate** as `(len + 511)/512`.
+* **PATH**: Full path; smart CSV quoting as needed (see §3.4).
+
+### 2.2 Concurrency Topology
+
 ```
-In-memory sorting for small to medium datasets (testing and comparison purposes).
-
-#### Streaming Output
-Default streaming mode maintains constant memory usage for production deployments.
-
-### 6.3 Threading Configuration
-
-#### Automatic Thread Scaling
-Default: `2 × CPU_CORES` (min: 4, max: 48)
-
-#### Manual Override
-```bash
-statwalker --threads 24 /large/dataset
+Main -> (seed Task::Dir) ─┐
+                          ├── crossbeam::channel (MPMC)
+Workers x N  <────────────┘
+   ├─ process Task::Dir: emit row, enumerate, enqueue new Tasks
+   ├─ process Task::Files: batch-stat names, append CSV rows
+   └─ write to per-thread shard buffers/files
 ```
 
-## 7. Security and Reliability Considerations
+* **Queue**: `crossbeam::channel` MPMC (multi-producer, multi-consumer).
+* **In-flight counter**: `AtomicUsize` tracks outstanding tasks. A lightweight
+  sentinel thread watches it and **broadcasts `Shutdown`** when it reaches **0**.
+* **No work-stealing deques**: balancing is achieved via the shared MPMC queue.
 
-### 7.1 Error Handling Strategy
+### 2.3 Termination Mechanics
 
-#### Graceful Degradation
-- Individual file/directory errors don't halt processing
-- Comprehensive error counting and reporting
-- Continued processing despite permission denials
+* Every time a task is **created**, in-flight is incremented **before** `send()`.
+* A worker **decrements** in-flight after fully handling a task.
+* When in-flight becomes **0**, the sentinel sends **N** `Shutdown` messages (N = worker threads).
+  Because in-flight includes tasks enqueued but not yet processed, reaching 0 implies the queue is empty (save benign races around send ordering).
 
-#### Resource Protection
-- Bounded memory usage prevents OOM conditions
-- Thread count limits prevent resource exhaustion
-- Automatic cleanup of temporary files
+---
 
-### 7.2 Data Integrity
+## 3. Implementation Details
 
-#### Atomic Operations
-- Shard files written atomically
-- Final output generated through atomic rename operations
-- No partial or corrupted output files
+### 3.1 Batching & Flush Strategy
 
-#### Metadata Accuracy
-- Direct syscall usage for maximum accuracy
-- Platform-specific optimizations maintain data fidelity
-- Consistent timestamp and size reporting
+* **Directory pagination**: file names are accumulated into pages of
+  `FILE_CHUNK = 16384`, then sent as a single `Task::Files` batch.
+* **Shard writers per worker**: `BufWriter` with **32 MiB** buffer.
+* **Flush threshold** inside workers: `FLUSH_BYTES = 8 MiB` of formatted CSV in a staging `Vec<u8>`.
+* **Merge writer**: `BufWriter` with **16 MiB** buffer for final CSV.
 
-## 8. Deployment and Operations
+### 3.2 Memory Efficiency
 
-### 8.1 System Requirements
+* Hot-path numeric formatting via thread-local `itoa::Buffer` (no allocation).
+* Pre-reserved staging buffers to minimize `Vec` growth.
+* On Unix, paths are handled as **raw bytes** (no UTF-8 validation/conversion).
+* On Windows, paths are normalized (strip `\\?\` / `\\?\UNC\`) **only for display/CSV**.
 
-#### Minimum Requirements
-- 2 CPU cores
-- 1GB available RAM
-- Modern operating system (Linux 3.10+, Windows 10+, macOS 10.14+)
+### 3.3 Platform Semantics
 
-#### Recommended Configuration
-- 8+ CPU cores for optimal performance
-- 4GB+ available RAM for large datasets
-- NVMe/SSD storage for best I/O performance
+**Unix (Linux/macOS/BSD)**
 
-### 8.2 Deployment Patterns
+* `symlink_metadata` is used: **symlinks are not followed** (entries describe the link object).
+* `dev/ino/mode/uid/gid/blocks/size/atime/mtime` from `MetadataExt`.
+* **Encoding**: `PATH` writes **raw bytes**; non-UTF-8 is preserved.
 
-#### Single-Server Deployment
-Direct execution on target systems for local filesystem scanning.
+**Windows (NTFS/FAT/exFAT)**
 
-#### Distributed Scanning
-Multiple instances can process different filesystem subtrees for massive parallel processing.
+* `dev/ino/uid/gid` are `0` (not resolved).
+* `mode` is synthesized:
 
-#### Containerized Deployment
-Docker containers for consistent deployment across environments.
+  * set dir/file bits (`040000`/`100000`), copy owner perms to group/other;
+  * set owner read; set owner write unless read-only; set exec for known extensions (`exe`, `bat`, etc.); dirs get exec.
+* `blocks` approximated as `(len + 511)/512` (not cluster-accurate).
+* Timestamps converted to Unix seconds.
+* Verbose prefixes removed for CSV readability.
 
-### 8.3 Monitoring and Observability
+**Fallback**
 
-#### Runtime Statistics
-- Real-time file processing rate
-- Error counts and types
-- Resource utilization metrics
-- Estimated completion time
+* For unsupported targets, provide best-effort fields (often zeros).
 
-#### Output Validation
-- CSV format compliance
-- Record count verification
-- Metadata consistency checks
+### 3.4 CSV Path Quoting & Escaping
 
-## 9. Future Enhancements
+* **Quote only if needed** (`,`, `"`, `\n`, `\r` present).
+* Inside quotes, `"` is doubled per RFC4180.
+* On Unix, quoting operates on **bytes**; on Windows, on UTF-16-to-UTF-8 lossless strings (via `to_string_lossy` if needed).
 
-### 9.1 Planned Features
+### 3.5 Sorting Mode
 
-#### Network Filesystem Support
-- Optimized handling of NFS, CIFS, and other network filesystems
-- Adaptive strategies for high-latency environments
-- Fault tolerance for network interruptions
+* `--sort` buffers **all** data lines (not header), then performs a **byte-wise lexicographic** sort of entire lines.
+  Useful for testing or deterministic diffs; **not recommended** for huge scans due to memory.
 
-#### Advanced Filtering
-- Regular expression support for path filtering
-- File type and size-based filtering
-- Date range filtering for focused scans
+---
 
-#### Output Formats
-- JSON output support
-- Parquet format for analytics pipelines
-- Direct database integration
+## 4. CLI, Defaults, and Behaviors
 
-### 9.2 Performance Improvements
+```
+USAGE:
+  statwalker [OPTIONS] [root]
 
-#### SIMD Optimizations
-- Vectorized string processing for path manipulation
-- Parallel CSV formatting operations
+ARGS:
+  root              Root folder (default: "."; canonicalized before scanning)
 
-#### GPU Acceleration
-- CUDA-based metadata processing for specialized workloads
-- GPU-accelerated sorting and filtering
+OPTIONS:
+  -o, --output FILE Output CSV path (default: "<canonical-root>.csv" in CWD)
+  -t, --threads N   Worker threads (default: min(48, max(4, 2×CPU)))
+      --sort        Sort lines in-memory (expensive for large outputs)
+      --skip SUBSTR Skip any directory whose full path contains SUBSTR
+```
 
-#### Advanced Caching
-- Intelligent metadata caching for repeated scans
-- Change detection for incremental updates
+* **Root canonicalization**: Converts inputs like `../some/folder` into absolute paths and uses that everywhere (scan + output naming).
+* **Output default naming**:
 
-## 10. Conclusion
+  * **Windows**: strip verbatim + drive colon; replace `\` with `-`.
+  * **Unix**: strip leading `/`; replace `/` with `-`.
+* **Rows include directories**: A directory is emitted **before** its contents are paged.
 
-Statwalker represents a significant advancement in filesystem scanning technology, delivering enterprise-grade performance through careful architectural design and aggressive optimization. The tool's combination of parallel processing, efficient memory management, and platform-specific optimizations enables processing speeds that exceed traditional tools by an order of magnitude.
+---
 
-The implementation demonstrates that systems programming in Rust can achieve both safety and performance, providing a foundation for reliable, high-performance infrastructure tools. As filesystem sizes continue to grow and compliance requirements become more stringent, tools like Statwalker become essential components of modern IT infrastructure.
+## 5. Reliability & Safety
 
-The project's success validates the architectural decisions around work-stealing concurrency, streaming processing, and optimization for modern hardware characteristics. These techniques and patterns can be applied to other high-performance systems software to achieve similar performance improvements.
+* **Graceful error handling**: Individual metadata or read-dir errors are **counted**, scanning continues.
+* **Aggregate error counter**: Reported at the end (no per-type breakdown).
+* **Temporary shards**: Each worker writes `shard_<tid>.csv.tmp`; shards are removed after merge.
+* **Finalization**: The merge currently writes **directly to the target file** and flushes.
+  *Enhancement recommended*: write to a temp file and **atomic rename** for crash-safe finalization.
+* **Back-pressure**: Batching reduces queue churn; buffers and `FLUSH_BYTES` limit fsync pressure.
 
-## Appendix A: Technical Specifications
+---
 
-### A.1 Compilation Targets
-- x86_64-unknown-linux-gnu
-- x86_64-pc-windows-msvc
-- x86_64-apple-darwin
-- aarch64-apple-darwin
+## 6. Performance Techniques
 
-### A.2 Dependencies
+* **Large batches (16k names)** collapse queue traffic and amortize syscalls.
+* **Layered buffering** (staging `Vec<u8>` → `BufWriter` → OS page cache).
+* **Minimal string churn**: path bytes on Unix; lossy conversions avoided on hot path.
+* **Atomic in-flight counter** eliminates joins/polls across all workers.
+
+**Thread count heuristic**: `min(48, max(4, 2×CPU))` is tuned for I/O-bound scans; override for specialized media (e.g., high-latency network mounts may prefer fewer threads).
+
+---
+
+## 7. Example Benchmarking (Methodology & Reference)
+
+> Results vary by media, directory shape, and security tooling. The following rubric enables reproducible comparisons.
+
+**Methodology**
+
+* Pin CPU governor to “performance” (Linux) / High Performance (Windows).
+* Warm up OS caches once (optional), then run **cold** and **warm** tests.
+* Collect: elapsed wall-time, files counted, errors, CSV bytes written, average files/sec.
+
+**Reference Environment (illustrative)**
+
+* 16-core workstation, 64 GB RAM, single NVMe SSD
+* Dataset: \~2.5 M entries across \~180 k directories, mixed small/large files
+
+| Tool           | Time (s) | Files/sec | RSS (GB) | Notes                   |
+| -------------- | -------: | --------: | -------: | ----------------------- |
+| GNU `find`     |      847 |     2,950 |      0.1 | single-threaded         |
+| `fd`           |      156 |    16,000 |      0.3 | multi-threaded          |
+| **Statwalker** |       68 |    36,700 |      0.8 | stream + batch + shards |
+
+*Your numbers will differ; keep the rubric consistent for fair comparisons.*
+
+---
+
+## 8. Operational Guidance
+
+* **Local disks**: default threads are fine; consider `--threads` up to the heuristic cap for NVMe.
+* **Spinning disks**: fewer threads can reduce seeking contention.
+* **Network filesystems**: try lower threads; consider `--skip` for known heavy trees (e.g., caches, `node_modules`).
+* **Security tools**: real-time scanning may dominate; whitelist the scan roots and shard files if policy allows.
+
+---
+
+## 9. Extensibility Roadmap
+
+* **Output formats**: JSON/Parquet; direct writers to object storage; optional compression (zstd).
+* **Filters**: size/type/date/regex; include/exclude lists; max depth.
+* **Metadata**: ctime/btime where available; DOS attributes; file IDs/inodes on Windows via Win32 API.
+* **Correct disk usage**: blocks at true cluster size on Windows via `GetDiskFreeSpace`.
+* **Crash-safety**: temp file + atomic rename; periodic checkpoints.
+
+---
+
+## 10. Limitations (current)
+
+* **Windows fidelity**: uid/gid and inode/device not populated; `mode` is heuristic.
+* **DISK on Windows**: approximate, not cluster-accurate.
+* **Sorting mode**: O(total CSV) memory; intended for small/medium test runs.
+* **No progress callback**: final-only summary (elapsed, totals); no real-time rate reporting.
+* **No symlink target stats**: entries describe symlinks themselves (by design).
+
+---
+
+## 11. Security & Privacy
+
+* **Read-only access**: scanner never modifies data in trees being scanned.
+* **Least privileges**: results depend on the permissions of the process user.
+* **PII**: paths may contain sensitive names; protect CSV outputs at rest and in transit.
+
+---
+
+## 12. Build & Config
+
+### 12.1 Dependencies
+
 ```toml
 [dependencies]
-clap = { version = "4.0", features = ["color"] }
-colored = "2.0"
+clap = { version = "4", features = ["color"] }
+colored = "2"
 crossbeam = "0.8"
-itoa = "1.0"
-num_cpus = "1.0"
+itoa = "1"
+num_cpus = "1"
 ```
 
-### A.3 Build Configuration
+### 12.2 Release profile
+
 ```toml
 [profile.release]
 lto = true
@@ -423,33 +285,76 @@ panic = "abort"
 opt-level = 3
 ```
 
-## Appendix B: Performance Tuning Guide
+### 12.3 Targets
 
-### B.1 Hardware Optimization
-- NVMe SSDs provide 3-5x performance improvement over traditional drives
-- Higher core count systems scale linearly up to ~32 cores
-- Memory bandwidth more important than capacity for most workloads
-
-### B.2 Operating System Tuning
-#### Linux
-```bash
-# Increase file descriptor limits
-ulimit -n 65536
-
-# Optimize I/O scheduler
-echo mq-deadline > /sys/block/nvme0n1/queue/scheduler
-```
-
-#### Windows
-- Enable "High Performance" power profile
-- Disable Windows Defender real-time scanning for scan directories
-- Use NTFS for best metadata performance
-
-### B.3 Filesystem Recommendations
-- ext4 with `dir_index` option on Linux
-- APFS on macOS for optimal performance
-- NTFS on Windows with cluster size optimization
+* x86\_64-unknown-linux-gnu
+* x86\_64-pc-windows-msvc
+* x86\_64-apple-darwin
+* aarch64-apple-darwin
 
 ---
 
-*This white paper is a living document and will be updated as Statwalker evolves and new optimizations are discovered.*
+## 13. Usage Examples
+
+```bash
+# Default scan of current directory, CSV named after canonical root
+statwalker
+
+# Scan a project and skip vendor cache
+statwalker --skip ".cache" --skip "node_modules" /projects/acme
+
+# Force 24 threads and produce a deterministic, sorted CSV (testing only)
+statwalker -t 24 --sort /data
+```
+
+---
+
+## 14. Output Validation Checklist
+
+* Header present exactly once.
+* Every row has **9** comma-separated fields.
+* Paths containing commas/quotes/newlines are properly **quoted** and **escaped**.
+* Final line ends with `\n` (important for some CSV consumers).
+* **Total rows = files + directories processed** (compare to a baseline if needed).
+
+---
+
+## Appendix A – Notable Code Points
+
+* **Banners**: Minor cosmetic typo (“Statlaker”) and “Processes” label for thread count—pure UX; no runtime impact.
+* **Shutdown loop sleep**: 10 ms; a lower value increases wakeups without measurable benefit in typical runs.
+* **Unix path encoding**: raw bytes output is intentional to preserve non-UTF-8 paths; CSV consumers must handle arbitrary bytes in `PATH`.
+
+---
+
+## Appendix B – Repro Scripts
+
+**Linux (bash)**
+
+```bash
+set -euo pipefail
+ROOT=/data/huge
+/usr/bin/time -v ./statwalker --threads 32 "$ROOT" -o out.csv
+wc -l out.csv
+```
+
+**Windows (PowerShell)**
+
+```powershell
+$root = "D:\Data"
+Measure-Command { .\statwalker.exe --threads 32 $root -o out.csv } | Format-List
+(Get-Content out.csv).Count
+```
+
+---
+
+## Appendix C – Future Testing Ideas
+
+* Synthetic “wide” vs “deep” trees to stress queue depth and batching.
+* Adversarial names (commas, quotes, newlines, non-UTF-8, long paths).
+* Mixed permissions/ACL landscapes to validate error counting stability.
+
+---
+
+**Conclusion**
+Statwalker focuses on the fundamentals that matter at scale: **batched traversal**, **streamed emission**, and **platform-aware metadata**. The current architecture provides dependable throughput with bounded memory and clear operational semantics, while leaving room for fidelity improvements (Windows) and production-hardening (atomic finalization, richer filters, alternative outputs).
