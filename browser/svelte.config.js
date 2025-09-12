@@ -11,8 +11,8 @@ const config = {
   kit: {
     adapter: adapter({
       // write directly into backend app
-      // pages: '../public',
-      // assets: '../public',
+      pages: 'public',
+      assets: 'public',
       fallback: 'index.html',   // SPA fallback
       precompress: false,
       strict: false

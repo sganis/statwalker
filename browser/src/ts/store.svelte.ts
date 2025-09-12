@@ -9,6 +9,7 @@ const localState = localStorage.getItem("state");
 const appState = localState ? JSON.parse(localState) : initialState;
 
 export const State = $state({
+  message: 'Path copied!',
   username: appState.username,
   token: appState.token,
   profile: appState.profile,

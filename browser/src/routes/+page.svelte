@@ -1,8 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { getParent, humanTime, humanCount, formatBytes, COLORS } from "../ts/util";
+  import { 
+    getParent, humanTime, humanCount, 
+    formatBytes, COLORS,
+  } from "../ts/util";
   import { api } from "../ts/api.svelte";
-  import { API_URL } from "../ts/store.svelte";
+  import { API_URL, State } from "../ts/store.svelte";
   import Svelecte, { addRenderer } from 'svelecte';
 
   //#region state
@@ -24,7 +27,7 @@
   let userColors = $state(new Map<string, string>()); // cache: username -> color
   let userDropdown = $state<{user:string;color:string}[]>([]);
   let pathInput = $state();
-  let path = $state('/');
+  let path = $state('/home/san/dev/statwalker/rs/src/bin');
   let fullPath = $state('');
   let isEditing = $state(false);
 
@@ -229,6 +232,7 @@
   }
 
   function showTip(e: MouseEvent, userData: UserStatsJson, percent: number) {
+    cancelHide(); // keep it open while interacting
     const { x, y } = clampToViewport(e.clientX, e.clientY);
     tip = {
       show: true,
@@ -241,11 +245,31 @@
   }
   function moveTip(e: MouseEvent) {
     if (!tip.show) return;
+    cancelHide(); // moving over the target keeps it alive
     const { x, y } = clampToViewport(e.clientX, e.clientY);
     tip = { ...tip, x, y };
   }
   function hideTip() {
+    cancelHide();
     tip = { show: false, x: 0, y: 0 };
+  }
+
+  const HIDE_DELAY = 1200; // ms — tweak to taste
+  let hideTimer: number | null = $state(null);
+
+  function scheduleHide(ms = HIDE_DELAY) {
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = window.setTimeout(() => {
+      tip = { show: false, x: 0, y: 0 };
+      hideTimer = null;
+    }, ms);
+  }
+
+  function cancelHide() {
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = null;
+    }
   }
   //#endregion
 
@@ -319,7 +343,7 @@
     return Number.isFinite(n) ? n : 0;
   }
   // ---------- Sorting (Folders) ----------
-  const sortedfolders = $derived.by(() => {
+  const sortedFolders = $derived.by(() => {
     const key = sortBy;
     const arr = folders ? [...folders] : [];
     return arr.sort((a: any, b: any) => {
@@ -426,14 +450,15 @@
   function sortedUserEntries(file: FileItem) {
     return Object.entries(file?.users ?? {}).sort(([, a], [, b]) => userMetricFor(a) - userMetricFor(b));
   }
-  // Build an aggregate "file" for the current path: sums of all visible children (bytes)
-  function aggregatePathTotals(foldersArr: FileItem[], p: string): FileItem {
+
+  function aggregatePathTotals(foldersArr: FileItem[], filesArr: ScannedFile[], p: string): FileItem {
     let total_count = 0;
     let total_disk = 0;
     let accessed = 0; 
     let modified = 0; 
     const aggUsers: Record<string, UserStatsJson> = {};
 
+    // Aggregate folders (existing logic)
     for (const f of foldersArr ?? []) {
       total_count += toNum(f?.total_count);
       total_disk  += toNum(f?.total_disk);
@@ -457,6 +482,30 @@
       }
     }
 
+    // Aggregate files (new logic)
+    for (const file of filesArr ?? []) {
+      total_count += 1;  // Each file counts as 1
+      total_disk += toNum(file?.size);
+      if (file.accessed > accessed) 
+        accessed = file.accessed;
+      if (file.modified > modified) 
+        modified = file.modified;
+      
+      // Aggregate user stats for this file
+      const owner = file.owner;
+      if (owner) {
+        const prev = aggUsers[owner] ?? { 
+          username: owner, count: 0, disk: 0, atime: 0, mtime: 0 };
+        aggUsers[owner] = {
+          username: owner,
+          count: prev.count + 1,
+          disk: prev.disk + toNum(file.size),
+          atime: Math.max(prev.atime, toNum(file.accessed)),
+          mtime: Math.max(prev.mtime, toNum(file.modified)),
+        };
+      }
+    }
+
     return {
       path: p,
       total_count,
@@ -466,7 +515,8 @@
       users: aggUsers,
     };
   }
-  const pathTotals = $derived.by(() => aggregatePathTotals(folders, path));
+
+  const pathTotals = $derived.by(() => aggregatePathTotals(folders, files, path));
   // ---------- Sorting (Files) ----------
   function fileMetricValue(f: ScannedFile) {
     switch (sortBy) {
@@ -585,7 +635,24 @@
   //#region keyboard
 
   //#endregion
-
+ 
+  function copyPath(event) {
+    const text = event.target.textContent;
+    
+    // Select text
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(event.target);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    
+    // Copy to clipboard
+    navigator.clipboard.writeText(text);
+    State.message = `Copied!: ${fullPath}`
+    setTimeout(() => {
+      State.message = ''
+    }, 1000);
+  }
 
   onMount(async () => {
     console.log("api url:", API_URL);
@@ -601,7 +668,7 @@
 </script>
 
 <div class="flex flex-col h-screen min-h-0 gap-2 p-2">
-  <div class="flex gap-2 items-center relative">
+  <div class="flex gap-2 items-center relative select-none">
     <button class="btn" onclick={goHome} title="Go to Root Folder" disabled={histIdx === 0 || fullPath === '/'}>
       <div class="flex items-center">
       <span class="material-symbols-outlined">home</span>
@@ -622,7 +689,11 @@
       <span class="material-symbols-outlined">arrow_upward</span>
       </div>
     </button>
-
+    <button class="btn" title="Go to..." disabled={getParent(path) === path}>
+      <div class="flex items-center">
+      <span class="material-symbols-outlined">arrow_forward</span>
+      </div>
+    </button>
     <!-- Sort dropdown -->
     <div class="relative" use:clickOutside={() => (sortOpen = false)}>
       <button class="btn w-36" onclick={() => (sortOpen = !sortOpen)}>
@@ -684,7 +755,7 @@
       class="z-20 min-w-40 h-10 border rounded border-gray-600 bg-gray-800 text-white"
     />
   </div>
-  <div class="flex">
+  <!-- <div class="flex">
     <input 
     bind:this={pathInput}
     bind:value={path} placeholder="Path..." 
@@ -693,17 +764,17 @@
     onblur={onPathBlur}
     onfocus={onPathFocus}
     disabled={loading} />
-  </div>
+  </div> -->
 
   <!-- Path total header item -->
-  <div>
+  <div class="">
     <div class="relative px-2 bg-gray-700 border border-gray-600 rounded overflow-hidden">
       <!-- Stacked bar for TOTAL of current path (full width) -->
       <div class="absolute left-0 top-0 bottom-0 flex z-0" style="width: 100%">
         {#each sortedUserEntries(pathTotals) as [uname, userData] (uname)}
-          {@const userMetric = sortBy === "disk" ? userData.disk : sortBy === "size" ? userData.size : userData.count}
+          {@const userMetric = sortBy === "disk" ? userData.disk : userData.count}
           {@const totalMetric =
-            sortBy === "disk" ? pathTotals.total_disk : sortBy === "size" ? pathTotals.total_size : pathTotals.total_count}
+            sortBy === "disk" ? pathTotals.total_disk :  pathTotals.total_count}
           {@const userPercent = totalMetric > 0 ? (userMetric / totalMetric) * 100 : 0}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
@@ -717,9 +788,11 @@
         {/each}
       </div>
       <!-- Foreground content -->
-      <div class="relative z-10 pointer-events-none">
+      <div class="relative z-10 p-1">
+        <!-- svelte-ignore a11y_interactive_supports_focus -->
+        <div class="" ondblclick={copyPath} role="textbox">{path}</div>
         <div class="flex items-center justify-end">
-          <p class="text-xs">
+          <p class="">
             {humanCount(pathTotals.total_count)} Files 
             • Changed {humanTime(pathTotals.modified)} 
             • {formatBytes(pathTotals.total_disk)}                  
@@ -769,19 +842,19 @@
   {:else}
     <div class="flex flex-col gap-2 overflow-y-auto transition-opacity duration-200 p-4">
       <!-- Folders -->
-      {#each sortedfolders as file}
+      {#each sortedFolders as folder}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           class="relative px-2 py-1 cursor-pointer hover:opacity-95 bg-gray-700 border border-gray-600 rounded-lg overflow-hidden min-h-16"
-          onclick={() => navigateTo(file.path)}
+          onclick={() => navigateTo(folder.path)}
         >
           <!-- Stacked bar background -->
-          <div class="absolute left-0 top-0 bottom-0 flex z-0" style="width: {pct(metricValue(file))}%">
-            {#each sortedUserEntries(file) as [uname, userData]}
-              {@const userMetric = sortBy === "disk" ? userData.disk : sortBy === "size" ? userData.size : userData.count}
+          <div class="absolute left-0 top-0 bottom-0 flex z-0" style="width: {pct(metricValue(folder))}%">
+            {#each sortedUserEntries(folder) as [uname, userData]}
+              {@const userMetric = sortBy === "disk" ? userData.disk : userData.count}
               {@const totalMetric =
-                sortBy === "disk" ? file.total_disk : sortBy === "size" ? file.total_size : file.total_count}
+                sortBy === "disk" ? folder.total_disk :folder.total_count}
               {@const userPercent = totalMetric > 0 ? (userMetric / totalMetric) * 100 : 0}
               <div
                 class="h-full transition-all duration-300 min-w-[0.5px] hover:opacity-90"
@@ -797,16 +870,16 @@
           <div class="flex flex-col gap-2 relative z-10 pointer-events-none">
             <div class="flex items-center justify-between gap-4">
               <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap">
-                <span>{file.path}</span>
+                <div>{folder.path}</div>
               </div>
-              <span class="text-nowrap font-bold">{rightValue(file)}</span>
+              <span class="text-nowrap font-bold">{rightValue(folder)}</span>
             </div>
             <div class="flex justify-end">
               <p class="text-sm">
-                {humanCount(file.total_count)} Files 
-                • Updated {humanTime(file.modified)} 
-                {#if humanTime(file.accessed) > humanTime(file.modified)}
-                • Last file read {humanTime(file.accessed)} 
+                {humanCount(folder.total_count)} Files 
+                • Updated {humanTime(folder.modified)} 
+                {#if humanTime(folder.accessed) > humanTime(folder.modified)}
+                • Last file read {humanTime(folder.accessed)} 
                 {/if}                      
               </p>
             </div>
@@ -824,13 +897,17 @@
             <div class="flex flex-col w-full">
               <div class="absolute left-0 top-0 bottom-0 z-0 opacity-60" style="width: {filePct(f)}%; background-color: {color};"></div>
               <div class="relative z-10 flex items-center justify-between gap-1">
-                <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap">{f.path}</div>
+                <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap"
+                  ondblclick={copyPath}>
+                  {f.path}
+                </div>
                 <div class="flex items-center gap-4 text-sm font-semibold text-nowrap">{rightValueFile(f)}</div>
               </div>
-              <div class="relative z-10 flex justify-between text-gray-300">
+              <div class="relative z-10 flex justify-between">
                 <div class="">{f.owner}</div>
-                <div class="">Updated {humanTime(f.modified)}</div>
-                <div class="">Read {humanTime(f.accessed)}</div>
+                <div class="">
+                  Updated {humanTime(f.modified)} • Read {humanTime(f.accessed)}
+                </div>
               </div>
             </div>
           </div>

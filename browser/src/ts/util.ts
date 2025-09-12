@@ -114,3 +114,70 @@ export const COLORS = [
   "#4C1D95","#1E40AF","#1D4ED8","#2563EB","#1F2937","#10A37F","#D97706",
   "#22D3EE","#059669","#D946EF","#F43F3F","#E11D48","#FB7185","#111827",
 ];
+
+
+  // Svelte action: use:copyOnDblclick={{ selector?: string, text?: string }}
+export function copyOnDblclick(
+  node: HTMLElement,
+  opts: { selector?: string; text?: string } = {}
+) {
+  const dispatch = (type: string, detail?: any) =>
+    node.dispatchEvent(new CustomEvent(type, { detail }));
+
+  async function onDblClick(e: MouseEvent) {
+    e.preventDefault();
+
+    const target =
+      (opts.selector ? node.querySelector<HTMLElement>(opts.selector) : null) ||
+      node;
+
+    const text =
+      opts.text ??
+      (target.innerText ?? target.textContent ?? '').trim();
+
+    // Temporarily allow selection if disabled
+    const hadSelectNone = node.classList.contains('select-none');
+    if (hadSelectNone) {
+      node.classList.remove('select-none');
+      node.classList.add('select-text');
+    }
+
+    // Visually select contents
+    const range = document.createRange();
+    range.selectNodeContents(target);
+    const sel = window.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+
+    // Copy (with fallback)
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        document.execCommand('copy');
+      }
+      dispatch('copied', { text });
+    } catch (err) {
+      dispatch('copyerror', { error: err });
+    }
+
+    // Cleanup selection & classes
+    setTimeout(() => {
+      sel?.removeAllRanges();
+      if (hadSelectNone) {
+        node.classList.add('select-none');
+        node.classList.remove('select-text');
+      }
+    }, 600);
+  }
+
+  node.addEventListener('dblclick', onDblClick);
+  return {
+    update(newOpts?: { selector?: string; text?: string }) {
+      opts = newOpts ?? {};
+    },
+    destroy() {
+      node.removeEventListener('dblclick', onDblClick);
+    }
+  };
+}
