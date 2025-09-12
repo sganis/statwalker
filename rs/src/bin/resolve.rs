@@ -269,3 +269,149 @@ fn octal_perm(mode: u32, cache: &mut HashMap<u32, String>) -> String {
 }
 
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- parse_*_bytes ----------
+
+    #[test]
+    fn parse_u32_bytes_basic() {
+        assert_eq!(super::parse_u32_bytes(Some(b"123")), 123);
+        assert_eq!(super::parse_u32_bytes(Some(b"  42  ")), 42);
+        assert_eq!(super::parse_u32_bytes(Some(b"+7")), 7);
+        assert_eq!(super::parse_u32_bytes(Some(b"-1")), 0, "negative -> default 0");
+        assert_eq!(super::parse_u32_bytes(Some(b"4294967296")), 0, "overflow -> default 0");
+        assert_eq!(super::parse_u32_bytes(Some(b"abc")), 0);
+        assert_eq!(super::parse_u32_bytes(None), 0);
+        assert_eq!(super::parse_u32_bytes(Some(b"000000")), 0);
+    }
+
+    #[test]
+    fn parse_i64_bytes_basic() {
+        assert_eq!(super::parse_i64_bytes(Some(b"0")), 0);
+        assert_eq!(super::parse_i64_bytes(Some(b"  -42 ")), -42);
+        assert_eq!(super::parse_i64_bytes(Some(b"+99")), 99);
+        // very large -> atoi returns None -> default 0
+        assert_eq!(super::parse_i64_bytes(Some(b"9223372036854775808")), 0);
+        assert_eq!(super::parse_i64_bytes(Some(b"foo")), 0);
+        assert_eq!(super::parse_i64_bytes(None), 0);
+    }
+
+    // ---------- trim_ascii ----------
+
+    #[test]
+    fn trim_ascii_works() {
+        assert_eq!(super::trim_ascii(b"  a  "), b"a");
+        assert_eq!(super::trim_ascii(b"\t\nabc\r\n"), b"abc");
+        assert_eq!(super::trim_ascii(b""), b"");
+        assert_eq!(super::trim_ascii(b"   "), b"");
+    }
+
+    // ---------- fmt_day (no TZ assumptions) ----------
+
+    #[test]
+    fn fmt_day_zero_and_cache() {
+        let mut cache = HashMap::new();
+        // ts <= 0 -> sentinel date
+        assert_eq!(super::fmt_day(0, &mut cache), "0001-01-01");
+        assert_eq!(super::fmt_day(-1, &mut cache), "0001-01-01");
+
+        // cache hit should not change size
+        let size_before = cache.len();
+        let _ = super::fmt_day(0, &mut cache);
+        assert_eq!(cache.len(), size_before);
+    }
+
+    #[test]
+    fn fmt_day_positive_shape() {
+        let mut cache = HashMap::new();
+        let s = super::fmt_day(86_400, &mut cache); // ~1970-01-02 local
+        assert_eq!(s.len(), 10);
+        let bytes = s.as_bytes();
+        assert_eq!(bytes[4], b'-');
+        assert_eq!(bytes[7], b'-');
+        // digits elsewhere
+        assert!(bytes.iter().enumerate().all(|(i, &c)|
+            (i == 4 || i == 7) || (c >= b'0' && c <= b'9')
+        ));
+    }
+
+    // ---------- file type mapping & caching ----------
+
+    #[test]
+    fn detect_file_type_mapping() {
+        #[cfg(unix)]
+        {
+            // type bits only
+            assert_eq!(super::detect_file_type(0o100000), "FILE");
+            assert_eq!(super::detect_file_type(0o040000), "DIR");
+            assert_eq!(super::detect_file_type(0o120000), "LINK");
+            assert_eq!(super::detect_file_type(0o140000), "SOCK");
+            assert_eq!(super::detect_file_type(0o010000), "PIPE");
+            assert_eq!(super::detect_file_type(0o060000), "BDEV");
+            assert_eq!(super::detect_file_type(0o020000), "CDEV");
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(super::detect_file_type(0o100000), "FILE");
+            assert_eq!(super::detect_file_type(0o040000), "DIR");
+            assert_eq!(super::detect_file_type(0o120000), "LINK");
+            assert_eq!(super::detect_file_type(0o140000), "SOCK");
+            assert_eq!(super::detect_file_type(0o010000), "PIPE");
+            assert_eq!(super::detect_file_type(0o060000), "BDEV");
+            assert_eq!(super::detect_file_type(0o020000), "CDEV");
+        }
+    }
+
+    #[test]
+    fn filetype_from_mode_cache_behavior() {
+        let mut cache: HashMap<u32, String> = HashMap::new();
+
+        // same type, different perms -> both "FILE"
+        let t1 = super::filetype_from_mode(0o100000, &mut cache);
+        assert_eq!(t1, "FILE");
+        assert_eq!(cache.len(), 1);
+
+        let t2 = super::filetype_from_mode(0o100644, &mut cache);
+        assert_eq!(t2, "FILE");
+        // current implementation keys by full mode, so this is a new entry
+        assert_eq!(cache.len(), 2);
+
+        // repeat should hit cache (no growth)
+        let _t3 = super::filetype_from_mode(0o100644, &mut cache);
+        assert_eq!(cache.len(), 2);
+    }
+
+    // ---------- permissions ----------
+
+    #[test]
+    fn octal_perm_formats_and_caches() {
+        let mut cache: HashMap<u32, String> = HashMap::new();
+        let p1 = super::octal_perm(0o100755, &mut cache);
+        assert_eq!(p1, "755");
+        assert_eq!(cache.len(), 1);
+
+        // different type bits, same low 12 perm bits => different cache key (by current impl)
+        let p2 = super::octal_perm(0o040755, &mut cache);
+        assert_eq!(p2, "755");
+        assert_eq!(cache.len(), 2);
+
+        // zero perms
+        let p3 = super::octal_perm(0o100000, &mut cache);
+        assert_eq!(p3, "0");
+    }
+
+    // ---------- PATH UTF-8 lossy behavior (what main loop uses) ----------
+
+    #[test]
+    fn path_utf8_lossy_replacement() {
+        let bad = [0xFFu8, b'a', 0xFE, b'b'];
+        let s = String::from_utf8_lossy(&bad);
+        assert!(s.contains('�'));
+        assert!(s.contains('a') && s.contains('b'));
+    }
+
+    // ---------- (optional) platform-specific user/group notes ----------
+    // We avoid asserting specific usernames/groups to keep tests portable.
+}
