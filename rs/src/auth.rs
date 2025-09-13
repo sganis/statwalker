@@ -222,7 +222,7 @@ pub mod platform {
     }
 
     // PAM conversation callback
-    unsafe extern "C" fn pam_conv(
+    extern "C" fn pam_conv(
         num_msg: c_int,
         msg: *mut *const PamMessage,
         resp: *mut *mut PamResponse,
