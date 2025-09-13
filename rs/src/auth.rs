@@ -143,97 +143,39 @@ where
 
 #[cfg(unix)]
 pub mod platform {
-    use libc::{c_char, c_int, c_void};
-    use std::{ffi::CString, ptr};
+    use std::process::{Command, Stdio};
+    use std::io::Write;
 
-    // ---- PAM FFI (as you already have) ----
-    #[repr(C)] struct PamHandle { _private: [u8;0] }
-    #[repr(C)] struct PamMessage { msg_style: c_int, msg: *const c_char }
-    #[repr(C)] struct PamResponse { resp: *mut c_char, resp_retcode: c_int }
-    type PamConvFunc = extern "C" fn(c_int, *mut *const PamMessage, *mut *mut PamResponse, *mut c_void) -> c_int;
-    #[repr(C)] struct PamConv { conv: Option<PamConvFunc>, appdata_ptr: *mut c_void }
-
-    const PAM_SUCCESS: c_int = 0;
-    const PAM_PROMPT_ECHO_OFF: c_int = 1;
-    const PAM_ERROR_MSG: c_int = 3;
-    const PAM_TEXT_INFO: c_int = 4;
-
-    #[link(name = "pam")]
-    unsafe extern "C" {
-        fn pam_start(service_name: *const c_char, user: *const c_char, conv: *const PamConv, pamh: *mut *mut PamHandle) -> c_int;
-        fn pam_end(pamh: *mut PamHandle, pam_status: c_int) -> c_int;
-        fn pam_authenticate(pamh: *mut PamHandle, flags: c_int) -> c_int;
-        // fn pam_acct_mgmt(pamh: *mut PamHandle, flags: c_int) -> c_int; // optional
-    }
-
-    unsafe extern "C" {
-        fn calloc(nmemb: usize, size: usize) -> *mut c_void;
-        fn strdup(s: *const c_char) -> *mut c_char;
-    }
-
-    // Conversation callback: feed password for "hidden" prompt
-    extern "C" fn pam_conv(n: c_int, msg: *mut *const PamMessage, resp: *mut *mut PamResponse, appdata: *mut c_void) -> c_int {
-        unsafe {
-            if n <= 0 || msg.is_null() || resp.is_null() { return 1; }
-            let replies = calloc(n as usize, std::mem::size_of::<PamResponse>()) as *mut PamResponse;
-            if replies.is_null() { return 1; }
-            *resp = replies;
-
-            let pw = appdata as *const c_char;
-
-            for i in 0..n {
-                let m = *msg.add(i as usize);
-                let r = replies.add(i as usize);
-                (*r).resp = std::ptr::null_mut();
-                (*r).resp_retcode = 0;
-                match (*m).msg_style {
-                    PAM_PROMPT_ECHO_OFF => { // password
-                        if !pw.is_null() {
-                            (*r).resp = strdup(pw);
-                            if (*r).resp.is_null() { return 1; }
-                        }
-                    }
-                    PAM_ERROR_MSG | PAM_TEXT_INFO => { /* no answer needed */ }
-                    _ => { /* ignore */ }
-                }
-            }
-            PAM_SUCCESS
-        }
-    }
-
-    /// Authenticate a user by password via PAM without needing root.
-    /// Defaults to PAM service "su" (present by default; no admin changes).
+    // Verify user credentials using the su command
+    /// Returns true if authentication succeeds, false otherwise
     pub fn verify_user(username: &str, password: &str) -> bool {
-        let service = std::env::var("PAM_SERVICE").unwrap_or_else(|_| "su".to_string());
-        verify_user_with_service(username, password, &service).unwrap_or(false)
-    }
+        let mut child = match Command::new("su")
+            .arg(username)
+            .arg("-c")
+            .arg("true") // Just run the 'true' command if auth succeeds
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null()) // Suppress output
+            .stderr(Stdio::null()) // Suppress error messages
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return false, // Failed to spawn su command
+        };
 
-    pub fn verify_user_with_service(username: &str, password: &str, service: &str) -> Result<bool, String> {
-        let service_c = CString::new(service).map_err(|_| "bad service")?;
-        let user_c    = CString::new(username).map_err(|_| "bad username")?;
-        let pw_c      = CString::new(password).map_err(|_| "bad password")?;
-
-        unsafe {
-            let mut pamh: *mut PamHandle = std::ptr::null_mut();
-            let conv = PamConv { conv: Some(pam_conv), appdata_ptr: pw_c.as_ptr() as *mut c_void };
-
-            let rc = pam_start(service_c.as_ptr(), user_c.as_ptr(), &conv, &mut pamh);
-            if rc != PAM_SUCCESS || pamh.is_null() {
-                if !pamh.is_null() { pam_end(pamh, rc); }
-                return Err(format!("pam_start rc={}", rc));
+        // Send the password to su's stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            if writeln!(stdin, "{}", password).is_err() {
+                return false;
             }
+        }
 
-            let ok = pam_authenticate(pamh, 0) == PAM_SUCCESS;
-            // By default, skip pam_acct_mgmt to avoid needing an "account" stack in the service file.
-            // If you want it, set PAM_ACCOUNT_CHECK=1
-            // if ok && std::env::var("PAM_ACCOUNT_CHECK").ok().is_some() {
-            //     ok = pam_acct_mgmt(pamh, 0) == PAM_SUCCESS;
-            // }
-
-            pam_end(pamh, 0);
-            Ok(ok)
+        // Wait for su to complete and check exit status
+        match child.wait() {
+            Ok(status) => status.success(),
+            Err(_) => false,
         }
     }
+
 }
 
 #[cfg(windows)]
