@@ -270,7 +270,7 @@ pub mod platform {
     }
 
     /// Simple PAM authentication
-    pub fn verify_user(username: &str, password: &str) -> Result<bool, String> {
+    pub fn verify_user(username: &str, password: &str) -> bool {
         verify_user_with_service(username, password, "login").is_ok()
     }
 
