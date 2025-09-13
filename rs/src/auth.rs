@@ -202,13 +202,13 @@ pub mod platform {
     unsafe extern "C" {
         fn malloc(size: size_t) -> *mut c_void;
         fn calloc(nmemb: size_t, size: size_t) -> *mut c_void;
-        fn free(ptr: *mut c_void);
+        //fn free(ptr: *mut c_void);
         fn strlen(s: *const c_char) -> size_t;
         fn strcpy(dest: *mut c_char, src: *const c_char) -> *mut c_char;
     }
 
     // Safe string duplication
-    unsafe fn string_dup(s: *const c_char) -> *mut c_char {
+    fn string_dup(s: *const c_char) -> *mut c_char {
         if s.is_null() {
             return ptr::null_mut();
         }
