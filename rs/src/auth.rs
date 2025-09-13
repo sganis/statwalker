@@ -212,12 +212,12 @@ pub mod platform {
         if s.is_null() {
             return ptr::null_mut();
         }
-        let len = strlen(s);
-        let new_str = malloc(len + 1) as *mut c_char;
+        let len = unsafe {strlen(s)};
+        let new_str = unsafe {malloc(len + 1) as *mut c_char};
         if new_str.is_null() {
             return ptr::null_mut();
         }
-        strcpy(new_str, s);
+        unsafe {strcpy(new_str, s)};
         new_str
     }
 
