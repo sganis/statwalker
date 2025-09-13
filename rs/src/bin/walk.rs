@@ -331,9 +331,9 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
     let base_arc = Arc::new(dir.to_path_buf());
     
     // Collect entries in larger batches to reduce channel overhead
-    let entries: Vec<_> = rd.collect();
+    //let entries: Vec<_> = rd.collect();
 
-    for dent in entries {
+    for dent in rd {
         let dent = match dent {
             Ok(d) => d,
             Err(_) => { error_count += 1; continue; }
