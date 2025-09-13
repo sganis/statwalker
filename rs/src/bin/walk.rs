@@ -625,7 +625,7 @@ fn merge_shards(out_dir: &Path,
     sort_lines: bool
 ) -> std::io::Result<()> {
     let mut out = BufWriter::with_capacity(
-        8 * 1024 * 1024, // Larger output buffer
+        16 * 1024 * 1024, // Larger output buffer
         File::create(&final_path)?
     );
     // build the header dynamically (replace the fixed write_all line)
