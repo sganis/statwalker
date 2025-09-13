@@ -1,17 +1,17 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount } from "svelte";
   import { 
     getParent, humanTime, humanCount, 
-    formatBytes, COLORS,
+    formatBytes, getOptimalColors,
   } from "../ts/util";
   import { api } from "../ts/api.svelte";
   import { API_URL, State } from "../ts/store.svelte";
   import Svelecte, { addRenderer } from 'svelecte';
 
   //#region state
-  
-  let path = $state('/nas/Drive/San/pc');
-  let fullPath = $state('');
+  let COLORS: string[] = []
+  let path = $state('/');
+  let fullPath = $state('/');
   let folders = $state<FileItem[]>([]);
   let files = $state<ScannedFile[]>([]);
   let loading = $state(false);
@@ -30,7 +30,6 @@
   let userDropdown = $state<{user:string;color:string}[]>([]);
   let pathInput = $state();
   let isEditing = $state(false);
-  let svelecteRef;
 
   //#endregion
 
@@ -43,14 +42,15 @@
     const c = COLORS[2] ?? b;
     const d = COLORS[3] ?? c;
 
-    const bg =
+    const icon_bg =
       item.user === "All Users"
         ? `background: linear-gradient(90deg, ${a} 0%, ${b} 33%, ${c} 66%, ${d} 100%);`
         : `background: ${item.color};`;
-      return `<div class="flex gap-2 items-center">
-                <div class="border border-gray-400 rounded"
-                  style="${base}${bg}"></div>
-                <div>${item.user}</div>              
+    const user_css = !State.isAdmin ? "text-gray-400" : ''
+    return `<div class="flex gap-2 items-center">
+                <div class="border border-gray-500 rounded"
+                  style="${base}${icon_bg}"></div>
+                <div class="${user_css}">${item.user}</div>              
               </div>`
   }
   addRenderer('color', colorRenderer);
@@ -660,10 +660,15 @@
   //#endregion
 
   onMount(async () => {
-    console.log("api url:", API_URL);
-    users = await api.getUsers(); 
+    console.log("api url:", API_URL)
+    users = await api.getUsers()
+    COLORS = getOptimalColors(users.length)
     users.splice(0,0,"All Users")
-    selectedUser = 'All Users'
+    if (State.isAdmin) {
+      selectedUser = 'All Users'
+    } else {
+      selectedUser = State.username
+    }
     seedUserColors(users);
     fullPath = path;
     path = truncatePathFromStart(path);
@@ -748,7 +753,7 @@
     </div>
 
     <Svelecte
-      bind:this={svelecteRef}
+      disabled={!State.isAdmin}
       bind:value={selectedUser} 
       options={userDropdown}
       valueField="user" 
@@ -968,9 +973,8 @@
 <!-- Feedback notification -->
 {#if copyFeedbackVisible}
   <div 
-    class="fixed top-1 right-2.5 bg-green-600 text-white px-4 py-3 
-      rounded-lg font-medium shadow-lg z-50 transform 
-      transition-transform duration-300 
+    class="fixed top-1 inset-x-0 mx-auto w-max bg-emerald-600 text-white px-4 py-1 
+      rounded-lg font-medium shadow-lg z-50 transform transition-transform duration-300 
       ease-[cubic-bezier(0.68,-0.55,0.265,1.55)]"
     class:translate-x-full={!copyFeedbackVisible}
     class:translate-x-0={copyFeedbackVisible}

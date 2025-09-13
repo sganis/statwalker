@@ -1,51 +1,23 @@
 export const API_URL = `${import.meta.env.VITE_PUBLIC_BASE_URL}api`;
 
-const initialState = {
+export const initialState = {
   username: "",
   token: "",
-  profile: {}
-};
+  isAdmin: false,
+  expiresAt: null
+}
+
 const localState = localStorage.getItem("state");
 const appState = localState ? JSON.parse(localState) : initialState;
 
 export const State = $state({
-  message: 'Path copied!',
   username: appState.username,
   token: appState.token,
-  profile: appState.profile,
-  searchText: '',
-  currentWellbore: {wellbore:'WELLBORE'},
-  currentWellId: '',
-  wellboreList: [],
-  currentWorkflowId: '',
-  currentWorkflow: {},
-  
-  currentWell: {},
-
-  // wellbores list
-  wellboresRightPanel: 'map',
-  wellboresMainPanelVisibility: true,
-  wellboresRightPanelVisibility: true,
-  wellboresRightPanelExpanded: false,
-  // wellbore item
-  wellboreItemRightPanel: 'list',
-  wellboreItemMainPanelVisibility: true,
-  wellboreItemRightPanelVisibility: true,
-  wellboreItemRightPanelExpanded: false,
-  // workflow 
-  workflowMainPanelVisibility: true,
-  nodePropertiesVisibility: false,
-  workflowNavigation: ['Workflows'],
-  // isUser: function() {
-  //   return this.profile.role ==='AP_USER' 
-  //     || this.profile.role ==='AP_ENGINEER'
-  //     || this.profile.role ==='AP_ADMIN'
-  // },
-  isEngineer: function() {
-    return this.profile.role ==='AP_ENGINEER'
-      || this.profile.role ==='AP_ADMIN'
-  },
-  isAdmin: function() {
-    return this.profile.role ==='AP_ADMIN'
-  }
+  isAdmin: appState.isAdmin,
+  expiresAt: appState.expiresAt,
+  logout: () => {
+    Object.assign(State, initialState);
+    try { 
+      localStorage.removeItem("state"); } catch {}
+    }
 })

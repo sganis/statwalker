@@ -40,11 +40,13 @@ class Api {
         }
       }
       const url = `${this.baseUrl}${endpoint}`
-      console.log('fetching url:', url)
+      console.log('fetching url:', url, options)
 
       const response = await fetch(url, options);
       const data: T = await response.json();
       if (!response.ok) {
+        // do this to redirect to login
+        State.token = null
         if (response.status === 401) {
           console.log('authentication failed.')
         }
@@ -78,6 +80,7 @@ class Api {
     const userParam = users.length > 0 ? `&users=${encodeURIComponent(users.join(','))}` : '';
     const ageParam = age !== undefined && age !== -1 ? `&age=${age}` : ''
     const url = `folders?${pathParam}${userParam}${ageParam}`
+    console.log('api url:', url)
     let result = await this.request<RawFolder[]>(url, "GET", undefined, true)
     return result ?? []
   }
@@ -87,6 +90,7 @@ class Api {
     const userParam = users.length > 0 ? `&users=${encodeURIComponent(users.join(','))}` : ''
     const ageParam = age !== undefined && age !== -1 ? `&age=${age}` : ''
     const url = `files?${pathParam}${userParam}${ageParam}`
+    console.log('api url:', url)
     let result = await this.request<ScannedFile[]>(url, "GET", undefined, true)
     return result ?? []
   }

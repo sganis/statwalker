@@ -93,13 +93,12 @@ async fn main() -> anyhow::Result<()> {
             "http://localhost:5173".parse().unwrap(),
             "http://127.0.0.1:5173".parse().unwrap(),
         ])
-        .allow_methods([Method::GET, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(Any);
 
     // API
     let api = Router::new()
         .route("/login", post(login_handler))
-        .route("/private", get(private_handler))
         .route("/users", get(users_handler))         // Vec<String> usernames
         .route("/folders", get(get_folders_handler)) // query: path, optional users/uids, optional age
         .route("/files", get(get_files_handler));    // path + optional users/uids
@@ -117,14 +116,6 @@ async fn main() -> anyhow::Result<()> {
     println!("Serving on http://{addr}  (static dir: {static_dir})");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
-}
-
-/// GET /api/private
-async fn private_handler(claims: Claims) -> Result<String, AuthError> {
-    // Send the protected data to the user
-    Ok(format!(
-        "Welcome to the protected area :)\nYour data:\n{claims}",
-    ))
 }
 
 /// PSOT /api/login

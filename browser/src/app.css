@@ -23,14 +23,12 @@ html, body {
   --sv-border-radius: 0.25rem;   /* 4px */
   --sv-border-color: #6b7280;    /* gray-500 */
   --sv-bg: #1f2937;              /* bg-gray-800 */
-  --sv-disabled-bg: #eee;
+  --sv-disabled-bg: #272d35;
   --sv-border: 1px solid #6b7280;
   --sv-border-radius: 4px;
   --sv-general-padding: 4px;
   --sv-control-bg: var(--sv-bg);
   --sv-item-selected-bg: #626262;
-  --sv-item-btn-color: #ccc;
-  --sv-item-btn-color-hover: #ccc;
   --sv-item-btn-bg: #626262;
   --sv-item-btn-bg-hover: #374151;
   --sv-separator-bg: #626262;

@@ -105,7 +105,7 @@ export function capitalize(str) {
 }
 
 export const COLORS = [
-  "#3B82F6","#22C55E","#EAB308","#F43F5E","#F59E0B","#0EA5E9","#10B981",
+  "#3B82F6","#EAB308","#F43F5E","#F59E0B","#0EA5E9","#10B981","#22C55E",
   "#A855F7","#6366F1","#06B6D4","#84CC16","#EF4444","#F97316","#14B8A6",
   "#8B5CF6","#7C3AED","#4F46E5","#0891B2","#16A34A","#A3E635","#BE123C",
   "#EA580C","#0D9488","#9333EA","#6D28D9","#4338CA","#155E75","#166534",
@@ -116,68 +116,155 @@ export const COLORS = [
 ];
 
 
-  // Svelte action: use:copyOnDblclick={{ selector?: string, text?: string }}
-export function copyOnDblclick(
-  node: HTMLElement,
-  opts: { selector?: string; text?: string } = {}
-) {
-  const dispatch = (type: string, detail?: any) =>
-    node.dispatchEvent(new CustomEvent(type, { detail }));
+// Base color palette optimized for maximum perceptual difference
+const baseColors = [
+  '#E53E3E', // Red
+  '#38A169', // Green  
+  '#3182CE', // Blue
+  '#D69E2E', // Orange/Gold
+  '#805AD5', // Purple
+  '#DD6B20', // Orange
+  '#319795', // Teal
+  '#E53E3E', // Pink/Magenta
+  '#2F855A', // Dark Green
+  '#2B6CB0', // Dark Blue
+  '#B83280', // Pink
+  '#C05621', // Dark Orange
+];
 
-  async function onDblClick(e: MouseEvent) {
-    e.preventDefault();
+// Enhanced color palette with better distribution
+const enhancedPalette = [
+  // Tier 1: Maximum contrast primaries
+  '#E53E3E', // Vibrant Red
+  '#38A169', // Forest Green
+  '#3182CE', // Royal Blue
+  '#D69E2E', // Golden Yellow
+  '#805AD5', // Deep Purple
+  '#DD6B20', // Burnt Orange
+  '#319795', // Teal
+  '#E91E63', // Magenta
+  
+  // Tier 2: Secondary colors with good contrast
+  '#2F855A', // Dark Green
+  '#2B6CB0', // Navy Blue
+  '#B83280', // Hot Pink
+  '#C05621', // Rust
+  '#553C9A', // Indigo
+  '#00B5D8', // Cyan
+  '#F56500', // Orange Red
+  '#0BC5EA', // Sky Blue
+  
+  // Tier 3: Lighter variants
+  '#68D391', // Light Green
+  '#63B3ED', // Light Blue  
+  '#F6AD55', // Light Orange
+  '#B794F6', // Light Purple
+  '#81E6D9', // Light Teal
+  '#FBB6CE', // Light Pink
+  '#FC8181', // Light Red
+  '#90CDF4', // Pale Blue
+  
+  // Tier 4: Darker variants
+  '#1A365D', // Dark Navy
+  '#1A202C', // Almost Black
+  '#2D3748', // Dark Gray
+  '#4A5568', // Medium Gray
+  '#742A2A', // Dark Red
+  '#22543D', // Dark Forest
+  '#553C9A', // Dark Purple
+  '#744210', // Dark Gold
+];
 
-    const target =
-      (opts.selector ? node.querySelector<HTMLElement>(opts.selector) : null) ||
-      node;
-
-    const text =
-      opts.text ??
-      (target.innerText ?? target.textContent ?? '').trim();
-
-    // Temporarily allow selection if disabled
-    const hadSelectNone = node.classList.contains('select-none');
-    if (hadSelectNone) {
-      node.classList.remove('select-none');
-      node.classList.add('select-text');
-    }
-
-    // Visually select contents
-    const range = document.createRange();
-    range.selectNodeContents(target);
-    const sel = window.getSelection();
-    sel?.removeAllRanges();
-    sel?.addRange(range);
-
-    // Copy (with fallback)
-    try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        document.execCommand('copy');
-      }
-      dispatch('copied', { text });
-    } catch (err) {
-      dispatch('copyerror', { error: err });
-    }
-
-    // Cleanup selection & classes
-    setTimeout(() => {
-      sel?.removeAllRanges();
-      if (hadSelectNone) {
-        node.classList.add('select-none');
-        node.classList.remove('select-text');
-      }
-    }, 600);
+// Smart color assignment function
+export const getOptimalColors = (numUsers) => {
+  if (numUsers === 1) {
+    return [enhancedPalette[0]]; // Single vibrant color
   }
-
-  node.addEventListener('dblclick', onDblClick);
-  return {
-    update(newOpts?: { selector?: string; text?: string }) {
-      opts = newOpts ?? {};
-    },
-    destroy() {
-      node.removeEventListener('dblclick', onDblClick);
+  
+  if (numUsers === 2) {
+    return [enhancedPalette[0], enhancedPalette[2]]; // Red and Blue - maximum contrast
+  }
+  
+  if (numUsers === 3) {
+    return [enhancedPalette[0], enhancedPalette[1], enhancedPalette[2]]; // Red, Green, Blue
+  }
+  
+  if (numUsers <= 8) {
+    // Use tier 1 colors for optimal distinction
+    return enhancedPalette.slice(0, numUsers);
+  }
+  
+  if (numUsers <= 16) {
+    // Mix tier 1 and tier 2
+    return enhancedPalette.slice(0, numUsers);
+  }
+  
+  if (numUsers <= 24) {
+    // Use first 24 colors
+    return enhancedPalette.slice(0, numUsers);
+  }
+  
+  // For more than 24 users, cycle through with slight variations
+  const colors = [];
+  for (let i = 0; i < numUsers; i++) {
+    const baseIndex = i % enhancedPalette.length;
+    const cycle = Math.floor(i / enhancedPalette.length);
+    let color = enhancedPalette[baseIndex];
+    
+    // Apply slight modifications for cycles
+    if (cycle > 0) {
+      const hsl = hexToHsl(color);
+      hsl.l = Math.max(0.2, Math.min(0.8, hsl.l + (cycle * 0.15 * (i % 2 === 0 ? 1 : -1))));
+      color = hslToHex(hsl);
     }
+    
+    colors.push(color);
+  }
+  
+  return colors;
+}
+
+// Helper functions for color manipulation
+const hexToHsl = (hex) => {
+  const r = parseInt(hex.slice(1, 3), 16) / 255;
+  const g = parseInt(hex.slice(3, 5), 16) / 255;
+  const b = parseInt(hex.slice(5, 7), 16) / 255;
+  
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  let h, s, l = (max + min) / 2;
+  
+  if (max === min) {
+    h = s = 0;
+  } else {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    switch (max) {
+      case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+      case g: h = (b - r) / d + 2; break;
+      case b: h = (r - g) / d + 4; break;
+    }
+    h /= 6;
+  }
+  
+  return { h, s, l };
+}
+
+const hslToHex = ({ h, s, l }) => {
+  const hue2rgb = (p, q, t) => {
+    if (t < 0) t += 1;
+    if (t > 1) t -= 1;
+    if (t < 1/6) return p + (q - p) * 6 * t;
+    if (t < 1/2) return q;
+    if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+    return p;
   };
+  
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const r = hue2rgb(p, q, h + 1/3);
+  const g = hue2rgb(p, q, h);
+  const b = hue2rgb(p, q, h - 1/3);
+  
+  return `#${Math.round(r * 255).toString(16).padStart(2, '0')}${Math.round(g * 255).toString(16).padStart(2, '0')}${Math.round(b * 255).toString(16).padStart(2, '0')}`;
 }
