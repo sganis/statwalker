@@ -271,7 +271,7 @@ pub mod platform {
 
     /// Simple PAM authentication
     pub fn verify_user(username: &str, password: &str) -> Result<bool, String> {
-        verify_user_with_service(username, password, "login")
+        verify_user_with_service(username, password, "login").is_ok()
     }
 
     /// PAM authentication with custom service
