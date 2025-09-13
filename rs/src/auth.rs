@@ -127,17 +127,165 @@ where
     }
 }
 
+// #[cfg(unix)]
+// pub mod platform {
+//     use pam::Authenticator;
+
+//     pub fn verify_user(username: &str, password: &str) -> bool {
+//         let mut auth = match Authenticator::with_password("login") {
+//             Ok(a) => a,
+//             Err(_) => return false,
+//         };
+//         auth.get_handler().set_credentials(username, password);
+//         auth.authenticate().is_ok()
+//     }
+// }
 #[cfg(unix)]
 pub mod platform {
-    use pam::Authenticator;
+    use libc::{c_char, c_int, c_void};
+    use std::{ffi::CString, ptr};
 
+    // ---- Minimal PAM FFI ----
+    #[repr(C)]
+    struct PamHandle { _private: [u8; 0] }
+
+    #[repr(C)]
+    struct PamMessage {
+        msg_style: c_int,
+        msg: *const c_char,
+    }
+
+    #[repr(C)]
+    struct PamResponse {
+        resp: *mut c_char,
+        resp_retcode: c_int,
+    }
+
+    #[repr(C)]
+    struct PamConv {
+        conv: Option<
+            extern "C" fn(
+                num_msg: c_int,
+                msg: *mut *mut PamMessage,
+                resp: *mut *mut PamResponse,
+                appdata_ptr: *mut c_void,
+            ) -> c_int,
+        >,
+        appdata_ptr: *mut c_void,
+    }
+
+    const PAM_SUCCESS: c_int = 0;
+    const PAM_PROMPT_ECHO_OFF: c_int = 1;
+    const PAM_PROMPT_ECHO_ON: c_int  = 2;
+    const PAM_ERROR_MSG: c_int       = 3;
+    const PAM_TEXT_INFO: c_int       = 4;
+
+    #[link(name = "pam")]
+    extern "C" {
+        fn pam_start(
+            service_name: *const c_char,
+            user: *const c_char,
+            pam_conversation: *const PamConv,
+            pamh: *mut *mut PamHandle,
+        ) -> c_int;
+
+        fn pam_end(pamh: *mut PamHandle, pam_status: c_int) -> c_int;
+        fn pam_authenticate(pamh: *mut PamHandle, flags: c_int) -> c_int;
+        fn pam_acct_mgmt(pamh: *mut PamHandle, flags: c_int) -> c_int;
+
+        // glibc
+        fn calloc(nmemb: usize, size: usize) -> *mut c_void;
+        fn free(ptr: *mut c_void);
+        fn strdup(s: *const c_char) -> *mut c_char;
+    }
+
+    // Conversation callback: supply password for PROMPT_ECHO_OFF
+    extern "C" fn conv(
+        num_msg: c_int,
+        msg: *mut *mut PamMessage,
+        resp: *mut *mut PamResponse,
+        appdata_ptr: *mut c_void,
+    ) -> c_int {
+        unsafe {
+            if num_msg <= 0 || msg.is_null() || resp.is_null() {
+                return 1; // error
+            }
+
+            // Allocate response array (PAM will free it)
+            let size = std::mem::size_of::<PamResponse>();
+            let replies = calloc(num_msg as usize, size) as *mut PamResponse;
+            if replies.is_null() {
+                return 1;
+            }
+            *resp = replies;
+
+            let pw_cstr = appdata_ptr as *const c_char;
+
+            for i in 0..num_msg {
+                let m = *msg.add(i as usize);
+                let r = replies.add(i as usize);
+
+                match (*m).msg_style {
+                    PAM_PROMPT_ECHO_OFF => {
+                        // Duplicate password for PAM
+                        (*r).resp = strdup(pw_cstr);
+                        (*r).resp_retcode = 0;
+                        if (*r).resp.is_null() {
+                            return 1;
+                        }
+                    }
+                    PAM_PROMPT_ECHO_ON => {
+                        // Not used here; respond empty
+                        (*r).resp = ptr::null_mut();
+                        (*r).resp_retcode = 0;
+                    }
+                    PAM_ERROR_MSG | PAM_TEXT_INFO => {
+                        // Informational; no response needed
+                        (*r).resp = ptr::null_mut();
+                        (*r).resp_retcode = 0;
+                    }
+                    _ => {
+                        return 1; // unknown style
+                    }
+                }
+            }
+
+            PAM_SUCCESS
+        }
+    }
+
+    /// Verify a user/password against the system PAM stack.
+    /// Service can be overridden via `PAM_SERVICE`, default "login".
     pub fn verify_user(username: &str, password: &str) -> bool {
-        let mut auth = match Authenticator::with_password("login") {
-            Ok(a) => a,
-            Err(_) => return false,
-        };
-        auth.get_handler().set_credentials(username, password);
-        auth.authenticate().is_ok()
+        unsafe {
+            let service = std::env::var("PAM_SERVICE").unwrap_or_else(|_| "login".to_string());
+            let service_c = match CString::new(service) { Ok(s) => s, Err(_) => return false };
+            let user_c    = match CString::new(username) { Ok(s) => s, Err(_) => return false };
+            let pw_c      = match CString::new(password) { Ok(s) => s, Err(_) => return false };
+
+            let mut pamh: *mut PamHandle = ptr::null_mut();
+            let mut conv = PamConv {
+                conv: Some(conv),
+                appdata_ptr: pw_c.as_ptr() as *mut c_void, // keep pw_c alive
+            };
+
+            let rc = pam_start(service_c.as_ptr(), user_c.as_ptr(), &conv as *const PamConv, &mut pamh);
+            if rc != PAM_SUCCESS || pamh.is_null() {
+                return false;
+            }
+
+            let mut ok = false;
+
+            // Authenticate
+            if pam_authenticate(pamh, 0) == PAM_SUCCESS {
+                // Account management (e.g., expired, locked)
+                let acct = pam_acct_mgmt(pamh, 0);
+                ok = acct == PAM_SUCCESS;
+            }
+
+            pam_end(pamh, 0);
+            ok
+        }
     }
 }
 
