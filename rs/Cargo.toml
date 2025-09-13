@@ -27,7 +27,6 @@ serde_json = "1"          # tests only, to decode JSON bodies
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-pam = "0.8.0"
 
 # Enable ANSI for Windows consoles
 # [target.'cfg(windows)'.dependencies]
