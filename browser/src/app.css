@@ -28,32 +28,20 @@ html, body {
   --sv-border-radius: 4px;
   --sv-general-padding: 4px;
   --sv-control-bg: var(--sv-bg);
-  --sv-item-wrap-padding: 3px 3px 3px 6px;
-  --sv-selection-wrap-padding: 3px 3px 3px 4px;
-  --sv-selection-multi-wrap-padding: 3px 3px 3px 6px;
   --sv-item-selected-bg: #626262;
   --sv-item-btn-color: #ccc;
   --sv-item-btn-color-hover: #ccc;
   --sv-item-btn-bg: #626262;
   --sv-item-btn-bg-hover: #374151;
-  --sv-icon-color: #bbb;
-  --sv-icon-color-hover: #ccc;
-  --sv-icon-bg: transparent;
-  --sv-icon-size: 20px;
   --sv-separator-bg: #626262;
   --sv-btn-border: 0;
-  --sv-placeholder-color: #ccccd6;
   --sv-dropdown-bg: var(--sv-bg);
   --sv-dropdown-border: var(--sv-border);
   --sv-dropdown-offset: 1px;
   --sv-dropdown-width: auto;
-  /* --sv-dropdown-shadow: 0 1px 3px #555; */
   --sv-dropdown-height: 320px;
   --sv-dropdown-active-bg: #374151;
   --sv-dropdown-selected-bg: #754545;
-  --sv-create-kbd-border: 1px solid #626262;
-  --sv-create-kbd-bg: #626262;
-  --sv-create-disabled-bg: #fcbaba;
 }
 
 .svelecte{
@@ -82,28 +70,10 @@ input {
          
 }
 
-select {
-  @apply border border-gray-500 rounded px-4 h-10
-    bg-gray-800 text-gray-100
-    cursor-pointer
-    focus:outline-none focus:ring-2 focus:ring-blue-500
-    disabled:opacity-50 disabled:cursor-not-allowed;
-      -webkit-appearance: none; /* Safari/Chrome */
-  -moz-appearance: none;    /* Firefox */
-  appearance: none;
-  background-position: right 0.5rem center;
-  background-repeat: no-repeat;
-  background-size: 1rem;
-}
-
 /* Works in Chrome, Edge, Safari */
 ::-webkit-scrollbar {
   width: 8px; /* slim scrollbar */
   height: 8px;
-}
-
-::-webkit-scrollbar-track {
-  /* background: #1a1a1a; dark background */
 }
 
 ::-webkit-scrollbar-thumb {
@@ -116,13 +86,6 @@ select {
   background-color: #666; /* lighter on hover */
 }
 
-/* Background: 
-Selection: #49483E; Active line often #3E3D32–#43443B. 
-Comments: #75715E. 
-Red/Pink (keywords/operators): #F92672. 
-Orange: #FD971F. 
-Yellow (strings): #E6DB74. 
-Green: #A6E22E. 
-Blue: #66D9EF. 
-Purple: #AE81FF. 
-*/
+.ease-bounce-out {
+	transition-timing-function: cubic-bezier(0.68, -0.55, 0.265, 1.55);
+}

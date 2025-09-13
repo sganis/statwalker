@@ -4,7 +4,7 @@ use axum::{
     extract::Query,
     http::{Method, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use csv::ReaderBuilder;
@@ -16,11 +16,14 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::OnceLock,
+    time::SystemTime,
 };
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use memchr::memchr_iter;
 use clap::{Parser, ColorChoice};
+use jsonwebtoken::{encode, Header};
+use statwalker::auth::{platform, AuthError, AuthPayload, AuthBody, Claims, keys};
 
 #[cfg(unix)]
 use std::ffi::CStr;
@@ -46,7 +49,7 @@ pub struct FsItemOut {
 }
 
 // ----------- Output shapes for /api/folders -----------
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Age {
     pub count: u64,
     pub disk:  u64,  // bytes
@@ -54,7 +57,7 @@ pub struct Age {
     pub mtime: i64,  // Unix seconds
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FolderOut {
     pub path: String,
     pub users: HashMap<String, HashMap<String, Age>>, // username -> age_string -> stats
@@ -65,17 +68,16 @@ static USERS: OnceLock<Vec<String>> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    
-    // CSV path
-    let csv_path = args.input.clone();
+    dotenvy::dotenv().ok();
+    std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");     
 
+    let args = Args::parse();
+    let csv_path = args.input.clone();
     let static_dir: String = args
         .static_dir
         .or_else(|| std::env::var("STATIC_DIR").ok())
         .unwrap_or_else(default_static_dir);
 
-    // ServeDir directly; SPA fallback to index.html
     let frontend = ServeDir::new(&static_dir)
         .not_found_service(ServeFile::new(format!("{}/index.html", static_dir)));
 
@@ -83,8 +85,6 @@ async fn main() -> anyhow::Result<()> {
     let users = idx.load_from_csv(Path::new(&csv_path))?;
     FS_INDEX.set(idx).expect("FS_INDEX already set");
     USERS.set(users).expect("USERS already set");
-
-    
 
     // CORS (dev)
     let cors = CorsLayer::new()
@@ -98,6 +98,8 @@ async fn main() -> anyhow::Result<()> {
 
     // API
     let api = Router::new()
+        .route("/login", post(login_handler))
+        .route("/private", get(private_handler))
         .route("/users", get(users_handler))         // Vec<String> usernames
         .route("/folders", get(get_folders_handler)) // query: path, optional users/uids, optional age
         .route("/files", get(get_files_handler));    // path + optional users/uids
@@ -115,6 +117,132 @@ async fn main() -> anyhow::Result<()> {
     println!("Serving on http://{addr}  (static dir: {static_dir})");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
+}
+
+/// GET /api/private
+async fn private_handler(claims: Claims) -> Result<String, AuthError> {
+    // Send the protected data to the user
+    Ok(format!(
+        "Welcome to the protected area :)\nYour data:\n{claims}",
+    ))
+}
+
+/// PSOT /api/login
+async fn login_handler(Json(payload): Json<AuthPayload>) -> Result<Json<AuthBody>, AuthError> {
+    // Check if the user sent the credentials
+    if payload.username.is_empty() || payload.password.is_empty() {
+        return Err(AuthError::MissingCredentials);
+    }
+    
+    if !platform::verify_user(&payload.username, &payload.password) {
+        return Err(AuthError::WrongCredentials);
+    }
+
+    const TTL_SECONDS: u64 = 24 * 60 * 60; // 1 day
+    let exp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + TTL_SECONDS;
+    
+    let admins: HashSet<String> = std::env::var("ADMIN_GROUP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+    let claims = Claims {
+        sub: payload.username.to_owned(),
+        is_admin: admins.contains(&payload.username.trim().to_ascii_lowercase()),
+        exp: exp.try_into().unwrap(),
+    };
+    println!("login success: {:?}", &claims);
+
+    // Create the authorization token
+    let token = encode(&Header::default(), &claims, &keys().encoding)
+        .map_err(|_| AuthError::TokenCreation)?;
+
+    // Send the authorized token
+    Ok(Json(AuthBody::new(token)))
+}
+
+/// GET /api/users
+async fn users_handler(claims: Claims) -> impl IntoResponse {
+    println!("users: {:?}", &claims);
+    if claims.is_admin {
+        // return all users
+        Json(get_users().clone())
+    } else {
+        // username only
+        Json(vec![claims.sub])
+    }
+}
+
+/// GET /api/folders?path=/some/dir&users=alice,bob&age=1
+async fn get_folders_handler(claims: Claims, Query(q): Query<FolderQuery>) -> impl IntoResponse {
+    // normalize path
+    let mut path = q.path.unwrap_or_else(|| "/".to_string());
+    if path.is_empty() { path = "/".to_string(); }
+    if !path.starts_with('/') { path = format!("/{}", path); }
+
+    // parse users (empty => "all users")
+    let requested: Vec<String> = match q.users.as_deref() {
+        Some(s) if !s.trim().is_empty() => parse_users_csv(s),
+        _ => Vec::new(),
+    };
+
+    // authorization: only admins can request "all users" or others
+    if !claims.is_admin {
+        if requested.is_empty() || requested.len() != 1 || requested[0] != claims.sub {
+            return AuthError::Forbidden.into_response();
+        }
+    }
+
+    let index = FS_INDEX.get().expect("FS index not initialized");
+    let items = match index.list_children(&path, &requested, q.age) {
+        Ok(v) => v,
+        Err(_) => Vec::new(),
+    };
+
+    Json(items).into_response()
+}
+
+/// GET /api/files?path=/some/dir&users=alice,bob&age=1
+async fn get_files_handler(claims: Claims, Query(q): Query<FilesQuery>) -> impl IntoResponse {
+    // validate path
+    let folder = match q.path.as_deref() {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => return (StatusCode::BAD_REQUEST, "missing 'path' query parameter").into_response(),
+    };
+
+    // parse users (empty => "all users")
+    let requested: Vec<String> = match q.users.as_deref() {
+        Some(s) if !s.trim().is_empty() => parse_users_csv(s),
+        _ => Vec::new(),
+    };
+
+    // authorization: only admins can request "all users" or others
+    if !claims.is_admin {
+        if requested.is_empty() || requested.len() != 1 || requested[0] != claims.sub {
+            return AuthError::Forbidden.into_response();
+        }
+    }
+
+    // run blocking scan
+    let age = q.age;
+    let fut = tokio::task::spawn_blocking(move || get_items(folder, &requested, age));
+
+    match fut.await {
+        Err(join_err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("task error: {join_err}")).into_response(),
+        Ok(Err(e)) => {
+            #[cfg(not(unix))]
+            { (StatusCode::NOT_IMPLEMENTED, e.to_string()).into_response() }
+            #[cfg(unix)]
+            { (StatusCode::BAD_REQUEST, e.to_string()).into_response() }
+        }
+        Ok(Ok(items)) => Json(items).into_response(),
+    }
 }
 
 
@@ -508,59 +636,6 @@ fn parse_users_csv(s: &str) -> Vec<String> {
         .collect()
 }
 
-async fn users_handler() -> impl IntoResponse {
-    Json(get_users().clone())
-}
-
-async fn get_folders_handler(Query(q): Query<FolderQuery>) -> impl IntoResponse {
-    // normalize path
-    let mut path = q.path.unwrap_or_else(|| "/".to_string());
-    if path.is_empty() { path = "/".to_string(); }
-    if !path.starts_with('/') { path = format!("/{}", path); }
-
-    let usernames: Vec<String> = match q.users.as_deref() {
-        Some(s) if !s.trim().is_empty() => parse_users_csv(s),
-        _ => Vec::new(), // empty means "all users"
-    };
-
-    let index = FS_INDEX.get().expect("FS index not initialized");
-
-    let items = match index.list_children(&path, &usernames, q.age) {
-        Ok(v) => v,
-        Err(_) => Vec::new(),
-    };
-
-    Json(items)
-}
-
-/// /api/files?path=/some/dir&users=alice,bob
-async fn get_files_handler(Query(q): Query<FilesQuery>) -> impl IntoResponse {
-    // validate path
-    let folder = match q.path.as_deref() {
-        Some(p) if !p.is_empty() => p.to_string(),
-        _ => return (StatusCode::BAD_REQUEST, "missing 'path' query parameter").into_response(),
-    };
-
-    let usernames: Vec<String> = match q.users.as_deref() {
-        Some(s) if !s.trim().is_empty() => parse_users_csv(s),
-        _ => Vec::new(), // empty means "all users"
-    };
-
-    // run blocking scan
-    let fut = tokio::task::spawn_blocking(move || get_items(folder, &usernames, q.age));
-
-    match fut.await {
-        Err(join_err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("task error: {join_err}")).into_response(),
-        Ok(Err(e)) => {
-            #[cfg(not(unix))]
-            { (StatusCode::NOT_IMPLEMENTED, e.to_string()).into_response() }
-            #[cfg(unix)]
-            { (StatusCode::BAD_REQUEST, e.to_string()).into_response() }
-        }
-        Ok(Ok(items)) => Json(items).into_response(),
-    }
-}
-
 fn default_static_dir() -> String {
     let mut exe_dir = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     exe_dir.pop(); // remove the binary name
@@ -568,3 +643,299 @@ fn default_static_dir() -> String {
     static_dir.to_string_lossy().into_owned()
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::Query;
+    use axum::response::IntoResponse;
+    use axum::body::to_bytes;
+    use serial_test::serial;
+    use serde_json::Value;
+    use std::io::Write;
+    use tempfile::{tempdir, NamedTempFile};
+    
+    const TEST_BODY_LIMIT: usize = 2 * 1024 * 1024; // 2 MiB is plenty for these payloads
+
+    /// Build a tiny CSV and initialize FS_INDEX + USERS exactly once.
+    fn init_index_once() {
+        if FS_INDEX.get().is_some() {
+            return;
+        }
+
+        // CSV columns: path,user,age,files,disk,atime,mtime
+        let mut f = NamedTempFile::new().expect("tmp csv");
+        writeln!(
+            f,
+            "path,user,age,files,disk,atime,mtime\n\
+             /,alice,0,2,100,1700000000,1700000100\n\
+             /,bob,1,1,50,1600000000,1600000100\n\
+             /docs,alice,2,3,300,1500000000,1500000050\n"
+        )
+        .unwrap();
+        let p = f.into_temp_path();
+
+        let mut idx = InMemoryFSIndex::new();
+        let users = idx.load_from_csv(p.as_ref()).expect("load_from_csv");
+        FS_INDEX.set(idx).expect("FS_INDEX set once");
+        USERS.set(users).expect("USERS set once");
+    }
+
+    #[test]
+    fn test_parse_users_csv() {
+        let v = parse_users_csv(" alice, bob ,, carol ");
+        assert_eq!(v, vec!["alice", "bob", "carol"]);
+        assert!(parse_users_csv(" ,, ,").is_empty());
+    }
+
+    #[test]
+    fn test_count_lines_variants() {
+        let mut f = NamedTempFile::new().unwrap();
+        // two lines, trailing newline
+        write!(f, "a\nb\n").unwrap();
+        assert_eq!(count_lines(f.path()).unwrap(), 2);
+
+        let mut g = NamedTempFile::new().unwrap();
+        // two lines, no trailing newline
+        write!(g, "a\nb").unwrap();
+        assert_eq!(count_lines(g.path()).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_normalize_and_canonical() {
+        assert_eq!(InMemoryFSIndex::normalize_path("foo/bar"), "/foo/bar");
+        assert_eq!(InMemoryFSIndex::canonical_key("/foo/bar/"), "/foo/bar");
+        assert_eq!(
+            InMemoryFSIndex::path_to_components("/a/b/c"),
+            vec!["a", "b", "c"]
+        );
+    }
+
+    #[tokio::test]
+    #[serial] // FS_INDEX/USERS are global
+    async fn test_users_handler_admin_and_user() {
+        init_index_once();
+        // Admin should receive full list
+        let admin = Claims {
+            sub: "root".to_string(),
+            is_admin: true,
+            exp: 9_999_999_999usize,
+        };
+        let resp_admin = users_handler(admin).await.into_response();
+        assert_eq!(resp_admin.status(), StatusCode::OK);
+        let body = to_bytes(resp_admin.into_body(), TEST_BODY_LIMIT).await.unwrap();
+        let list: Vec<String> = serde_json::from_slice(&body).unwrap();
+        assert!(list.contains(&"alice".to_string()));
+        assert!(list.contains(&"bob".to_string()));
+
+        // Non-admin should receive only self
+        let user = Claims {
+            sub: "alice".to_string(),
+            is_admin: false,
+            exp: 9_999_999_999usize,
+        };
+        let resp_user = users_handler(user).await.into_response();
+        let body = to_bytes(resp_user.into_body(), TEST_BODY_LIMIT).await.unwrap();
+        let list: Vec<String> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list, vec!["alice".to_string()]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_folders_handler_authz_and_filters() {
+        init_index_once();
+
+        // Non-admin asking "all users" -> Forbidden
+        let non_admin = Claims {
+            sub: "alice".into(),
+            is_admin: false,
+            exp: 9_999_999_999usize,
+        };
+        let q_all = FolderQuery {
+            path: Some("/".into()),
+            users: None, // empty means "all"
+            age: None,
+        };
+        let resp = get_folders_handler(non_admin.clone(), Query(q_all)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Non-admin asking for self only -> OK
+        let q_self = FolderQuery {
+            path: Some("/".into()),
+            users: Some("alice".into()),
+            age: None,
+        };
+        let resp = get_folders_handler(non_admin, Query(q_self)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), TEST_BODY_LIMIT).await.unwrap();
+        // Expect JSON array of FolderOut
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.is_array());
+
+        // Admin asking all -> OK, has children like "/docs"
+        let admin = Claims {
+            sub: "root".into(),
+            is_admin: true,
+            exp: 9_999_999_999usize,
+        };
+        let q_admin_all = FolderQuery {
+            path: Some("/".into()),
+            users: None,
+            age: None,
+        };
+        let resp = get_folders_handler(admin, Query(q_admin_all)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), TEST_BODY_LIMIT).await.unwrap();
+        let arr: Vec<FolderOut> = serde_json::from_slice(&body).unwrap();
+        assert!(arr.iter().any(|it| it.path == "/docs"));
+        // Check that at least one user has data in "/docs"
+        let docs = arr.into_iter().find(|it| it.path == "/docs").unwrap();
+        assert!(!docs.users.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_files_handler_bad_path() {
+        let claims = Claims {
+            sub: "any".into(),
+            is_admin: true,
+            exp: 9_999_999_999usize,
+        };
+        let q = FilesQuery {
+            path: None, // BAD
+            users: None,
+            age: None,
+        };
+        let resp = get_files_handler(claims, Query(q)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_get_files_handler_unix_admin_ok() {
+        // Make a temp dir with one file
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("a.txt");
+        std::fs::write(&file_path, b"hi").unwrap();
+
+        let claims = Claims {
+            sub: "root".into(),
+            is_admin: true,
+            exp: 9_999_999_999usize,
+        };
+        let q = FilesQuery {
+            path: Some(dir.path().to_string_lossy().into()),
+            users: None, // all users (allowed for admin)
+            age: None,
+        };
+
+        let resp = get_files_handler(claims, Query(q)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), TEST_BODY_LIMIT).await.unwrap();
+        let items: Vec<FsItemOut> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].path.ends_with("a.txt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_get_files_handler_unix_non_admin_forbidden() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("b.txt");
+        std::fs::write(&file_path, b"hi").unwrap();
+
+        let claims = Claims {
+            sub: "alice".into(),
+            is_admin: false,
+            exp: 9_999_999_999usize,
+        };
+        // Requesting "all users" -> forbidden for non-admin
+        let q = FilesQuery {
+            path: Some(dir.path().to_string_lossy().into()),
+            users: None,
+            age: None,
+        };
+        let resp = get_files_handler(claims, Query(q)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn test_get_files_handler_non_unix_not_implemented() {
+        let tmp = tempdir().unwrap();
+        let claims = Claims {
+            sub: "root".into(),
+            is_admin: true,
+            exp: 9_999_999_999usize,
+        };
+        let q = FilesQuery {
+            path: Some(tmp.path().to_string_lossy().into()),
+            users: None,
+            age: None,
+        };
+        let resp = get_files_handler(claims, Query(q)).await.into_response();
+        // handler maps get_items() error to 501 when not unix
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn test_private_handler_displays_claims() {
+        let claims = Claims {
+            sub: "carol".into(),
+            is_admin: false,
+            exp: 9_999_999_999usize,
+        };
+        let s = private_handler(claims).await.unwrap();
+        assert!(s.contains("Welcome to the protected area"));
+        assert!(s.contains("carol"));
+    }
+
+    #[tokio::test]
+    async fn test_login_missing_credentials() {
+        // No need to hit PAM/fake auth to test this branch
+        let bad1 = AuthPayload {
+            username: "".into(),
+            password: "x".into(),
+        };
+        let err1 = login_handler(Json(bad1)).await.unwrap_err();
+        assert!(matches!(err1, AuthError::MissingCredentials));
+
+        let bad2 = AuthPayload {
+            username: "x".into(),
+            password: "".into(),
+        };
+        let err2 = login_handler(Json(bad2)).await.unwrap_err();
+        assert!(matches!(err2, AuthError::MissingCredentials));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_list_children_filters_and_ages() {
+        init_index_once();
+        let idx = FS_INDEX.get().unwrap();
+
+        // all users under "/" (admin-like call)
+        let items = idx.list_children("/", &Vec::new(), None).unwrap();
+        assert!(items.iter().any(|it| it.path == "/docs"));
+
+        // filter by alice only
+        let items_alice = idx
+            .list_children("/", &vec!["alice".into()], None)
+            .unwrap();
+        assert!(items_alice.iter().any(|it| it.path == "/docs"));
+        // in "/docs", expect only "alice" present
+        let docs = items_alice
+            .into_iter()
+            .find(|it| it.path == "/docs")
+            .unwrap();
+        assert!(docs.users.contains_key("alice"));
+
+        // age filter: only age 2 under "/docs" (from fixture CSV)
+        let items_age2 = idx
+            .list_children("/", &Vec::new(), Some(2))
+            .unwrap();
+        let docs2 = items_age2.into_iter().find(|it| it.path == "/docs").unwrap();
+        // Age map keys are strings "0","1","2"
+        let alice_ages = docs2.users.get("alice").unwrap();
+        assert!(alice_ages.contains_key("2"));
+    }
+}

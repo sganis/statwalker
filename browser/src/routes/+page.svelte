@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { 
     getParent, humanTime, humanCount, 
     formatBytes, COLORS,
@@ -10,6 +10,8 @@
 
   //#region state
   
+  let path = $state('/nas/Drive/San/pc');
+  let fullPath = $state('');
   let folders = $state<FileItem[]>([]);
   let files = $state<ScannedFile[]>([]);
   let loading = $state(false);
@@ -27,9 +29,8 @@
   let userColors = $state(new Map<string, string>()); // cache: username -> color
   let userDropdown = $state<{user:string;color:string}[]>([]);
   let pathInput = $state();
-  let path = $state('/home/san/dev/statwalker/rs/src/bin');
-  let fullPath = $state('');
   let isEditing = $state(false);
+  let svelecteRef;
 
   //#endregion
 
@@ -120,8 +121,8 @@
   let ageFilter = $state<AgeFilter>(-1);
   let ageOpen = $state(false);
   const AGE_LABELS: Record<AgeFilter, string> = {
-    '-1': "All Ages",
-    0: "Recents",
+    '-1': "Any Time",
+    0: "Recent",
     1: "Not too old",
     2: "Old files",
   }
@@ -135,64 +136,6 @@
     ageOpen = false;
     refresh();
   }
-  //#endregion
-
-  //#region input path
-
-  function setPath(newPath) {
-    const displayedPath = displayPath(newPath);
-    fullPath = displayedPath;
-
-    if (!isEditing) {
-      path = truncatePathFromStart(displayedPath);
-    } else {
-      path = displayedPath;
-    }
-  }
-  // Function to truncate path from the beginning
-  function truncatePathFromStart(inputPath, maxLength = 50) {
-    if (!inputPath || inputPath.length <= maxLength) return inputPath;
-
-    const parts = inputPath.split('/');
-    let result = parts[parts.length - 1]; // Start with filename
-
-    // Add directories from the end until we approach maxLength
-    for (let i = parts.length - 2; i >= 0; i--) {
-      const potential = parts[i] + '/' + result;
-      if (('...' + potential).length > maxLength) break;
-      result = potential;
-    }
-
-    return '...' + result;
-  }
-  function onPathFocus() {
-    isEditing = true;
-    if (fullPath) {
-      path = fullPath;
-    }
-  }
-  function onPathBlur() {
-    isEditing = false;
-    if (path && !path.startsWith('...')) {
-      fullPath = path;
-    }
-    if (fullPath) {
-      path = truncatePathFromStart(fullPath);
-    }
-  }
-  function displayPath(p: string): string {
-    if (!p) return "/";
-    let s = p.replace(/\\/g, "/");
-    if (s !== "/") s = s.replace(/\/+$/, "");
-    if (!s.startsWith("/")) s = "/" + s;
-    return s || "/";
-  }
-  function onPathKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter") {
-      navigateTo(fullPath || path);
-    }
-  }
-
   //#endregion
 
   //#region tooltip
@@ -531,9 +474,9 @@
     return arr.sort((a, b) => fileMetricValue(b) - fileMetricValue(a));
   });
   const maxFileMetric = $derived.by(() => {
-    const vals = files?.map((f) => fileMetricValue(f)) ?? [];
-    const max = Math.max(0, ...vals);
-    return max > 0 ? max : 1;
+    // Use the parent folder's total as the maximum for file bars
+    const parentTotal = sortBy === "disk" ? pathTotals.total_disk : pathTotals.total_count;
+    return parentTotal > 0 ? parentTotal : 1;
   });
   const filePct = (f: ScannedFile) => Math.round((fileMetricValue(f) / maxFileMetric) * 1000) / 10;
   function rightValueFile(f: ScannedFile) {
@@ -624,35 +567,97 @@
       fetchFolders(history[histIdx]);
     }
   }
-  function userChanged() {
-    if (!selectedUser)
+  function onUserChanged() {
+    if (!selectedUser || selectedUser===null) {
       selectedUser = 'All Users'
+      //svelecteRef?.close();
+    }
     refresh()
   }
 
   //#endregion
 
-  //#region keyboard
+  //#region path
+
+	let copyFeedbackVisible = $state(false);
+
+  function setPath(newPath) {
+    const displayedPath = displayPath(newPath);
+    fullPath = displayedPath;
+
+    if (!isEditing) {
+      path = truncatePathFromStart(displayedPath);
+    } else {
+      path = displayedPath;
+    }
+  }
+  // Function to truncate path from the beginning
+  function truncatePathFromStart(inputPath, maxLength = 50) {
+    if (!inputPath || inputPath.length <= maxLength) return inputPath;
+
+    const parts = inputPath.split('/');
+    let result = parts[parts.length - 1]; // Start with filename
+
+    // Add directories from the end until we approach maxLength
+    for (let i = parts.length - 2; i >= 0; i--) {
+      const potential = parts[i] + '/' + result;
+      if (('...' + potential).length > maxLength) break;
+      result = potential;
+    }
+
+    return '...' + result;
+  }
+  function onPathFocus() {
+    isEditing = true;
+    if (fullPath) {
+      path = fullPath;
+    }
+  }
+  function onPathBlur() {
+    isEditing = false;
+    if (path && !path.startsWith('...')) {
+      fullPath = path;
+    }
+    if (fullPath) {
+      path = truncatePathFromStart(fullPath);
+    }
+  }
+  function displayPath(p: string): string {
+    if (!p) return "/";
+    let s = p.replace(/\\/g, "/");
+    if (s !== "/") s = s.replace(/\/+$/, "");
+    if (!s.startsWith("/")) s = "/" + s;
+    return s || "/";
+  }
+  function onPathKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      navigateTo(fullPath || path);
+    }
+  }
+
+  // Function to copy text from input/textarea
+	async function copyText(e) {
+    let element = e.currentTarget
+    try {
+      const textToCopy = element.value !== undefined 
+      ? element.value 
+      : (element.textContent || element.innerText || '')
+      await navigator.clipboard.writeText(textToCopy)
+      showCopyFeedback()
+    } catch (err) {
+      console.error('Copy failed:', err);
+    }
+	}
+
+	// Show copy feedback notification
+	function showCopyFeedback() {
+		copyFeedbackVisible = true;
+		setTimeout(() => {
+			copyFeedbackVisible = false;
+		}, 2000);
+	}
 
   //#endregion
- 
-  function copyPath(event) {
-    const text = event.target.textContent;
-    
-    // Select text
-    const selection = window.getSelection();
-    const range = document.createRange();
-    range.selectNodeContents(event.target);
-    selection.removeAllRanges();
-    selection.addRange(range);
-    
-    // Copy to clipboard
-    navigator.clipboard.writeText(text);
-    State.message = `Copied!: ${fullPath}`
-    setTimeout(() => {
-      State.message = ''
-    }, 1000);
-  }
 
   onMount(async () => {
     console.log("api url:", API_URL);
@@ -676,12 +681,12 @@
     </button>
     <button class="btn" onclick={goBack} title="Go Back" disabled={histIdx === 0}>
       <div class="flex items-center">
-      <span class="material-symbols-outlined">arrow_back_ios</span>
+      <span class="material-symbols-outlined">arrow_back</span>
       </div>
     </button>
     <button class="btn" onclick={goForward} title="Go Forward" disabled={histIdx >= history.length - 1}>
       <div class="flex items-center">
-      <span class="material-symbols-outlined">arrow_forward_ios</span>
+      <span class="material-symbols-outlined">arrow_forward</span>
       </div>
     </button>
     <button class="btn" onclick={goUp} title="Go Up" disabled={getParent(path) === path}>
@@ -689,11 +694,7 @@
       <span class="material-symbols-outlined">arrow_upward</span>
       </div>
     </button>
-    <button class="btn" title="Go to..." disabled={getParent(path) === path}>
-      <div class="flex items-center">
-      <span class="material-symbols-outlined">arrow_forward</span>
-      </div>
-    </button>
+
     <!-- Sort dropdown -->
     <div class="relative" use:clickOutside={() => (sortOpen = false)}>
       <button class="btn w-36" onclick={() => (sortOpen = !sortOpen)}>
@@ -731,10 +732,10 @@
            border-gray-500 bg-gray-800 shadow-lg z-20 overflow-hidden mt-0.5"
         >
           <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge(-1)}>
-            All Ages
+            Any Time
           </button>
           <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge(0)}>
-            Recents (2 months)
+            Recent (2 months)
           </button>
           <button class="w-full text-left px-3 py-2 hover:bg-gray-700" onclick={() => chooseAge(1)}>
             Not too old (2 years)
@@ -747,29 +748,40 @@
     </div>
 
     <Svelecte
+      bind:this={svelecteRef}
       bind:value={selectedUser} 
       options={userDropdown}
       valueField="user" 
       renderer="color"
-      onChange={userChanged}
-      class="z-20 min-w-40 h-10 border rounded border-gray-600 bg-gray-800 text-white"
+      highlightFirstItem={false}
+      onChange={onUserChanged}
+      closeAfterSelect={true}
+      deselectMode="native"
+      virtualList={true}
+      class="z-20 min-w-40 h-10 border rounded
+       border-gray-500 bg-gray-800 text-white"
     />
   </div>
-  <!-- <div class="flex">
+  <div class="flex">
     <input 
-    bind:this={pathInput}
-    bind:value={path} placeholder="Path..." 
-    class="w-full truncate text-left"
-    onkeydown={onPathKeydown} 
-    onblur={onPathBlur}
-    onfocus={onPathFocus}
-    disabled={loading} />
-  </div> -->
-
+      bind:this={pathInput}
+      bind:value={path} placeholder="Path..." 
+      class="w-full truncate text-left cursor-pointer"
+      onkeydown={onPathKeydown} 
+      onblur={onPathBlur}
+      onfocus={onPathFocus}
+      onclick={(e)=>copyText(e)}
+      autocorrect="off" 
+      spellcheck="false"
+      autocomplete="off"
+      autocapitalize="none"
+      disabled={loading} />
+  </div>
+  
   <!-- Path total header item -->
   <div class="">
-    <div class="relative px-2 bg-gray-700 border border-gray-600 rounded overflow-hidden">
-      <!-- Stacked bar for TOTAL of current path (full width) -->
+    <div class="relative px-2 bg-gray-700 border border-gray-500 rounded overflow-hidden">
+      <!-- Total bar background -->
       <div class="absolute left-0 top-0 bottom-0 flex z-0" style="width: 100%">
         {#each sortedUserEntries(pathTotals) as [uname, userData] (uname)}
           {@const userMetric = sortBy === "disk" ? userData.disk : userData.count}
@@ -787,10 +799,9 @@
           ></div>
         {/each}
       </div>
-      <!-- Foreground content -->
-      <div class="relative z-10 p-1">
-        <!-- svelte-ignore a11y_interactive_supports_focus -->
-        <div class="" ondblclick={copyPath} role="textbox">{path}</div>
+      <!-- Total bar foreground -->
+      <div class="relative z-10 p-1 pointer-events-none">        
+        <!-- <div class="" ondblclick={copyPath} role="textbox">{path}</div> -->
         <div class="flex items-center justify-end">
           <p class="">
             {humanCount(pathTotals.total_count)} Files 
@@ -826,7 +837,7 @@
     <!-- Skeleton Loader (UI stays interactive) -->
     <div class="flex flex-col gap-2 overflow-y-auto">
       {#each Array(6) as _, i}
-        <div class="relative p-3 bg-gray-800 border border-gray-600 rounded-lg animate-pulse min-h-16 h-16">
+        <div class="relative p-3 bg-gray-800 border border-gray-500 rounded-lg animate-pulse min-h-16 h-16">
           <div class="flex items-center justify-between gap-4">
             <div class="h-4 bg-gray-700 rounded w-3/4"></div>
             <div class="h-3 bg-gray-700 rounded w-12"></div>
@@ -846,10 +857,10 @@
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
-          class="relative px-2 py-1 cursor-pointer hover:opacity-95 bg-gray-700 border border-gray-600 rounded-lg overflow-hidden min-h-16"
+          class="relative px-2 py-1 cursor-pointer hover:opacity-95 bg-gray-700 border border-gray-500 rounded-lg overflow-hidden min-h-16"
           onclick={() => navigateTo(folder.path)}
         >
-          <!-- Stacked bar background -->
+          <!-- Folder bar background -->
           <div class="absolute left-0 top-0 bottom-0 flex z-0" style="width: {pct(metricValue(folder))}%">
             {#each sortedUserEntries(folder) as [uname, userData]}
               {@const userMetric = sortBy === "disk" ? userData.disk : userData.count}
@@ -866,8 +877,8 @@
               ></div>
             {/each}
           </div>
-
-          <div class="flex flex-col gap-2 relative z-10 pointer-events-none">
+          <!-- Folder bar foreground -->
+          <div class="relative flex flex-col gap-2 z-10 pointer-events-none">
             <div class="flex items-center justify-between gap-4">
               <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap">
                 <div>{folder.path}</div>
@@ -893,15 +904,23 @@
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div class="flex">
           <span class="material-symbols-outlined text-4xl">subdirectory_arrow_right</span>
-          <div class="flex grow relative px-2 py-1 bg-gray-700 border border-gray-600 rounded overflow-hidden text-xs">
+          <div class="relative flex grow px-2 py-1 bg-gray-700 border border-gray-500 rounded overflow-hidden text-xs">
             <div class="flex flex-col w-full">
-              <div class="absolute left-0 top-0 bottom-0 z-0 opacity-60" style="width: {filePct(f)}%; background-color: {color};"></div>
-              <div class="relative z-10 flex items-center justify-between gap-1">
-                <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap"
-                  ondblclick={copyPath}>
-                  {f.path}
+              <!-- File bar background -->
+              <div class="absolute left-0 top-0 bottom-0 z-0 opacity-60" 
+                style="width: {filePct(f)}%; background-color: {color};">
+              </div>
+              <div class="relative z-10 flex items-center justify-between gap-2">
+                <div class="w-full overflow-hidden">
+                  <!-- svelte-ignore a11y_click_events_have_key_events -->
+                  <span class="cursor-pointer text-ellipsis text-nowrap"
+                    onclick={(e)=>copyText(e)}>
+                    {f.path}
+                  </span>                  
                 </div>
-                <div class="flex items-center gap-4 text-sm font-semibold text-nowrap">{rightValueFile(f)}</div>
+                <div class="flex items-center gap-4 text-sm font-semibold text-nowrap">
+                  {rightValueFile(f)}
+                </div>
               </div>
               <div class="relative z-10 flex justify-between">
                 <div class="">{f.owner}</div>
@@ -918,6 +937,7 @@
   <div class="grow"></div>
 </div>
 
+<!-- Tooltip -->
 {#if tip.show}
   <div
     class="fixed z-50 pointer-events-none"
@@ -942,5 +962,19 @@
         <div class="w-2 h-2 rotate-45 bg-black/90 border border-white/10 border-l-0 border-t-0"></div>
       </div>
     </div>
+  </div>
+{/if}
+
+<!-- Feedback notification -->
+{#if copyFeedbackVisible}
+  <div 
+    class="fixed top-1 right-2.5 bg-green-600 text-white px-4 py-3 
+      rounded-lg font-medium shadow-lg z-50 transform 
+      transition-transform duration-300 
+      ease-[cubic-bezier(0.68,-0.55,0.265,1.55)]"
+    class:translate-x-full={!copyFeedbackVisible}
+    class:translate-x-0={copyFeedbackVisible}
+  >
+    Path copied!
   </div>
 {/if}

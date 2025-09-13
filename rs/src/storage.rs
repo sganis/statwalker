@@ -411,30 +411,30 @@ pub fn get_all_storage_info() -> std::io::Result<Vec<StorageInfo>> {
 }
 
 // Example usage and test function
-fn main() -> std::io::Result<()> {
-    println!("Physical Storage Devices:");
-    println!("{}", "=".repeat(120));
+// fn main() -> std::io::Result<()> {
+//     println!("Physical Storage Devices:");
+//     println!("{}", "=".repeat(120));
     
-    match get_all_storage_info() {
-        Ok(storages) => {
-            if storages.is_empty() {
-                println!("No storage devices found.");
-            } else {
-                for storage in storages {
-                    println!("{}", storage);
-                    if storage.mount_points.len() > 1 {
-                        println!("  Mount points: {}", storage.mount_points.join(", "));
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("Error getting storage information: {}", e);
-        }
-    }
+//     match get_all_storage_info() {
+//         Ok(storages) => {
+//             if storages.is_empty() {
+//                 println!("No storage devices found.");
+//             } else {
+//                 for storage in storages {
+//                     println!("{}", storage);
+//                     if storage.mount_points.len() > 1 {
+//                         println!("  Mount points: {}", storage.mount_points.join(", "));
+//                     }
+//                 }
+//             }
+//         }
+//         Err(e) => {
+//             eprintln!("Error getting storage information: {}", e);
+//         }
+//     }
     
-    Ok(())
-}
+//     Ok(())
+// }
 
 #[cfg(test)]
 mod tests {
