@@ -3,27 +3,27 @@
   import "../app.css";
   import logo from '../assets/disk_usage.svg';
   import Login from '../lib/Login.svelte';
-  import { State, initialState} from '../ts/store.svelte';
+  import { State } from '../ts/store.svelte';
 
   let { children } = $props()
-  let authed = $derived(Boolean(State.token) && (!State.expiresAt || Date.now() < State.expiresAt))
+  let authed = $derived(
+      Boolean(State.token) 
+    && (!State.expiresAt || Date.now() < State.expiresAt)
+  )
 
-  // keep authed in sync with State (when Login writes State, this flips)
   $effect(() => {
     authed = Boolean(State.token) && (!State.expiresAt || Date.now() < State.expiresAt);
   });
 
-  function logout(silent = false) {
+  function logout() {
     State.logout()
     localStorage.removeItem('state');
-    // optional: redirect to login (hash-based in your app)
-    if (!silent) location.href = '/#/login';
   }
 
   function onLogout() {
     logout();
-    authed = false;
   }
+
 </script>
 
 <div class="flex flex-col h-screen min-h-0 overflow-hidden">
