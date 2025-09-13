@@ -86,15 +86,7 @@ fn main() -> std::io::Result<()> {
     // Enable colors on Windows (this is automatic on Unix-like systems)
     #[cfg(windows)]
     colored::control::set_virtual_terminal(true).unwrap_or(());
-
-    // println!(
-    //     "{}, {}, {}, {}, {}, and some normal text.",
-    //     "Bold".bold(),
-    //     "Red".red().bold(),
-    //     "Yellow".yellow(),
-    //     "Green".green().bold(),
-    //     "Blue".blue().bold(),
-    // );
+    
     println!("{}","------------------------------------------------".cyan().bold());
     println!("{}", "Statlaker: Super fast filesystem scanner".cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());
@@ -184,7 +176,7 @@ fn main() -> std::io::Result<()> {
     }
 
     // ---- merge shards and print summary ----
-    merge_shards(&out_dir, &final_path, threads, args.sort)?;
+    merge_shards(&out_dir, &final_path, threads, args.sort).expect("merge shards failed");
 
     let elapsed = start_time.elapsed();
     let secs = elapsed.as_secs_f64();
