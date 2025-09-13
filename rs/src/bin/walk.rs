@@ -86,7 +86,7 @@ fn main() -> std::io::Result<()> {
     // Enable colors on Windows (this is automatic on Unix-like systems)
     #[cfg(windows)]
     colored::control::set_virtual_terminal(true).unwrap_or(());
-    
+
     println!("{}","------------------------------------------------".cyan().bold());
     println!("{}", "Statlaker: Super fast filesystem scanner".cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());
@@ -625,7 +625,7 @@ fn merge_shards(out_dir: &Path,
     sort_lines: bool
 ) -> std::io::Result<()> {
     let mut out = BufWriter::with_capacity(
-        16 * 1024 * 1024, // Larger output buffer
+        8 * 1024 * 1024, // Larger output buffer
         File::create(&final_path)?
     );
     // build the header dynamically (replace the fixed write_all line)
