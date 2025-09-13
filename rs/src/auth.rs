@@ -186,7 +186,7 @@ pub mod platform {
 
     // PAM functions
     #[link(name = "pam")]
-    extern "C" {
+    unsafe extern "C" {
         fn pam_start(
             service_name: *const c_char,
             user: *const c_char,
@@ -199,7 +199,7 @@ pub mod platform {
     }
 
     // libc functions
-    extern "C" {
+    unsafe extern "C" {
         fn malloc(size: size_t) -> *mut c_void;
         fn calloc(nmemb: size_t, size: size_t) -> *mut c_void;
         fn free(ptr: *mut c_void);
@@ -222,7 +222,7 @@ pub mod platform {
     }
 
     // PAM conversation callback
-    extern "C" fn pam_conv(
+    unsafe extern "C" fn pam_conv(
         num_msg: c_int,
         msg: *mut *const PamMessage,
         resp: *mut *mut PamResponse,
@@ -269,114 +269,52 @@ pub mod platform {
         }
     }
 
-/// Simple PAM authentication
-pub fn verify_user(username: &str, password: &str) -> Result<bool, String> {
-    verify_user_with_service(username, password, "login")
-}
-
-/// PAM authentication with custom service
-pub fn verify_user_with_service(username: &str, password: &str, service: &str) -> Result<bool, String> {
-    let service_c = CString::new(service).map_err(|_| "Invalid service name")?;
-    let user_c = CString::new(username).map_err(|_| "Invalid username")?;
-    let password_c = CString::new(password).map_err(|_| "Invalid password")?;
-
-    unsafe {
-        let mut pamh: *mut PamHandle = ptr::null_mut();
-        let conv = PamConv {
-            conv: Some(pam_conv),
-            appdata_ptr: password_c.as_ptr() as *mut c_void,
-        };
-
-        // Start PAM
-        let rc = pam_start(
-            service_c.as_ptr(),
-            user_c.as_ptr(),
-            &conv,
-            &mut pamh,
-        );
-
-        if rc != PAM_SUCCESS || pamh.is_null() {
-            if !pamh.is_null() {
-                pam_end(pamh, rc);
-            }
-            return Err(format!("PAM initialization failed: {}", rc));
-        }
-
-        // Authenticate
-        let auth_result = pam_authenticate(pamh, 0);
-        if auth_result != PAM_SUCCESS {
-            pam_end(pamh, auth_result);
-            return Ok(false); // Authentication failed
-        }
-
-        // Check account
-        let acct_result = pam_acct_mgmt(pamh, 0);
-        let success = acct_result == PAM_SUCCESS;
-
-        pam_end(pamh, PAM_SUCCESS);
-        Ok(success)
+    /// Simple PAM authentication
+    pub fn verify_user(username: &str, password: &str) -> Result<bool, String> {
+        verify_user_with_service(username, password, "login")
     }
-}
 
-    /// Check if user exists using getpwnam
-    pub fn user_exists(username: &str) -> bool {
-        let user_c = match CString::new(username) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
+    /// PAM authentication with custom service
+    pub fn verify_user_with_service(username: &str, password: &str, service: &str) -> Result<bool, String> {
+        let service_c = CString::new(service).map_err(|_| "Invalid service name")?;
+        let user_c = CString::new(username).map_err(|_| "Invalid username")?;
+        let password_c = CString::new(password).map_err(|_| "Invalid password")?;
 
         unsafe {
-            let passwd = libc::getpwnam(user_c.as_ptr());
-            !passwd.is_null()
-        }
-    }
+            let mut pamh: *mut PamHandle = ptr::null_mut();
+            let conv = PamConv {
+                conv: Some(pam_conv),
+                appdata_ptr: password_c.as_ptr() as *mut c_void,
+            };
 
-    /// Get user information
-    #[derive(Debug)]
-    pub struct UserInfo {
-        pub username: String,
-        pub uid: u32,
-        pub gid: u32,
-        pub home_dir: std::path::PathBuf,
-        pub shell: std::path::PathBuf,
-    }
+            // Start PAM
+            let rc = pam_start(
+                service_c.as_ptr(),
+                user_c.as_ptr(),
+                &conv,
+                &mut pamh,
+            );
 
-    impl UserInfo {
-        pub fn is_root(&self) -> bool {
-            self.uid == 0
-        }
-
-        pub fn home_exists(&self) -> bool {
-            self.home_dir.exists()
-        }
-
-        pub fn shell_exists(&self) -> bool {
-            self.shell.exists()
-        }
-    }
-
-    /// Get user information from passwd
-    pub fn get_user_info(username: &str) -> Option<UserInfo> {
-        let user_c = CString::new(username).ok()?;
-
-        unsafe {
-            let passwd = libc::getpwnam(user_c.as_ptr());
-            if passwd.is_null() {
-                return None;
+            if rc != PAM_SUCCESS || pamh.is_null() {
+                if !pamh.is_null() {
+                    pam_end(pamh, rc);
+                }
+                return Err(format!("PAM initialization failed: {}", rc));
             }
 
-            let pw = *passwd;
-            let username = std::ffi::CStr::from_ptr(pw.pw_name).to_string_lossy().to_string();
-            let home_dir = std::ffi::CStr::from_ptr(pw.pw_dir).to_string_lossy();
-            let shell = std::ffi::CStr::from_ptr(pw.pw_shell).to_string_lossy();
+            // Authenticate
+            let auth_result = pam_authenticate(pamh, 0);
+            if auth_result != PAM_SUCCESS {
+                pam_end(pamh, auth_result);
+                return Ok(false); // Authentication failed
+            }
 
-            Some(UserInfo {
-                username,
-                uid: pw.pw_uid,
-                gid: pw.pw_gid,
-                home_dir: std::path::PathBuf::from(home_dir.as_ref()),
-                shell: std::path::PathBuf::from(shell.as_ref()),
-            })
+            // Check account
+            let acct_result = pam_acct_mgmt(pamh, 0);
+            let success = acct_result == PAM_SUCCESS;
+
+            pam_end(pamh, PAM_SUCCESS);
+            Ok(success)
         }
     }
 }
