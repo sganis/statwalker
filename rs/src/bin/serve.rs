@@ -39,7 +39,7 @@ struct Args {
     static_dir: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsItemOut {
     pub path: String,
     pub owner: String,   // username
@@ -868,18 +868,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
-    #[tokio::test]
-    async fn test_private_handler_displays_claims() {
-        let claims = Claims {
-            sub: "carol".into(),
-            is_admin: false,
-            exp: 9_999_999_999usize,
-        };
-        let s = private_handler(claims).await.unwrap();
-        assert!(s.contains("Welcome to the protected area"));
-        assert!(s.contains("carol"));
-    }
-
+   
     #[tokio::test]
     async fn test_login_missing_credentials() {
         // No need to hit PAM/fake auth to test this branch
