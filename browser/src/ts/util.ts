@@ -104,112 +104,95 @@ export function capitalize(str) {
   return str.charAt(0).toUpperCase() + str.slice(1);
 }
 
+// export const COLORS = [
+//   "#3B82F6","#EAB308","#F43F5E","#F59E0B","#0EA5E9","#10B981","#22C55E",
+//   "#A855F7","#6366F1","#06B6D4","#84CC16","#EF4444","#F97316","#14B8A6",
+//   "#8B5CF6","#7C3AED","#4F46E5","#0891B2","#16A34A","#A3E635","#BE123C",
+//   "#EA580C","#0D9488","#9333EA","#6D28D9","#4338CA","#155E75","#166534",
+//   "#65A30D","#9F1239","#C2410C","#0F766E","#7E22CE","#5B21B6","#3730A3",
+//   "#0E7490","#15803D","#4D7C0F","#881337","#9A3412","#115E59","#6B21A8",
+//   "#4C1D95","#1E40AF","#1D4ED8","#2563EB","#1F2937","#10A37F","#D97706",
+//   "#22D3EE","#059669","#D946EF","#F43F3F","#E11D48","#FB7185","#111827",
+// ];
+
+// Dark + Vivid Palette for Black Backgrounds
 export const COLORS = [
-  "#3B82F6","#EAB308","#F43F5E","#F59E0B","#0EA5E9","#10B981","#22C55E",
-  "#A855F7","#6366F1","#06B6D4","#84CC16","#EF4444","#F97316","#14B8A6",
-  "#8B5CF6","#7C3AED","#4F46E5","#0891B2","#16A34A","#A3E635","#BE123C",
-  "#EA580C","#0D9488","#9333EA","#6D28D9","#4338CA","#155E75","#166534",
-  "#65A30D","#9F1239","#C2410C","#0F766E","#7E22CE","#5B21B6","#3730A3",
-  "#0E7490","#15803D","#4D7C0F","#881337","#9A3412","#115E59","#6B21A8",
-  "#4C1D95","#1E40AF","#1D4ED8","#2563EB","#1F2937","#10A37F","#D97706",
-  "#22D3EE","#059669","#D946EF","#F43F3F","#E11D48","#FB7185","#111827",
-];
+  // Tier 1: Strong primaries
+  '#C53030', // Dark Red
+  '#2F855A', // Deep Green
+  '#2B6CB0', // Deep Blue
+  '#B7791F', // Dark Gold
+  '#6B46C1', // Dark Purple
+  '#C05621', // Burnt Orange
+  '#2C7A7B', // Dark Teal
+  '#C2185B', // Vivid Magenta
 
+  // Tier 2: Secondary strongs
+  '#22543D', // Forest Green
+  '#1A365D', // Navy
+  '#97266D', // Hot Pink / Fuchsia
+  '#9C4221', // Rust Red
+  '#44337A', // Indigo
+  '#00838F', // Cyan/Teal
+  '#D35400', // Orange Red
+  '#0891B2', // Sky Cyan
 
-// Base color palette optimized for maximum perceptual difference
-const baseColors = [
-  '#E53E3E', // Red
-  '#38A169', // Green  
-  '#3182CE', // Blue
-  '#D69E2E', // Orange/Gold
-  '#805AD5', // Purple
-  '#DD6B20', // Orange
-  '#319795', // Teal
-  '#E53E3E', // Pink/Magenta
-  '#2F855A', // Dark Green
-  '#2B6CB0', // Dark Blue
-  '#B83280', // Pink
-  '#C05621', // Dark Orange
-];
+  // Tier 3: Mid-dark variants (still visible with white text)
+  '#276749', // Medium-Dark Green
+  '#1E40AF', // Medium-Dark Blue
+  '#9B2C2C', // Medium-Dark Crimson
+  '#553C9A', // Deep Indigo
+  '#115E59', // Teal Shade
+  '#9F1239', // Deep Pinkish Red
+  '#A16207', // Dark Amber
+  '#0F766E', // Deep Aquamarine
 
-// Enhanced color palette with better distribution
-const enhancedPalette = [
-  // Tier 1: Maximum contrast primaries
-  '#E53E3E', // Vibrant Red
-  '#38A169', // Forest Green
-  '#3182CE', // Royal Blue
-  '#D69E2E', // Golden Yellow
-  '#805AD5', // Deep Purple
-  '#DD6B20', // Burnt Orange
-  '#319795', // Teal
-  '#E91E63', // Magenta
-  
-  // Tier 2: Secondary colors with good contrast
-  '#2F855A', // Dark Green
-  '#2B6CB0', // Navy Blue
-  '#B83280', // Hot Pink
-  '#C05621', // Rust
-  '#553C9A', // Indigo
-  '#00B5D8', // Cyan
-  '#F56500', // Orange Red
-  '#0BC5EA', // Sky Blue
-  
-  // Tier 3: Lighter variants
-  '#68D391', // Light Green
-  '#63B3ED', // Light Blue  
-  '#F6AD55', // Light Orange
-  '#B794F6', // Light Purple
-  '#81E6D9', // Light Teal
-  '#FBB6CE', // Light Pink
-  '#FC8181', // Light Red
-  '#90CDF4', // Pale Blue
-  
-  // Tier 4: Darker variants
-  '#1A365D', // Dark Navy
-  '#1A202C', // Almost Black
-  '#2D3748', // Dark Gray
-  '#4A5568', // Medium Gray
-  '#742A2A', // Dark Red
-  '#22543D', // Dark Forest
-  '#553C9A', // Dark Purple
-  '#744210', // Dark Gold
+  // Tier 4: Extra deep anchors
+  '#742A2A', // Very Dark Red
+  '#234E52', // Very Dark Teal
+  '#312E81', // Very Dark Indigo
+  '#5A1E1E', // Brick
+  '#513C06', // Dark Mustard
+  '#3C096C', // Royal Violet
+  '#7C2D12', // Ember
+  '#14532D', // Pine Green
 ];
 
 // Smart color assignment function
 export const getOptimalColors = (numUsers) => {
   if (numUsers === 1) {
-    return [enhancedPalette[0]]; // Single vibrant color
+    return [COLORS[0]]; // Single vibrant color
   }
   
   if (numUsers === 2) {
-    return [enhancedPalette[0], enhancedPalette[2]]; // Red and Blue - maximum contrast
+    return [COLORS[0], COLORS[2]]; // Red and Blue - maximum contrast
   }
   
   if (numUsers === 3) {
-    return [enhancedPalette[0], enhancedPalette[1], enhancedPalette[2]]; // Red, Green, Blue
+    return [COLORS[0], COLORS[1], COLORS[2]]; // Red, Green, Blue
   }
   
   if (numUsers <= 8) {
     // Use tier 1 colors for optimal distinction
-    return enhancedPalette.slice(0, numUsers);
+    return COLORS.slice(0, numUsers);
   }
   
   if (numUsers <= 16) {
     // Mix tier 1 and tier 2
-    return enhancedPalette.slice(0, numUsers);
+    return COLORS.slice(0, numUsers);
   }
   
   if (numUsers <= 24) {
     // Use first 24 colors
-    return enhancedPalette.slice(0, numUsers);
+    return COLORS.slice(0, numUsers);
   }
   
   // For more than 24 users, cycle through with slight variations
   const colors = [];
   for (let i = 0; i < numUsers; i++) {
-    const baseIndex = i % enhancedPalette.length;
-    const cycle = Math.floor(i / enhancedPalette.length);
-    let color = enhancedPalette[baseIndex];
+    const baseIndex = i % COLORS.length;
+    const cycle = Math.floor(i / COLORS.length);
+    let color = COLORS[baseIndex];
     
     // Apply slight modifications for cycles
     if (cycle > 0) {
