@@ -160,18 +160,27 @@ async fn login_handler(Json(payload): Json<AuthPayload>) -> Result<Json<AuthBody
 
 /// GET /api/users
 async fn users_handler(claims: Claims) -> impl IntoResponse {
-    println!("users: {:?}", &claims);
+    // println!("GET /api/users as={} admin={}", claims.sub, claims.is_admin);
+
     if claims.is_admin {
-        // return all users
-        Json(get_users().clone())
+        let users = get_users().clone();
+        println!("200 OK /api/users count={}", users.len());
+        Json(users)
     } else {
-        // username only
-        Json(vec![claims.sub])
+        let me = vec![claims.sub.clone()];
+        println!("200 OK /api/users self={:?}", me);
+        Json(me)
     }
 }
 
+
 /// GET /api/folders?path=/some/dir&users=alice,bob&age=1
 async fn get_folders_handler(claims: Claims, Query(q): Query<FolderQuery>) -> impl IntoResponse {
+    // println!(
+    //     "GET /api/folders raw path={:?} users={:?} age={:?} as={} admin={}",
+    //     q.path, q.users, q.age, claims.sub, claims.is_admin
+    // );
+
     // normalize path
     let mut path = q.path.unwrap_or_else(|| "/".to_string());
     if path.is_empty() { path = "/".to_string(); }
@@ -182,18 +191,29 @@ async fn get_folders_handler(claims: Claims, Query(q): Query<FolderQuery>) -> im
         Some(s) if !s.trim().is_empty() => parse_users_csv(s),
         _ => Vec::new(),
     };
+    // println!(
+    //     "GET /api/folders normalized path={} requested_users={:?} age={:?}",
+    //     path, requested, q.age
+    // );
 
-    // authorization: only admins can request "all users" or others
+    // authorization
     if !claims.is_admin {
         if requested.is_empty() || requested.len() != 1 || requested[0] != claims.sub {
+            println!("403 Forbidden /api/folders path={} requested_users={:?}", path, requested);
             return AuthError::Forbidden.into_response();
         }
     }
 
     let index = FS_INDEX.get().expect("FS index not initialized");
     let items = match index.list_children(&path, &requested, q.age) {
-        Ok(v) => v,
-        Err(_) => Vec::new(),
+        Ok(v) => {
+            println!("200 OK /api/folders path={} items={}", path, v.len());
+            v
+        }
+        Err(e) => {
+            println!("list_children ERROR /api/folders path={} err={}", path, e);
+            Vec::new()
+        }
     };
 
     Json(items).into_response()
@@ -201,10 +221,18 @@ async fn get_folders_handler(claims: Claims, Query(q): Query<FolderQuery>) -> im
 
 /// GET /api/files?path=/some/dir&users=alice,bob&age=1
 async fn get_files_handler(claims: Claims, Query(q): Query<FilesQuery>) -> impl IntoResponse {
+    // println!(
+    //     "GET /api/files raw path={:?} users={:?} age={:?} as={} admin={}",
+    //     q.path, q.users, q.age, claims.sub, claims.is_admin
+    // );
+
     // validate path
     let folder = match q.path.as_deref() {
         Some(p) if !p.is_empty() => p.to_string(),
-        _ => return (StatusCode::BAD_REQUEST, "missing 'path' query parameter").into_response(),
+        _ => {
+            println!("400 Bad Request /api/files missing 'path'");
+            return (StatusCode::BAD_REQUEST, "missing 'path' query parameter").into_response();
+        }
     };
 
     // parse users (empty => "all users")
@@ -213,26 +241,41 @@ async fn get_files_handler(claims: Claims, Query(q): Query<FilesQuery>) -> impl 
         _ => Vec::new(),
     };
 
-    // authorization: only admins can request "all users" or others
+    // authorization
     if !claims.is_admin {
         if requested.is_empty() || requested.len() != 1 || requested[0] != claims.sub {
+            println!("403 Forbidden /api/files path={} requested_users={:?}", folder, requested);
             return AuthError::Forbidden.into_response();
         }
     }
 
-    // run blocking scan
     let age = q.age;
+    //println!("GET /api/files scan folder={} requested_users={:?} age={:?}", folder, requested, age);
+
+    // run blocking scan
     let fut = tokio::task::spawn_blocking(move || get_items(folder, &requested, age));
 
     match fut.await {
-        Err(join_err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("task error: {join_err}")).into_response(),
+        Err(join_err) => {
+            println!("500 Task Join Error /api/files err={join_err}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("task error: {join_err}")).into_response()
+        }
         Ok(Err(e)) => {
             #[cfg(not(unix))]
-            { (StatusCode::NOT_IMPLEMENTED, e.to_string()).into_response() }
+            {
+                println!("501 Not Implemented /api/files err={}", e);
+                (StatusCode::NOT_IMPLEMENTED, e.to_string()).into_response()
+            }
             #[cfg(unix)]
-            { (StatusCode::BAD_REQUEST, e.to_string()).into_response() }
+            {
+                println!("400 Bad Request /api/files err={}", e);
+                (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+            }
         }
-        Ok(Ok(items)) => Json(items).into_response(),
+        Ok(Ok(items)) => {
+            println!("200 OK /api/files items={}", items.len());
+            Json(items).into_response()
+        }
     }
 }
 

@@ -127,7 +127,7 @@ where
     }
 }
 
-// #[cfg(unix)]
+// #[cfg(target_os = "macos")]
 // pub mod platform {
 //     use pam::Authenticator;
 
@@ -141,7 +141,35 @@ where
 //     }
 // }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+pub mod platform {
+    use std::process::{Command, Stdio};
+    pub fn verify_user(username: &str, password: &str) -> bool {
+        // WARNING: password is passed as a process argument (visible to local admins via ps)
+        // Prefer PAM for production security; this is the simplest working approach.
+        match Command::new("dscl")
+            .args([".", "-authonly", username, password])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) => {
+                if status.success() {
+                    true
+                } else {
+                    println!("dscl . -authonly {} ******** exit status: {:?}", username, status);
+                    false
+                }
+            },
+            Err(e) => {
+                println!("error in command: dscl . -authonly {} ********: {:?}", username, e);                
+                false
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub mod platform {
     use std::process::{Command, Stdio};
     use std::io::Write;
@@ -149,6 +177,7 @@ pub mod platform {
     // Verify user credentials using the su command
     /// Returns true if authentication succeeds, false otherwise
     pub fn verify_user(username: &str, password: &str) -> bool {
+        println!("vefirying user: {}", username);
         let mut child = match Command::new("su")
             .arg(username)
             .arg("-c")
@@ -159,20 +188,34 @@ pub mod platform {
             .spawn()
         {
             Ok(child) => child,
-            Err(_) => return false, // Failed to spawn su command
+            Err(e) => {
+                println!("vefiry user failed: {}: {:?}", username, e);
+                return false;                 
+            }
         };
 
         // Send the password to su's stdin
         if let Some(mut stdin) = child.stdin.take() {
             if writeln!(stdin, "{}", password).is_err() {
+                println!("error sending string to stdin");                
                 return false;
             }
         }
 
         // Wait for su to complete and check exit status
         match child.wait() {
-            Ok(status) => status.success(),
-            Err(_) => false,
+            Ok(status) => {
+                if status.success() {
+                    true
+                } else {
+                    println!("su {} -c true command exit status: {:?}", username, status);
+                    false
+                }
+            },
+            Err(e) => {
+                println!("error waiting for su {} -c true command: {:?}", username, e);                
+                false
+            }
         }
     }
 
