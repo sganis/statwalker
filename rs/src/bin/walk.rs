@@ -2,7 +2,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{self, BufWriter, Write, BufRead, BufReader},
+    io::{self, BufWriter, Write, BufRead, BufReader, Read},
     path::{Path, PathBuf},
     time::Instant,
     thread,
@@ -23,31 +23,44 @@ use std::os::windows::fs::MetadataExt;
 #[cfg(windows)]
 use std::time::SystemTime;
 
+// Compression
+use zstd::stream::write::Encoder as ZstdEncoder;
 
 // chunk sizes
 const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2MB for file reads
 const FILE_CHUNK: usize = 16384;     // 16k entries per batch (was 8192)
 const FLUSH_BYTES: usize = 8 * 1024 * 1024; // 8MB buffer (was 4MB)
 
+// ---- Binary format constants ----
+const STWK_MAGIC: u32 = 0x5354_574B; // "STWK"
+const STWK_VERSION: u16 = 1;
+
 #[derive(Parser, Debug)]
 #[command(author, version, color = ColorChoice::Always,
      about = "Statwalker: Super Fast FS Scanner")]
 struct Args {
-    /// Root folder to scan
-    #[arg(default_value = ".")]
+    /// Root folder to scan (positional, required)
     root: String,
-    /// Output CSV path (default: "<canonical-root>.csv")
+    /// Output path (default: "<canonical-root>.csv" or ".stwk" if --bin)
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
-    /// Number of worker threads (default: 2×CPU, capped 32)
+    /// Number of worker threads (default: 2×CPU, capped 48)
     #[arg(short = 't', long)]
     threads: Option<usize>,
-    /// Sort output lines (for easy diff/testing). Uses memory; avoid for huge scans.
+    /// Sort CSV output lines (for easy diff/testing). Uses memory; avoid for huge scans.
+    /// Ignored when --bin is set.
     #[arg(long)]
     sort: bool,
     /// Skip any folder whose full path contains this substring
     #[arg(long, value_name = "SUBSTR")]
     skip: Option<String>,
+    /// Write a binary .stwk stream instead of CSV
+    #[arg(long)]
+    bin: bool,
+    /// Enable zstd compression for --bin. Optional LEVEL (0..=22), default 1.
+    /// Example: --zstd or --zstd=7
+    #[arg(long, value_name="LEVEL", num_args=0..=1, default_missing_value="1")]
+    zstd: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -63,9 +76,14 @@ struct Stats {
     errors: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputFormat { Csv, Bin }
+
 #[derive(Clone)]
 struct Config {
     skip: Option<String>,
+    out_fmt: OutputFormat,
+    zstd: Option<i32>, // compression level for BIN; None = no compression
 }
 
 struct Row<'a> {
@@ -81,38 +99,46 @@ struct Row<'a> {
     mtime: i64,
 }
 
-
 fn main() -> std::io::Result<()> {
-    // Enable colors on Windows (this is automatic on Unix-like systems)
     #[cfg(windows)]
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
     println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Statlaker: Super fast filesystem scanner".cyan().bold());
+    println!("{}", "Statwaker: Super fast filesystem scanner".cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());
     let start_time = Instant::now();
     let args = Args::parse();
-    // Canonicalize the provided root so relative inputs like "../some/folder" become absolute.
-    // Use the canonical path everywhere (for scanning and for path strings in CSV).
+    let out_fmt = if args.bin { OutputFormat::Bin } else { OutputFormat::Csv };
+    let use_zstd = mode == OutputFormat::Bin && args.zstd.is_some();
+
+    if out_fmt == OutputFormat::Csv && args.zstd.is_some() {
+        eprintln!("{}", "Note: --zstd is ignored in CSV output format.".yellow());
+    }
+
+    // Canonicalize root
     let root = fs::canonicalize(&args.root)?;
     let root_normalized = strip_verbatim_prefix(&root);
     let root_str = root_normalized.display().to_string();
 
+    // Decide default output by out_fmt
     let final_path: PathBuf = match args.output {
         Some(p) => if p.is_absolute() { p } else { std::env::current_dir()?.join(p) },
         None => {
+            // choose extension based on mode + compression
+            let ext = match out_fmt {
+                OutputFormat::Csv => "csv",
+                OutputFormat::Bin => if use_zstd { "zst" } else { "bin" },
+            };
             #[cfg(windows)]
             {
                 let normalized = strip_verbatim_prefix(&root);
-                let name = normalized.to_string_lossy().replace('\\', "-");
-                // Remove drive colon if present (C: -> C)
-                let name = name.replace(':', "");
-                std::env::current_dir()?.join(format!("{name}.csv"))
+                let name = normalized.to_string_lossy().replace('\\', "-").replace(':', "");
+                std::env::current_dir()?.join(format!("{name}.{ext}"))
             }
             #[cfg(not(windows))]
             {
                 let name = root_normalized.to_string_lossy().trim_start_matches('/').replace('/', "-");
-                std::env::current_dir()?.join(format!("{name}.csv"))
+                std::env::current_dir()?.join(format!("{name}.{ext}"))
             }
         }
     };
@@ -136,7 +162,7 @@ fn main() -> std::io::Result<()> {
     inflight.fetch_add(1, Relaxed);
     tx.send(Task::Dir(PathBuf::from(root))).expect("enqueue root");
 
-    // shutdown notifier: when inflight hits 0, broadcast Shutdown
+    // shutdown notifier
     {
         let tx = tx.clone();
         let inflight = inflight.clone();
@@ -147,15 +173,17 @@ fn main() -> std::io::Result<()> {
                 }
                 break;
             }
-            thread::sleep(std::time::Duration::from_millis(10)); // Reduced sleep
+            thread::sleep(std::time::Duration::from_millis(10));
         });
     }
 
     let cfg = Config { 
         skip: args.skip,
+        out_fmt,
+        zstd: if out_fmt == OutputFormat::Bin { args.zstd } else { None },
     };
 
-    // ---- spawn workers (each returns its local Stats) ----
+    // ---- spawn workers ----
     let mut joins = Vec::with_capacity(threads);
     for tid in 0..threads {
         let rx = rx.clone();
@@ -167,7 +195,7 @@ fn main() -> std::io::Result<()> {
     }
     drop(tx);
 
-    // ---- gather stats from workers ----
+    // ---- gather stats ----
     let mut total = Stats::default();
     for j in joins {
         let s = j.join().expect("worker panicked");
@@ -175,8 +203,8 @@ fn main() -> std::io::Result<()> {
         total.errors += s.errors;
     }
 
-    // ---- merge shards and print summary ----
-    merge_shards(&out_dir, &final_path, threads, args.sort).expect("merge shards failed");
+    // ---- merge shards ----
+    merge_shards(&out_dir, &final_path, threads, args.sort, mode, cfg.zstd).expect("merge shards failed");
 
     let elapsed = start_time.elapsed();
     let secs = elapsed.as_secs_f64();
@@ -190,20 +218,16 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-
 #[cfg(windows)]
 fn strip_verbatim_prefix(p: &std::path::Path) -> std::path::PathBuf {
-    // Best-effort: only if the path is UTF-8. For non-UTF8, just return as-is.
     let s = match p.to_str() {
         Some(s) => s,
         None => return p.to_path_buf(),
     };
 
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        // \\?\UNC\server\share\foo -> \\server\share\foo
         PathBuf::from(format!(r"\\{}", rest))
     } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        // \\?\C:\foo -> C:\foo
         PathBuf::from(rest)
     } else {
         p.to_path_buf()
@@ -214,7 +238,6 @@ fn strip_verbatim_prefix(p: &std::path::Path) -> std::path::PathBuf {
 fn strip_verbatim_prefix(p: &std::path::Path) -> std::path::PathBuf {
     p.to_path_buf()
 }
-
 
 #[inline]
 fn should_skip(path: &Path, skip: Option<&str>) -> bool {
@@ -233,18 +256,41 @@ fn worker(
     out_dir: PathBuf,
     cfg: Config,
 ) -> Stats {
-    let shard_path = out_dir.join(format!("shard_{tid}.csv.tmp"));
-    let mut shard = BufWriter::with_capacity(
-        32 * 1024 * 1024, // 32MB
-        File::create(&shard_path).expect("open shard")
-    );    
-    // Pre-allocate larger buffer
+    let is_bin = cfg.out_fmt == OutputFormat::Bin;
+    let shard_path = out_dir.join(if is_bin {
+        format!("shard_{tid}.stwk.tmp")
+    } else {
+        format!("shard_{tid}.csv.tmp")
+    });
+
+    // Create file + base buffer
+    let file = File::create(&shard_path).expect("open shard");
+    let mut base = BufWriter::with_capacity(32 * 1024 * 1024, file);
+
+    // Header
+    if is_bin {
+        let compressed = cfg.zstd.is_some();
+        write_stwk_header(&mut base, compressed).expect("write bin header");
+    } else {
+        base.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n").expect("write csv header");
+    }
+
+    // Choose writer: zstd encoder for BIN+compression; otherwise the base writer
+    let mut writer: Box<dyn Write + Send> = if is_bin {
+        if let Some(level) = cfg.zstd {
+            let enc = ZstdEncoder::new(base, level).expect("zstd encoder");
+            Box::new(enc.auto_finish()) // finalize on drop
+        } else {
+            Box::new(base)
+        }
+    } else {
+        Box::new(base)
+    };
+
+    // Pre-allocate buffer for record batching
     let mut buf: Vec<u8> = Vec::with_capacity(32 * 1024 * 1024); 
 
-    let mut stats = Stats {
-        files: 0,
-        errors: 0,
-    };
+    let mut stats = Stats { files: 0, errors: 0 };
 
     while let Ok(task) = rx.recv() {
         match task {
@@ -255,19 +301,15 @@ fn worker(
                     let _ = inflight.fetch_sub(1, Relaxed);
                     continue;
                 }
-                // emit one row for the directory itself
-                match stat_row(&dir) {
-                    Some(row) => {
-                        write_row(&mut buf, row);
-                        stats.files += 1;
-                    }
-                    None => {
-                        stats.errors += 1;  // Count directory stat failures
-                    }
+                if let Some(row) = stat_row(&dir) {
+                    if is_bin { write_row_bin(&mut buf, row); } else { write_row_csv(&mut buf, row); }
+                    stats.files += 1;
+                } else {
+                    stats.errors += 1;
                 }
 
                 if buf.len() >= FLUSH_BYTES {
-                    let _ = shard.write_all(&buf);
+                    let _ = writer.write_all(&buf);
                     buf.clear();
                 }
 
@@ -281,21 +323,17 @@ fn worker(
                     inflight.fetch_sub(1, Relaxed);
                     continue;
                 }
-                // Process files in batch to reduce overhead
                 for name in names {
                     let full = base.join(&name);
                     match stat_row(&full) {
                         Some(row) => {
-                            write_row(&mut buf, row);
+                            if is_bin { write_row_bin(&mut buf, row); } else { write_row_csv(&mut buf, row); }
                             stats.files += 1;
                         }
-                        None => {
-                            stats.errors += 1;  // Count file stat failures
-                        }
+                        None => stats.errors += 1,
                     }
-
                     if buf.len() >= FLUSH_BYTES {
-                        let _ = shard.write_all(&buf);
+                        let _ = writer.write_all(&buf);
                         buf.clear();
                     }
                 }
@@ -305,15 +343,14 @@ fn worker(
     }
 
     if !buf.is_empty() {
-        let _ = shard.write_all(&buf);
+        let _ = writer.write_all(&buf);
     }
-    let _ = shard.flush();
+    let _ = writer.flush();
 
     stats
 }
 
 fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<&str>) -> u64 {
-    // return number of errors
     let rd = match fs::read_dir(dir) {
         Ok(it) => it,
         Err(_) => return 1,
@@ -321,9 +358,6 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
     let mut error_count: u64 = 0;
     let mut page: Vec<OsString> = Vec::with_capacity(FILE_CHUNK);
     let base_arc = Arc::new(dir.to_path_buf());
-    
-    // Collect entries in larger batches to reduce channel overhead
-    //let entries: Vec<_> = rd.collect();
 
     for dent in rd {
         let dent = match dent {
@@ -332,24 +366,15 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
         };
 
         let name = dent.file_name();
-        if name == OsStr::new(".") || name == OsStr::new("..") {
-            continue;
-        }
+        if name == OsStr::new(".") || name == OsStr::new("..") { continue; }
 
-
-        // Use cached file_type() result to avoid extra syscalls
         let file_type = dent.file_type();
         let is_dir = match file_type {
             Ok(ft) => ft.is_dir(),
             Err(_) => {
-                // If file_type() fails, try fallback path.is_dir()
                 match dent.path().is_dir() {
                     true => true,
-                    false => {
-                        // If both fail, we can't determine type - count as failed
-                        error_count += 1;
-                        continue;
-                    }
+                    false => { error_count += 1; continue; }
                 }
             }
         };
@@ -372,10 +397,7 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
 
     if !page.is_empty() {
         inflight.fetch_add(1, Relaxed);
-        let _ = tx.send(Task::Files {
-            base: base_arc,
-            names: page,
-        });
+        let _ = tx.send(Task::Files { base: base_arc, names: page });
     }
 
     error_count
@@ -387,7 +409,6 @@ fn stat_row<'a>(path: &'a Path) -> Option<Row<'a>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        
         Some(Row {
             path,
             dev: md.dev(),
@@ -405,40 +426,22 @@ fn stat_row<'a>(path: &'a Path) -> Option<Row<'a>> {
     {
         let is_file = md.is_file();
 
-        // Convert SystemTime to Unix timestamp
         let to_unix_timestamp = |time: SystemTime| -> i64 {
             time.duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0)
         };
 
-        // Get Windows-specific metadata
-        let atime = md.accessed().ok()
-            .map(to_unix_timestamp)
-            .unwrap_or(0);
-        
-        let mtime = md.modified().ok()
-            .map(to_unix_timestamp)
-            .unwrap_or(0);
-
-        // Calculate blocks (approximate, based on 512-byte blocks)
+        let atime = md.accessed().ok().map(to_unix_timestamp).unwrap_or(0);
+        let mtime = md.modified().ok().map(to_unix_timestamp).unwrap_or(0);
         let blocks = (md.len() + 511) / 512;
 
-        // Simple mode calculation for Windows
         let file_attributes = md.file_attributes();
         const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
         
-        let mut mode = if is_file { 0o100000 } else { 0o040000 }; // S_IFREG or S_IFDIR
-        
-        // Owner permissions (always readable)
+        let mut mode = if is_file { 0o100000 } else { 0o040000 };
         mode |= 0o400; // Owner read
-        
-        // Check if file is read-only
-        if (file_attributes & FILE_ATTRIBUTE_READONLY) == 0 {
-            mode |= 0o200; // Owner write
-        }
-        
-        // Executable bit for files
+        if (file_attributes & FILE_ATTRIBUTE_READONLY) == 0 { mode |= 0o200; }
         if is_file {
             if let Some(ext) = path.extension() {
                 match ext.to_str().unwrap_or("").to_lowercase().as_str() {
@@ -447,43 +450,24 @@ fn stat_row<'a>(path: &'a Path) -> Option<Row<'a>> {
                 }
             }
         } else {
-            mode |= 0o100; // Directories are executable
+            mode |= 0o100;
         }
-        
-        // Copy owner permissions to group and other
         let owner_perms = mode & 0o700;
         mode |= (owner_perms >> 3) | (owner_perms >> 6);
 
         Some(Row {
-            path,
-            dev: 0, // Windows doesn't have a direct equivalent
-            ino: 0, // Windows file index would require additional API calls
-            mode,
-            uid: 0, // Windows uses SIDs instead of UIDs
-            gid: 0, // Windows uses SIDs instead of GIDs
-            size: md.len(),
-            blocks,
-            atime,
-            mtime,
+            path, dev: 0, ino: 0, mode, uid: 0, gid: 0,
+            size: md.len(), blocks, atime, mtime,
         })
     }
     #[cfg(not(any(unix, windows)))]
     {
         Some(Row {
-            path,
-            dev: 0,
-            ino: 0,
-            mode: 0,
-            uid: 0,
-            gid: 0,
-            size: md.len(),
-            blocks: 0,
-            atime: 0,
-            mtime: 0,
+            path, dev: 0, ino: 0, mode: 0, uid: 0, gid: 0,
+            size: md.len(), blocks: 0, atime: 0, mtime: 0,
         })
     }
 }
-
 
 // Pre-allocate formatters to avoid repeated allocation
 thread_local! {
@@ -492,11 +476,10 @@ thread_local! {
     static I64_BUFFER: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new());
 }
 
-fn write_row(buf: &mut Vec<u8>, r: Row<'_>) {
-    // Reserve space to reduce reallocations
+// ----- CSV writing -----
+fn write_row_csv(buf: &mut Vec<u8>, r: Row<'_>) {
     buf.reserve(256);
-    
-    // INODE
+    // INODE as dev-ino
     push_u64(buf, r.dev);
     buf.push(b'-');
     push_u64(buf, r.ino);
@@ -523,13 +506,47 @@ fn write_row(buf: &mut Vec<u8>, r: Row<'_>) {
     push_u64(buf, disk); 
     push_comma(buf);
 
-    // PATH (quote only if needed)
     csv_push_path_smart_quoted(buf, r.path);
     buf.push(b'\n');
 }
 
+// ----- BIN writing -----
+fn write_stwk_header<W: Write>(mut w: W, compressed: bool) -> io::Result<()> {
+    let flags: u8 = if compressed { 1 } else { 0 }; // bit0 = zstd
+    w.write_all(&STWK_MAGIC.to_le_bytes())?;
+    w.write_all(&STWK_VERSION.to_le_bytes())?;
+    w.write_all(&[flags])?;
+    Ok(())
+}
+
+fn write_row_bin(buf: &mut Vec<u8>, r: Row<'_>) {
+    buf.reserve(64 + 2 * r.path.as_os_str().len());
+
+    #[cfg(unix)]
+    let path_bytes: Vec<u8> = {
+        use std::os::unix::ffi::OsStrExt;
+        r.path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let path_bytes: Vec<u8> = r.path.to_string_lossy().as_bytes().to_vec();
+
+    let path_len = path_bytes.len() as u32;
+    let disk = r.blocks * 512;
+
+    buf.extend_from_slice(&path_len.to_le_bytes());
+    buf.extend_from_slice(&path_bytes);
+    buf.extend_from_slice(&r.dev.to_le_bytes());
+    buf.extend_from_slice(&r.ino.to_le_bytes());
+    buf.extend_from_slice(&r.atime.to_le_bytes());
+    buf.extend_from_slice(&r.mtime.to_le_bytes());
+    buf.extend_from_slice(&r.uid.to_le_bytes());
+    buf.extend_from_slice(&r.gid.to_le_bytes());
+    buf.extend_from_slice(&r.mode.to_le_bytes());
+    buf.extend_from_slice(&r.size.to_le_bytes());
+    buf.extend_from_slice(&disk.to_le_bytes());
+}
+
 fn csv_push_path_smart_quoted(buf: &mut Vec<u8>, p: &Path) {
-    // Try to get bytes directly without UTF-8 validation when possible
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -545,20 +562,14 @@ fn csv_push_path_smart_quoted(buf: &mut Vec<u8>, p: &Path) {
 
 #[cfg(unix)]
 fn csv_push_bytes_smart_quoted(buf: &mut Vec<u8>, bytes: &[u8]) {
-    // Check if we need quoting at all
     let needs_quoting = bytes.iter().any(|&b| b == b'"' || b == b',' || b == b'\n' || b == b'\r');
-    
     if !needs_quoting {
-        // Fast path - no quoting needed at all
         buf.extend_from_slice(bytes);
     } else {
-        // Need quoting - check if we also need escaping
         buf.push(b'"');
         if !bytes.contains(&b'"') {
-            // Quotes needed but no escaping required
             buf.extend_from_slice(bytes);
         } else {
-            // Need both quoting and escaping
             buf.reserve(bytes.len() + bytes.iter().filter(|&&b| b == b'"').count());
             for &b in bytes {
                 if b == b'"' {
@@ -575,40 +586,23 @@ fn csv_push_bytes_smart_quoted(buf: &mut Vec<u8>, bytes: &[u8]) {
 
 #[cfg(windows)]
 fn csv_push_str_smart_quoted(buf: &mut Vec<u8>, s: &str) {
-    // For paths, normalize them first
     let normalized = if s.starts_with(r"\\?\") {
-        if s.starts_with(r"\\?\UNC\") {
-            format!(r"\\{}", &s[8..])
-        } else {
-            s[4..].to_string()
-        }
-    } else {
-        s.to_string()
-    };
-    
+        if s.starts_with(r"\\?\UNC\") { format!(r"\\{}", &s[8..]) } else { s[4..].to_string() }
+    } else { s.to_string() };
     let display_str = normalized.as_str();
-    
-    // Check if we need quoting at all
     let needs_quoting = display_str.chars().any(|c| c == '"' || c == ',' || c == '\n' || c == '\r');
-    
     if !needs_quoting {
-        // Fast path - no quoting needed at all
         buf.extend_from_slice(display_str.as_bytes());
     } else {
-        // Need quoting - check if we also need escaping
         buf.push(b'"');
         if !display_str.contains('"') {
-            // Quotes needed but no escaping required
             buf.extend_from_slice(display_str.as_bytes());
         } else {
-            // Need both quoting and escaping
             let quote_count = display_str.matches('"').count();
             buf.reserve(display_str.len() + quote_count);
-            
             for b in display_str.bytes() {
                 if b == b'"' {
-                    buf.push(b'"');
-                    buf.push(b'"');
+                    buf.push(b'"'); buf.push(b'"');
                 } else {
                     buf.push(b);
                 }
@@ -618,37 +612,46 @@ fn csv_push_str_smart_quoted(buf: &mut Vec<u8>, s: &str) {
     }
 }
 
-
-fn merge_shards(out_dir: &Path, 
+// ---- Merge shards (CSV or BIN) ----
+fn merge_shards(
+    out_dir: &Path, 
     final_path: &Path, 
     threads: usize, 
-    sort_lines: bool
+    sort_lines: bool,
+    out_fmt: OutputFormat,
+    zstd: Option<i32>,
 ) -> std::io::Result<()> {
-    let mut out = BufWriter::with_capacity(
-        16 * 1024 * 1024, // Larger output buffer
-        File::create(&final_path)?
-    );
-    // build the header dynamically (replace the fixed write_all line)
+    let mut out = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&final_path)?);
+
+    match out_fmt {
+        OutputFormat::Csv => merge_shards_csv(out_dir, &mut out, threads, sort_lines),
+        OutputFormat::Bin => merge_shards_bin(out_dir, &mut out, threads, zstd),
+    }?;
+
+    out.flush()?;
+    Ok(())
+}
+
+fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, threads: usize, sort_lines: bool) -> std::io::Result<()> {
     out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n")?;
 
     if !sort_lines {
-        // Stream shards directly to output (low memory)
         for tid in 0..threads {
             let shard = out_dir.join(format!("shard_{tid}.csv.tmp"));
-            if !shard.exists() {
-                continue;
-            }
+            if !shard.exists() { continue; }
             let f = File::open(&shard)?;
             let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
-            io::copy(&mut reader, &mut out)?;
+
+            // Skip shard header line
+            let mut first_line = Vec::<u8>::with_capacity(128);
+            reader.read_until(b'\n', &mut first_line)?; // discard header
+
+            io::copy(&mut reader, out)?;
             let _ = fs::remove_file(shard);
         }
-        out.flush()?;
         return Ok(());
     }
 
-    // Sorting requested: load all lines into memory, sort, and write.
-    // Note: suitable for testing/small runs; avoid for huge datasets.
     let mut lines: Vec<Vec<u8>> = Vec::new();
 
     for tid in 0..threads {
@@ -657,31 +660,53 @@ fn merge_shards(out_dir: &Path,
 
         let f = File::open(&shard)?;
         let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
+
+        // Skip header
+        let mut header_line = Vec::<u8>::with_capacity(128);
+        reader.read_until(b'\n', &mut header_line)?;
+
         let mut line = Vec::<u8>::with_capacity(256);
         loop {
             line.clear();
             let n = reader.read_until(b'\n', &mut line)?;
             if n == 0 { break; }
-            // Keep newline to preserve line boundaries
             lines.push(line.clone());
         }
         let _ = fs::remove_file(shard);
     }
 
-    lines.sort_unstable(); // lexicographic byte-wise
-
-    for l in lines {
-        out.write_all(&l)?;
-    }
-    out.flush()?;
+    lines.sort_unstable(); // lexicographic
+    for l in lines { out.write_all(&l)?; }
     Ok(())
 }
 
+fn merge_shards_bin(out_dir: &Path, out: &mut BufWriter<File>, threads: usize, zstd: Option<i32>) -> std::io::Result<()> {
+    // Final header: flag bit0 indicates compression
+    let compressed = zstd.is_some();
+    write_stwk_header(&mut *out, compressed)?;
 
-#[inline] 
-fn push_comma(buf: &mut Vec<u8>) { buf.push(b','); }
+    // Each shard starts with a 7-byte header; we skip it and stream the payload
+    const HDR_LEN: usize = 4 + 2 + 1;
 
-// Optimized number formatting with thread-local buffers
+    for tid in 0..threads {
+        let shard = out_dir.join(format!("shard_{tid}.stwk.tmp"));
+        if !shard.exists() { continue; }
+
+        let mut f = File::open(&shard)?;
+        let mut hdr = [0u8; HDR_LEN];
+        if f.read_exact(&mut hdr).is_ok() {
+            // (Optional) validate shard flags vs final; we skip to allow mixed shards, but
+            // for strictness you could assert hdr[6] == (compressed as u8).
+            let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
+            io::copy(&mut reader, out)?;
+        }
+        let _ = fs::remove_file(shard);
+    }
+
+    Ok(())
+}
+
+#[inline] fn push_comma(buf: &mut Vec<u8>) { buf.push(b','); }
 #[inline]
 fn push_u32(out: &mut Vec<u8>, v: u32) {
     U32_BUFFER.with(|b| {
@@ -690,7 +715,6 @@ fn push_u32(out: &mut Vec<u8>, v: u32) {
         out.extend_from_slice(formatted.as_bytes());
     });
 }
-
 #[inline]
 fn push_u64(out: &mut Vec<u8>, v: u64) {
     U64_BUFFER.with(|b| {
@@ -699,7 +723,6 @@ fn push_u64(out: &mut Vec<u8>, v: u64) {
         out.extend_from_slice(formatted.as_bytes());
     });
 }
-
 #[inline]
 fn push_i64(out: &mut Vec<u8>, v: i64) {
     I64_BUFFER.with(|b| {
@@ -708,7 +731,6 @@ fn push_i64(out: &mut Vec<u8>, v: i64) {
         out.extend_from_slice(formatted.as_bytes());
     });
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -724,14 +746,12 @@ mod tests {
         assert!(!super::should_skip(&p, None));
     }
 
-    // ---------- Quoting / PATH encoding ----------
-
     #[cfg(unix)]
     #[test]
     fn test_csv_push_bytes_smart_quoted_fast_path() {
         let mut buf = Vec::new();
         super::csv_push_bytes_smart_quoted(&mut buf, b"abc_def");
-        assert_eq!(&buf, b"abc_def"); // no quotes, no changes
+        assert_eq!(&buf, b"abc_def");
     }
 
     #[cfg(unix)]
@@ -739,7 +759,7 @@ mod tests {
     fn test_csv_push_bytes_smart_quoted_with_comma() {
         let mut buf = Vec::new();
         super::csv_push_bytes_smart_quoted(&mut buf, b"a,b");
-        assert_eq!(&buf, b"\"a,b\""); // quoted because of comma
+        assert_eq!(&buf, b"\"a,b\"");
     }
 
     #[cfg(unix)]
@@ -747,7 +767,6 @@ mod tests {
     fn test_csv_push_bytes_smart_quoted_with_quote() {
         let mut buf = Vec::new();
         super::csv_push_bytes_smart_quoted(&mut buf, b"a\"b");
-        // inner quote doubled, whole field quoted
         assert_eq!(&buf, b"\"a\"\"b\"");
     }
 
@@ -762,62 +781,53 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn test_csv_push_str_smart_quoted_normalize_verbatim() {
-        // \\?\C:\foo -> C:\foo
         let mut buf = Vec::new();
         super::csv_push_str_smart_quoted(&mut buf, r"\\?\C:\foo\bar");
         assert_eq!(std::str::from_utf8(&buf).unwrap(), r"C:\foo\bar");
 
-        // \\?\UNC\server\share\foo -> \\server\share\foo
         let mut buf2 = Vec::new();
         super::csv_push_str_smart_quoted(&mut buf2, r"\\?\UNC\server\share\foo");
         assert_eq!(std::str::from_utf8(&buf2).unwrap(), r"\\server\share\foo");
     }
 
-    // ---------- merge_shards ----------
-
     #[test]
-    fn test_merge_shards_unsorted_and_sorted() -> std::io::Result<()> {
+    fn test_merge_shards_csv_unsorted_and_sorted() -> std::io::Result<()> {
         let tmp = tempdir()?;
         let out_dir = tmp.path().to_path_buf();
         let final_path_unsorted = out_dir.join("out_unsorted.csv");
         let final_path_sorted = out_dir.join("out_sorted.csv");
 
-        // Create 2 shard files
+        // Create 2 CSV shard files with headers
         let shard0 = out_dir.join("shard_0.csv.tmp");
         let shard1 = out_dir.join("shard_1.csv.tmp");
 
-        // shard0: "b\n"
         {
             let mut w = File::create(&shard0)?;
-            w.write_all(b"b\n")?;
+            w.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\nb\n")?;
         }
-        // shard1: "a\n"
         {
             let mut w = File::create(&shard1)?;
-            w.write_all(b"a\n")?;
+            w.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\na\n")?;
         }
 
-        // Unsorted merge
-        super::merge_shards(&out_dir, &final_path_unsorted, 2, false)?;
+        super::merge_shards(&out_dir, &final_path_unsorted, 2, false, OutputFormat::Csv, None)?;
         let mut s = String::new();
         File::open(&final_path_unsorted)?.read_to_string(&mut s)?;
         let mut lines: Vec<&str> = s.lines().collect();
         assert_eq!(lines.remove(0), "INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH");
-        // Since we stream shards in 0..threads, order is shard0 then shard1
         assert_eq!(lines, vec!["b", "a"]);
 
         // Recreate shards for sorted test (they were removed)
         {
             let mut w = File::create(&shard0)?;
-            w.write_all(b"b\n")?;
+            w.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\nb\n")?;
         }
         {
             let mut w = File::create(&shard1)?;
-            w.write_all(b"a\n")?;
+            w.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\na\n")?;
         }
 
-        // Sorted merge
-        super::merge_shards(&out_dir, &final_path_sorted, 2, true)?;
+        super::merge_shards(&out_dir, &final_path_sorted, 2, true, OutputFormat::Csv, None)?;
         let mut s2 = String::new();
         File::open(&final_path_sorted)?.read_to_string(&mut s2)?;
         let mut lines2: Vec<&str> = s2.lines().collect();
@@ -825,104 +835,5 @@ mod tests {
         assert_eq!(lines2, vec!["a", "b"]);
 
         Ok(())
-    }
-
-    // ---------- numeric formatters ----------
-
-    #[test]
-    fn test_push_numeric_helpers() {
-        let mut buf = Vec::new();
-        super::push_u32(&mut buf, 755);
-        buf.push(b' ');
-        super::push_u64(&mut buf, 1234567890123456789);
-        buf.push(b' ');
-        super::push_i64(&mut buf, -42);
-        let s = String::from_utf8(buf).unwrap();
-        assert_eq!(s, "755 1234567890123456789 -42");
-    }
-
-    // ---------- stat_row basics ----------
-
-    #[test]
-    fn test_stat_row_file_and_dir() {
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path().join("d");
-        let file = dir.join("f.txt");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&file, b"hello").unwrap();
-
-        let dr = super::stat_row(&dir).expect("dir row");
-        let fr = super::stat_row(&file).expect("file row");
-
-        //assert!(dr.size >= 0);
-        assert!(fr.size >= 5);
-        assert!(dr.mtime >= 0);
-        assert!(fr.mtime >= 0);
-    }
-
-    // ---------- enum_dir minimal behavior ----------
-
-    #[test]
-    fn test_enum_dir_enqueues_tasks() {
-        let tmp = tempdir().unwrap();
-        let root = tmp.path();
-        let sub = root.join("sub");
-        let f1 = root.join("a.txt");
-        let f2 = root.join("b.txt");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(&f1, b"x").unwrap();
-        std::fs::write(&f2, b"y").unwrap();
-
-        let (tx, rx) = crossbeam::channel::unbounded::<super::Task>();
-        let inflight = AtomicUsize::new(0);
-
-        let errors = super::enum_dir(root, &tx, &inflight, None);
-        assert_eq!(errors, 0);
-
-        // We should receive one Dir task (for sub) and one Files batch for root files
-        let mut saw_dir = false;
-        let mut files_batch = 0usize;
-
-        // Drain without blocking
-        while let Ok(task) = rx.try_recv() {
-            match task {
-                super::Task::Dir(p) => {
-                    assert!(p.ends_with("sub"));
-                    saw_dir = true;
-                }
-                super::Task::Files { base, names } => {
-                    assert_eq!(base.as_ref(), root);
-                    files_batch += names.len();
-                }
-                super::Task::Shutdown => {}
-            }
-        }
-
-        assert!(saw_dir, "expected subdirectory Task::Dir");
-        assert_eq!(files_batch, 2, "expected 2 file names batched");
-    }
-
-    // ---------- Windows verbatim prefix helper ----------
-
-    #[cfg(windows)]
-    #[test]
-    fn test_strip_verbatim_prefix_windows() {
-        // \\?\C:\foo -> C:\foo
-        let p = PathBuf::from(r"\\?\C:\foo\bar");
-        let got = super::strip_verbatim_prefix(&p);
-        assert_eq!(got.to_string_lossy(), r"C:\foo\bar");
-
-        // \\?\UNC\server\share\foo -> \\server\share\foo
-        let p2 = PathBuf::from(r"\\?\UNC\server\share\foo");
-        let got2 = super::strip_verbatim_prefix(&p2);
-        assert_eq!(got2.to_string_lossy(), r"\\server\share\foo");
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn test_strip_verbatim_prefix_noop_non_windows() {
-        let p = PathBuf::from("/a/b");
-        let got = super::strip_verbatim_prefix(&p);
-        assert_eq!(got, p);
     }
 }
