@@ -109,7 +109,7 @@ fn main() -> std::io::Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
     let out_fmt = if args.bin { OutputFormat::Bin } else { OutputFormat::Csv };
-    let use_zstd = mode == OutputFormat::Bin && args.zstd.is_some();
+    let use_zstd = out_fmt == OutputFormat::Bin && args.zstd.is_some();
 
     if out_fmt == OutputFormat::Csv && args.zstd.is_some() {
         eprintln!("{}", "Note: --zstd is ignored in CSV output format.".yellow());
@@ -204,7 +204,7 @@ fn main() -> std::io::Result<()> {
     }
 
     // ---- merge shards ----
-    merge_shards(&out_dir, &final_path, threads, args.sort, mode, cfg.zstd).expect("merge shards failed");
+    merge_shards(&out_dir, &final_path, threads, args.sort, out_fmt, cfg.zstd).expect("merge shards failed");
 
     let elapsed = start_time.elapsed();
     let secs = elapsed.as_secs_f64();
