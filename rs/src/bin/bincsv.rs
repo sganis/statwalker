@@ -30,7 +30,8 @@
 // zstd = "0.13"
 // itoa = "1"
 
-use clap::Parser;
+use clap::{Parser, ColorChoice};
+use colored::Colorize;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -44,7 +45,7 @@ const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 
 #[derive(Parser, Debug)]
-#[command(name = "bincsv", version, about = "Convert Statwalker .bin/.zst (STWK) to CSV")]
+#[command(version, color = ColorChoice::Auto)]
 struct Args {
     /// Input STWK file (.bin or .zst). Compression is auto-detected from header.
     input: PathBuf,
@@ -55,6 +56,13 @@ struct Args {
 }
 
 fn main() -> io::Result<()> {
+    #[cfg(windows)]
+    colored::control::set_virtual_terminal(true).unwrap_or(());
+
+    println!("{}","------------------------------------------------".cyan().bold());
+    println!("{}", "Statwaker bincsv: convert binary to csv".cyan().bold());
+    println!("{}","------------------------------------------------".cyan().bold());
+
     let args = Args::parse();
 
     // Open input and read STWK header from the raw File (not BufReader) so we can

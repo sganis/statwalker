@@ -22,6 +22,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use memchr::memchr_iter;
 use clap::{Parser, ColorChoice};
+use colored::Colorize;
 use jsonwebtoken::{encode, Header};
 use statwalker::auth::{platform, AuthError, AuthPayload, AuthBody, Claims, keys};
 
@@ -29,8 +30,7 @@ use statwalker::auth::{platform, AuthError, AuthPayload, AuthBody, Claims, keys}
 use std::ffi::CStr;
 
 #[derive(Parser, Debug)]
-#[command(author, version, color = ColorChoice::Always,
-    about = "Statwalker web server and UI")]
+#[command(version, color = ColorChoice::Auto)]
 struct Args {
     /// Input CSV file path
     input: PathBuf,
@@ -68,6 +68,13 @@ static USERS: OnceLock<Vec<String>> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    colored::control::set_virtual_terminal(true).unwrap_or(());
+
+    println!("{}","------------------------------------------------".cyan().bold());
+    println!("{}", "Statwaker web server".cyan().bold());
+    println!("{}","------------------------------------------------".cyan().bold());
+
     dotenvy::dotenv().ok();
     std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");     
 

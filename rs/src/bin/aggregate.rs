@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use clap::{Parser, ColorChoice};
+use colored::Colorize;
 use csv::{ReaderBuilder, Trim, WriterBuilder};
 use memchr::memchr_iter;
 use chrono::Utc;
@@ -23,8 +24,7 @@ const S_IFDIR: u32 = 0o040000;
 
 
 #[derive(Parser, Debug)]
-#[command(author, version, color = ColorChoice::Always, 
-    about = "Aggregate statwalker CSV into per-(folder, user, age) rows")]
+#[command(version, color = ColorChoice::Auto)]
 struct Args {
     /// Input CSV file path
     input: PathBuf,
@@ -55,6 +55,14 @@ impl UserStats {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    colored::control::set_virtual_terminal(true).unwrap_or(());
+
+    println!("{}","------------------------------------------------".cyan().bold());
+    println!("{}", "Statwaker aggregate: totals per triplet: folder,user,age".cyan().bold());
+    println!("{}","------------------------------------------------".cyan().bold());
+
+
     let start_time = std::time::Instant::now();
     let args = Args::parse();
 

@@ -1,6 +1,7 @@
 // resolve.rs
 use anyhow::{Context, Result};
 use clap::{Parser, ColorChoice};
+use colored::Colorize;
 use csv::{ReaderBuilder, WriterBuilder};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,8 +11,7 @@ use chrono::{Local, TimeZone, Utc};
 use std::ffi::CStr;
 
 #[derive(Parser, Debug)]
-#[command(author, version, color = ColorChoice::Always, 
-    about = "Resolve statwalker CSV into human fields")]
+#[command(version, color = ColorChoice::Auto)]
 struct Args {
     /// Input CSV produced by statwalker.py
     input: PathBuf,
@@ -25,6 +25,13 @@ const OUT_HEADER: &[&str] = &[
 ];
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    colored::control::set_virtual_terminal(true).unwrap_or(());
+
+    println!("{}","------------------------------------------------".cyan().bold());
+    println!("{}", "Statwaker resolve: convert raw stats into human version".cyan().bold());
+    println!("{}","------------------------------------------------".cyan().bold());
+
     let start = std::time::Instant::now();
     let args = Args::parse();
     let input = args.input;
