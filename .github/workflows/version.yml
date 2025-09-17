@@ -9,18 +9,31 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}   # check out the branch/tag properly
+
       - name: Install cargo-edit
         run: cargo install cargo-edit
+
       - name: Extract version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
       - name: Set Cargo.toml version
         working-directory: rs
         run: cargo set-version $VERSION
+
       - name: Commit and push version bump
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git commit -am "chore: bump version to $VERSION" || true
-          git push
 
+          # Add only Cargo.toml/Cargo.lock
+          git add rs/Cargo.toml rs/Cargo.lock
+
+          git commit -m "chore: bump version to $VERSION" || echo "No changes to commit"
+
+          # Push commit back to the same branch
+          git push origin HEAD:${GITHUB_REF_NAME}
