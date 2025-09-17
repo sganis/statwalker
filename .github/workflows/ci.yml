@@ -47,7 +47,6 @@ jobs:
         with:
           node-version: '22'
           cache: 'npm'
-          cache-dependency-path: browser/package-lock.json
 
       - name: Install deps (browser/)
         working-directory: browser
