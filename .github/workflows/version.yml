@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     branches:
-      - master
+      - master  
 
 jobs:
   release:
@@ -13,27 +13,30 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.ref_name }}   # check out the branch/tag properly
 
       - name: Install cargo-edit
         run: cargo install cargo-edit
 
-      - name: Extract version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
-
-      - name: Set Cargo.toml version
+      - name: Bump patch version
         working-directory: rs
-        run: cargo set-version $VERSION
+        run: cargo set-version --bump patch
+
+      - name: Get new version
+        id: cargo_version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Commit and push version bump
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-
-          # Add only Cargo.toml/Cargo.lock
           git add rs/Cargo.toml rs/Cargo.lock
-
           git commit -m "chore: bump version to $VERSION" || echo "No changes to commit"
-
-          # Push commit back to the same branch
           git push origin HEAD:${GITHUB_REF_NAME}
+
+      - name: Create tag
+        run: |
+          git tag v${VERSION}
+          git push origin v${VERSION}
