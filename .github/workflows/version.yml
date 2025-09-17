@@ -15,6 +15,7 @@ jobs:
       - name: Extract version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
       - name: Set Cargo.toml version
+        working-directory: rs
         run: cargo set-version $VERSION
       - name: Commit and push version bump
         run: |
