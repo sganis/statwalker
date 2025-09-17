@@ -25,6 +25,9 @@ use std::os::windows::fs::MetadataExt;
 #[cfg(windows)]
 use std::time::SystemTime;
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+
 // chunk sizes
 const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2MB for file reads
 const FILE_CHUNK: usize = 16384;     // 16k entries per batch (was 8192)
@@ -54,9 +57,15 @@ struct Args {
 }
 
 #[derive(Debug)]
+struct FileItem {
+    name: OsString,
+    md: fs::Metadata,
+}
+
+#[derive(Debug)]
 enum Task {
     Dir(PathBuf),
-    Files { base: std::sync::Arc<PathBuf>, names: Vec<OsString> },
+    Files { base: std::sync::Arc<PathBuf>, items: Vec<FileItem> },
     Shutdown,
 }
 
@@ -340,24 +349,21 @@ fn worker(
                 inflight.fetch_sub(1, Relaxed);
             }
 
-            Task::Files { base, names } => {
+            Task::Files { base, items } => {
                 if should_skip(base.as_ref(), cfg.skip.as_deref()) {
                     inflight.fetch_sub(1, Relaxed);
                     continue;
                 }
-                for name in names {
+                for FileItem { name, md } in items {
                     let full = base.join(&name);
-                    match stat_row(&full) {
-                        Some(row) => {
-                            if is_bin { 
-                                write_row_bin(&mut buf, row, cfg.skip_atime); 
-                            } else { 
-                                write_row_csv(&mut buf, &row, cfg.skip_atime);
-                            }
-                            stats.files += 1;
-                        }
-                        None => stats.errors += 1,
+                    let row = row_from_metadata(&full, &md); // <-- no syscall here
+                    if is_bin { 
+                        write_row_bin(&mut buf, row, cfg.skip_atime);
+                    } else { 
+                        write_row_csv(&mut buf, &row, cfg.skip_atime);
                     }
+                    stats.files += 1;
+
                     if buf.len() >= FLUSH_BYTES {
                         let _ = writer.write_all(&buf);
                         buf.clear();
@@ -382,40 +388,47 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
         Err(_) => return 1,
     };
     let mut error_count: u64 = 0;
-    let mut page: Vec<OsString> = Vec::with_capacity(FILE_CHUNK);
+    let mut page: Vec<FileItem> = Vec::with_capacity(FILE_CHUNK);
     let base_arc = Arc::new(dir.to_path_buf());
 
     for dent in rd {
-        let dent = match dent {
-            Ok(d) => d,
-            Err(_) => { error_count += 1; continue; }
-        };
-
+        let dent = match dent { Ok(d) => d, Err(_) => { error_count += 1; continue; } };
         let name = dent.file_name();
         if name == OsStr::new(".") || name == OsStr::new("..") { continue; }
 
-        let file_type = dent.file_type();
-        let is_dir = match file_type {
-            Ok(ft) => ft.is_dir(),
-            Err(_) => {
-                match dent.path().is_dir() {
-                    true => true,
-                    false => { error_count += 1; continue; }
-                }
-            }
+        // One file_type() call
+        let ft = match dent.file_type() {
+            Ok(ft) => ft,
+            Err(_) => { error_count += 1; continue; }
         };
 
-        if is_dir {
-            if should_skip(&dent.path(), skip) { continue; }
+        if ft.is_dir() {
+            let p = dent.path();
+            if should_skip(&p, skip) { continue; }
             inflight.fetch_add(1, Relaxed);
-            let _ = tx.send(Task::Dir(dent.path()));
+            let _ = tx.send(Task::Dir(p));
         } else {
-            page.push(name);
+            // Preserve your symlink semantics:
+            // - symlink -> use lstat (symlink_metadata)
+            // - otherwise -> metadata() (follows, faster/cached)
+            let md = if ft.is_symlink() {
+                match fs::symlink_metadata(dent.path()) {
+                    Ok(m) => m,
+                    Err(_) => { error_count += 1; continue; }
+                }
+            } else {
+                match dent.metadata() {
+                    Ok(m) => m,
+                    Err(_) => { error_count += 1; continue; }
+                }
+            };
+
+            page.push(FileItem { name, md });
             if page.len() == FILE_CHUNK {
                 inflight.fetch_add(1, Relaxed);
                 let _ = tx.send(Task::Files {
                     base: base_arc.clone(),
-                    names: std::mem::take(&mut page),
+                    items: std::mem::take(&mut page),
                 });
             }
         }
@@ -423,11 +436,73 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
 
     if !page.is_empty() {
         inflight.fetch_add(1, Relaxed);
-        let _ = tx.send(Task::Files { base: base_arc, names: page });
+        let _ = tx.send(Task::Files { base: base_arc, items: page });
     }
 
     error_count
 }
+
+
+fn row_from_metadata<'a>(path: &'a Path, md: &fs::Metadata) -> Row<'a> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Row {
+            path,
+            dev: md.dev(),
+            ino: md.ino(),
+            mode: md.mode(),
+            uid: md.uid(),
+            gid: md.gid(),
+            size: md.size(),
+            blocks: md.blocks() as u64,
+            atime: md.atime(),
+            mtime: md.mtime(),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use std::time::SystemTime;
+
+        let to_unix = |t: SystemTime| -> i64 {
+            t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+        };
+        let atime = md.accessed().ok().map(to_unix).unwrap_or(0);
+        let mtime = md.modified().ok().map(to_unix).unwrap_or(0);
+        let blocks = (md.len() + 511) / 512;
+
+        let file_attributes = md.file_attributes();
+        const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+
+        let is_file = md.is_file();
+        let mut mode = if is_file { 0o100000 } else { 0o040000 };
+        mode |= 0o400; // Owner read
+        if (file_attributes & FILE_ATTRIBUTE_READONLY) == 0 { mode |= 0o200; }
+        if is_file {
+            if let Some(ext) = path.extension() {
+                match ext.to_str().unwrap_or("").to_lowercase().as_str() {
+                    "exe" | "bat" | "cmd" | "com" | "scr" | "ps1" | "vbs" => mode |= 0o100,
+                    _ => {}
+                }
+            }
+        } else {
+            mode |= 0o100;
+        }
+        let owner = mode & 0o700;
+        mode |= (owner >> 3) | (owner >> 6);
+
+        Row {
+            path, dev: 0, ino: 0, mode, uid: 0, gid: 0,
+            size: md.len(), blocks, atime, mtime,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Row { path, dev: 0, ino: 0, mode: 0, uid: 0, gid: 0, size: md.len(), blocks: 0, atime: 0, mtime: 0 }
+    }
+}
+
 
 fn stat_row<'a>(path: &'a Path) -> Option<Row<'a>> {
     let md = fs::symlink_metadata(path).ok()?;
@@ -540,22 +615,25 @@ fn write_row_csv(buf: &mut Vec<u8>, r: &Row<'_>, skip_atime: bool) {
 
 // ----- BIN writing -----
 fn write_row_bin(buf: &mut Vec<u8>, r: Row<'_>, skip_atime: bool) {
-    buf.reserve(64 + 2 * r.path.as_os_str().len());
-
+    
     #[cfg(unix)]
-    let path_bytes: Vec<u8> = {
-        use std::os::unix::ffi::OsStrExt;
-        r.path.as_os_str().as_bytes().to_vec()
+    let path_bytes: &[u8] = {
+        r.path.as_os_str().as_bytes()
     };
+
     #[cfg(not(unix))]
-    let path_bytes: Vec<u8> = r.path.to_string_lossy().as_bytes().to_vec();
+    let path_lossy = r.path.to_string_lossy();     // keep the Cow alive
+    #[cfg(not(unix))]
+    let path_bytes: &[u8] = path_lossy.as_bytes(); // borrow from it safely
 
     let path_len = path_bytes.len() as u32;
     let atime = if skip_atime { 0i64 } else { r.atime };
     let disk = r.blocks * 512;
     
+    //buf.reserve(64 + 2 * r.path.as_os_str().len());
+    buf.reserve(80 + path_bytes.len()); // cheap pre-reserve
     buf.extend_from_slice(&path_len.to_le_bytes());
-    buf.extend_from_slice(&path_bytes);
+    buf.extend_from_slice(path_bytes);
     buf.extend_from_slice(&r.dev.to_le_bytes());
     buf.extend_from_slice(&r.ino.to_le_bytes());
     buf.extend_from_slice(&atime.to_le_bytes());
