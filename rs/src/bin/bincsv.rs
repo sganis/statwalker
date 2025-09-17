@@ -1,12 +1,7 @@
 // src/bin/bincsv.rs
 //
-// Convert Statwalker STWK binary stream (.bin or .zst) to CSV.
-// Autodetects compression via STWK header flags.
-//
-// STWK header (little-endian):
-//   u32 MAGIC = 0x5354574B ("STWK")
-//   u16 VERSION = 1
-//   u8  FLAGS: bit0 = 1 -> zstd compressed payload
+// Convert Statwalker binary stream (.bin or .zst) to CSV.
+// Autodetects compression via zstd header bytes: magic == 0xFD2FB528
 //
 // Record (repeated):
 //   u32 path_len
@@ -23,23 +18,12 @@
 //
 // Output CSV header:
 // INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH
-//
-// Build deps in Cargo.toml:
-// [dependencies]
-// clap = { version = "4", features = ["derive"] }
-// zstd = "0.13"
-// itoa = "1"
 
 use clap::{Parser, ColorChoice};
 use colored::Colorize;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write, Seek};
 use std::path::PathBuf;
-
-// --- Constants (match the writer) ---
-const STWK_MAGIC: u32 = 0x5354_574B; // "STWK"
-const STWK_VERSION: u16 = 1;
-const FLAG_ZSTD: u8 = 0b0000_0001;
 
 const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
@@ -70,37 +54,36 @@ fn main() -> io::Result<()> {
     let f = File::open(&args.input)?;
     let mut f = f; // mutable for Read
 
-    // Read and validate header
-    let magic = read_u32_le_exact(&mut f)?;
-    if magic != STWK_MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Bad STWK magic: 0x{:08X}", magic),
-        ));
-    }
-    let version = read_u16_le_exact(&mut f)?;
-    if version != STWK_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unsupported STWK version: {}", version),
-        ));
-    }
-    let flags = read_u8_exact(&mut f)?;
-    let compressed = (flags & FLAG_ZSTD) != 0;
+    // Peek first 4 bytes
+    let mut magic_buf = [0u8; 4];
+    f.read_exact(&mut magic_buf)?;
+    f.rewind()?; // reset to start
+    let magic = u32::from_le_bytes(magic_buf);
 
-    // Wrap remaining bytes in the right reader
-    let reader: Box<dyn Read> = if compressed {
+    // Detect format
+    let reader: Box<dyn Read> = if magic == 0xFD2FB528 {
+        // Standard Zstd compressed stream
         let dec = zstd::stream::read::Decoder::new(f)?;
-        Box::new(dec) // supports concatenated frames
+        Box::new(dec)
     } else {
+        // Raw uncompressed Statwalker binary
         Box::new(f)
     };
+
     let mut r = BufReader::with_capacity(READ_BUF_SIZE, reader);
 
     // Decide output path
     let out_path = args
         .output
         .unwrap_or_else(|| args.input.with_extension("csv"));
+    
+    if out_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("Output file already exists: {}", out_path.display()),
+        ));
+    }
+
     let out_file = File::create(&out_path)?;
     let mut w = BufWriter::with_capacity(WRITE_BUF_SIZE, out_file);
 
@@ -265,13 +248,13 @@ fn read_exact_fully<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn read_u8_exact<R: Read>(r: &mut R) -> io::Result<u8> {
+fn _read_u8_exact<R: Read>(r: &mut R) -> io::Result<u8> {
     let mut b = [0u8; 1];
     read_exact_fully(r, &mut b)?;
     Ok(b[0])
 }
 
-fn read_u16_le_exact<R: Read>(r: &mut R) -> io::Result<u16> {
+fn _read_u16_le_exact<R: Read>(r: &mut R) -> io::Result<u16> {
     let mut b = [0u8; 2];
     read_exact_fully(r, &mut b)?;
     Ok(u16::from_le_bytes(b))

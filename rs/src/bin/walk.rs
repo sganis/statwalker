@@ -2,7 +2,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{self, BufWriter, Write, BufRead, BufReader, Read},
+    io::{self, BufWriter, Write, BufRead, BufReader},
     path::{Path, PathBuf},
     time::Instant,
     thread,
@@ -16,6 +16,8 @@ use num_cpus;
 use itoa::Buffer;
 use clap::{Parser, ColorChoice};
 use colored::Colorize;
+use chrono::Local;
+use zstd::stream::write::Encoder as ZstdEncoder;
 
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
@@ -23,19 +25,11 @@ use std::os::windows::fs::MetadataExt;
 #[cfg(windows)]
 use std::time::SystemTime;
 
-// Compression
-use zstd::stream::write::Encoder as ZstdEncoder;
-
 // chunk sizes
 const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2MB for file reads
 const FILE_CHUNK: usize = 16384;     // 16k entries per batch (was 8192)
 const FLUSH_BYTES: usize = 8 * 1024 * 1024; // 8MB buffer (was 4MB)
 
-// ---- Binary format constants ----
-const STATWALKER_MAGIC: u32 = 0x5354_574B; 
-const STATWALKER_VERSION: u16 = 1;
-const STATWALKER_FLAG_ZSTD: u8 = 1 << 0;
-const STATWALKER_FLAG_NO_ATIME: u8 = 1 << 1;
 
 #[derive(Parser, Debug)]
 #[command(version, color = ColorChoice::Auto)]
@@ -51,12 +45,9 @@ struct Args {
     /// Skip any folder whose full path contains this substring
     #[arg(long, value_name = "SUBSTR")]
     skip: Option<String>,
-    /// Write a binary .stwk stream instead of CSV
+    /// Write a binary .zst compressed file instead of .csv
     #[arg(long)]
     bin: bool,
-    /// Enable zstd compression for --bin. Optional LEVEL (0..=22), default 1.
-    #[arg(long, value_name="LEVEL", num_args=0..=1, default_missing_value="1")]
-    compress: Option<i32>,
     /// Zero the ATIME field in outputs (CSV & BIN) for testing
     #[arg(long = "skip-atime", aliases = ["no-atime", "zero-atime"])]
     skip_atime: bool,
@@ -82,7 +73,6 @@ enum OutputFormat { Csv, Bin }
 struct Config {
     skip: Option<String>,
     out_fmt: OutputFormat,
-    compress: Option<i32>, // compression level for BIN; None = no compression
     skip_atime: bool,  // zero ATIME for reproducible outputs
 }
 
@@ -110,11 +100,7 @@ fn main() -> std::io::Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
     let out_fmt = if args.bin { OutputFormat::Bin } else { OutputFormat::Csv };
-    let compress = out_fmt == OutputFormat::Bin && args.compress.is_some();
-
-    if out_fmt == OutputFormat::Csv && args.compress.is_some() {
-        eprintln!("{}", "Note: --compress is ignored in CSV output format.".yellow());
-    }
+    
     if args.skip_atime {
         eprintln!("{}", "Note: ATIME will be written as 0 for reproducible output (--skip-atime).".yellow());
     }
@@ -128,10 +114,10 @@ fn main() -> std::io::Result<()> {
     let final_path: PathBuf = match args.output {
         Some(p) => if p.is_absolute() { p } else { std::env::current_dir()?.join(p) },
         None => {
-            // choose extension based on mode + compression
+            // choose extension based on mode 
             let ext = match out_fmt {
                 OutputFormat::Csv => "csv",
-                OutputFormat::Bin => if compress { "zst" } else { "bin" },
+                OutputFormat::Bin => "zst",
             };
             #[cfg(windows)]
             {
@@ -184,7 +170,11 @@ fn main() -> std::io::Result<()> {
 
     let threads = args.threads.unwrap_or_else(|| (num_cpus::get()*2).max(4).min(48));
     let cmd: Vec<String> = std::env::args().collect();    
-    
+    let now = Local::now();
+    let hostname = get_hostname();
+
+    println!("Local time   : {}", now.format("%Y-%m-%d %H:%M:%S").to_string());
+    println!("Host         : {}", hostname);
     println!("Command      : {}", cmd.join(" "));
     println!("Input        : {}", &root_str);
     println!("Output       : {}", &final_path.display());
@@ -217,7 +207,6 @@ fn main() -> std::io::Result<()> {
     let cfg = Config { 
         skip: args.skip,
         out_fmt,
-        compress: if out_fmt == OutputFormat::Bin { args.compress } else { None },
         skip_atime: args.skip_atime,
     };
 
@@ -240,20 +229,23 @@ fn main() -> std::io::Result<()> {
         total.files += s.files;
         total.errors += s.errors;
     }
-
+    // measure speed before merging
+    let speed = (total.files as f64) / start_time.elapsed().as_secs_f64();
+    
     // ---- merge shards ----
-    merge_shards(&out_dir, &final_path, threads, out_fmt, cfg.compress, cfg.skip_atime).expect("merge shards failed");
-
-    let elapsed = start_time.elapsed();
-    let secs = elapsed.as_secs_f64();
+    merge_shards(&out_dir, &final_path, threads, out_fmt).expect("merge shards failed");
 
     println!("Total files  : {}", total.files);
     println!("Failed files : {}", total.errors);  
-    println!("Elapsed time : {:.2} seconds", secs);
-    println!("Files/sec.   : {:.2}", (total.files as f64) / secs);
+    println!("Elapsed time : {:.2} seconds", start_time.elapsed().as_secs_f64());
+    println!("Files/sec.   : {:.2}", speed);
     println!("{}","------------------------------------------------".cyan().bold());
     println!("Done.");
     Ok(())
+}
+
+fn get_hostname() -> String {
+    hostname::get().ok().and_then(|s| s.into_string().ok()).unwrap_or("noname".to_string())
 }
 
 #[cfg(windows)]
@@ -295,26 +287,20 @@ fn worker(
     cfg: Config,
 ) -> Stats {
     let is_bin = cfg.out_fmt == OutputFormat::Bin;
-    let shard_path = out_dir.join(format!("shard_{tid}.tmp"));
+    let hostname = get_hostname();
+    let shard_path = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
     let file = File::create(&shard_path).expect("open shard");
     let mut base = BufWriter::with_capacity(32 * 1024 * 1024, file);
 
     // Header
-    if is_bin {
-        let compressed = cfg.compress.is_some();
-        write_bin_header(&mut base, compressed, cfg.skip_atime).expect("write bin header");
-    } else {
+    if !is_bin {
         base.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n").expect("write csv header"); 
     }
 
-    // Choose writer: zstd encoder for BIN+compression; otherwise the base writer
+    // Choose writer: zstd encoder for binary; otherwise the base writer
     let mut writer: Box<dyn Write + Send> = if is_bin {
-        if let Some(level) = cfg.compress {
-            let enc = ZstdEncoder::new(base, level).expect("zstd encoder");
-            Box::new(enc.auto_finish()) // finalize on drop
-        } else {
-            Box::new(base)
-        }
+        let enc = ZstdEncoder::new(base, 1).expect("zstd encoder");
+        Box::new(enc.auto_finish()) // finalize on drop
     } else {
         Box::new(base)
     };
@@ -553,16 +539,6 @@ fn write_row_csv(buf: &mut Vec<u8>, r: &Row<'_>, skip_atime: bool) {
 }
 
 // ----- BIN writing -----
-fn write_bin_header<W: Write>(mut w: W, compressed: bool, no_atime: bool) -> io::Result<()> {
-    let mut flags: u8 = 0;
-    if compressed { flags |= STATWALKER_FLAG_ZSTD; }
-    if no_atime  { flags |= STATWALKER_FLAG_NO_ATIME; }
-    w.write_all(&STATWALKER_MAGIC.to_le_bytes())?;
-    w.write_all(&STATWALKER_VERSION.to_le_bytes())?;
-    w.write_all(&[flags])?;
-    Ok(())
-}
-
 fn write_row_bin(buf: &mut Vec<u8>, r: Row<'_>, skip_atime: bool) {
     buf.reserve(64 + 2 * r.path.as_os_str().len());
 
@@ -663,14 +639,12 @@ fn merge_shards(
     final_path: &Path, 
     threads: usize, 
     out_fmt: OutputFormat,
-    compress: Option<i32>,
-    skip_atime: bool,
 ) -> std::io::Result<()> {
     let mut out = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&final_path)?);
 
     match out_fmt {
         OutputFormat::Csv => merge_shards_csv(out_dir, &mut out, threads),
-        OutputFormat::Bin => merge_shards_bin(out_dir, &mut out, threads, compress, skip_atime),
+        OutputFormat::Bin => merge_shards_bin(out_dir, &mut out, threads),
     }?;
 
     out.flush()?;
@@ -679,9 +653,9 @@ fn merge_shards(
 
 fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, threads: usize) -> std::io::Result<()> {
     out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n")?;
-    
+    let hostname = get_hostname();
     for tid in 0..threads {
-        let shard = out_dir.join(format!("shard_{tid}.tmp"));
+        let shard = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
         if !shard.exists() { continue; }
         let f = File::open(&shard)?;
         let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
@@ -700,26 +674,14 @@ fn merge_shards_bin(
     out_dir: &Path, 
     out: &mut BufWriter<File>, 
     threads: usize, 
-    compress: Option<i32>, 
-    skip_atime: bool
 ) -> std::io::Result<()> {
-    // Final header: flags indicate compression and NO_ATIME
-    let compressed = compress.is_some();
-    write_bin_header(&mut *out, compressed, skip_atime)?;
-
-    // Each shard starts with a 7-byte header; we skip it and stream the payload
-    const HDR_LEN: usize = 4 + 2 + 1;
-
+    let hostname = get_hostname();
     for tid in 0..threads {
-        let shard = out_dir.join(format!("shard_{tid}.tmp"));
+        let shard = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
         if !shard.exists() { continue; }
-
-        let mut f = File::open(&shard)?;
-        let mut hdr = [0u8; HDR_LEN];
-        if f.read_exact(&mut hdr).is_ok() {
-            let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
-            io::copy(&mut reader, out)?;
-        }
+        let f = File::open(&shard)?;
+        let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
+        io::copy(&mut reader, out)?;
         let _ = fs::remove_file(shard);
     }
 
@@ -817,8 +779,8 @@ mod tests {
         let final_path = out_dir.join("out_unsorted.csv");
 
         // Create 2 CSV shard files with headers
-        let shard0 = out_dir.join("shard_0.tmp");
-        let shard1 = out_dir.join("shard_1.tmp");
+        let shard0 = out_dir.join(format!("shard_{}_0.tmp", get_hostname()));
+        let shard1 = out_dir.join(format!("shard_{}_1.tmp", get_hostname()));
 
         {
             let mut w = File::create(&shard0)?;
@@ -829,12 +791,15 @@ mod tests {
             w.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\na\n")?;
         }
 
-        super::merge_shards(&out_dir, &final_path, 2, OutputFormat::Csv, None, false)?;
+        // Call with correct signature
+        super::merge_shards(&out_dir, &final_path, 2, OutputFormat::Csv)?;
+
         let mut s = String::new();
         File::open(&final_path)?.read_to_string(&mut s)?;
         let mut lines: Vec<&str> = s.lines().collect();
+
         assert_eq!(lines.remove(0), "INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH");
-        // order is just concatenation of shards
+        // Order is just concatenation of shards
         assert_eq!(lines, vec!["b", "a"]);
         Ok(())
     }
