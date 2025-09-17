@@ -45,6 +45,8 @@ fn main() -> io::Result<()> {
 
     println!("{}","------------------------------------------------".cyan().bold());
     println!("{}", "Statwaker bincsv: convert binary to csv".cyan().bold());
+    println!("{}", format!("Version    : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Build date : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());
 
     let args = Args::parse();

@@ -60,6 +60,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("{}","------------------------------------------------".cyan().bold());
     println!("{}", "Statwaker aggregate: totals per triplet: folder,user,age".cyan().bold());
+    println!("{}", format!("Version    : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Build date : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());
 
 

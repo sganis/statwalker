@@ -73,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
 
     println!("{}","------------------------------------------------".cyan().bold());
     println!("{}", "Statwaker web server".cyan().bold());
+    println!("{}", format!("Version    : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Build date : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());
 
     dotenvy::dotenv().ok();

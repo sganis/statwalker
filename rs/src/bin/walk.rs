@@ -35,7 +35,7 @@ const FLUSH_BYTES: usize = 8 * 1024 * 1024; // 8MB buffer (was 4MB)
 
 
 #[derive(Parser, Debug)]
-#[command(version, color = ColorChoice::Auto)]
+#[command(version, author, color = ColorChoice::Auto)]
 struct Args {
     /// Root folder to scan (positional, required)
     root: String,
@@ -103,7 +103,10 @@ fn main() -> std::io::Result<()> {
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
     println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Statwaker: Super fast filesystem scanner".cyan().bold());
+    println!("{}", "Statwaker  : Super fast filesystem scanner".cyan().bold());
+    println!("{}", format!("Version    : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Build date : {}", env!("BUILD_DATE")).cyan().bold());
+    // println!("{}", format!("Author: {}",env!("CARGO_PKG_AUTHORS")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());
 
     let start_time = Instant::now();
