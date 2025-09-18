@@ -7,6 +7,7 @@
   import { api } from "../ts/api.svelte";
   import { API_URL, State } from "../ts/store.svelte";
   import Svelecte, { addRenderer } from 'svelecte';
+  import ColorPicker from 'svelte-awesome-color-picker';
 
   //#region state
   let COLORS: string[] = []
@@ -24,7 +25,8 @@
   type SortKey = "disk" | "count";
   let sortBy = $state<SortKey>("disk");
   let sortOpen = $state(false);
-  let selectedUser = $state<string>("All Users");
+  let selectedUser = $state("All Users");
+  let selectedUserColor = $state('')
   let users = $state<string[]>([]);
   let userColors = $state(new Map<string, string>()); // cache: username -> color
   let userDropdown = $state<{user:string;color:string}[]>([]);
@@ -568,10 +570,12 @@
     }
   }
   function onUserChanged() {
-    if (!selectedUser || selectedUser===null) {
-      selectedUser = 'All Users'
-      //svelecteRef?.close();
-    }
+    console.log('selected user:',selectedUser)
+    selectedUserColor = userColors.get(selectedUser) ?? '#000000'
+    // if (!selectedUser || selectedUser===null) {
+    //   selectedUser = 'All Users'
+    //   //svelecteRef?.close();
+    // }
     refresh()
   }
 
@@ -756,7 +760,7 @@
       disabled={!State.isAdmin}
       bind:value={selectedUser} 
       options={userDropdown}
-      valueField="user" 
+      valueField="user"
       renderer="color"
       highlightFirstItem={false}
       onChange={onUserChanged}
@@ -766,6 +770,14 @@
       class="z-20 min-w-40 h-10 border rounded
        border-gray-500 bg-gray-800 text-white"
     />
+    <button class="btn" onclick={pickColor} title="Go to Root Folder">
+      <div class="flex items-center">
+      <span class="material-symbols-outlined">colors</span>
+      <ColorPicker 
+	      bind:hex={selectedUserColor} position="responsive"
+      />
+      </div>
+    </button>
   </div>
   <div class="flex">
     <input 
