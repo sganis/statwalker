@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
 
     dotenvy::dotenv().ok();
     if std::env::var("JWT_SECRET").is_err() {
-        eprintln!("{}","Warning: JWT_SECRET env var is not set.".yellow());
+        eprintln!("{}","Warning: JWT_SECRET env var is not set, using default (unsafe)".yellow());
         unsafe {
             std::env::set_var("JWT_SECRET", "1234567890abcdef");
         }
