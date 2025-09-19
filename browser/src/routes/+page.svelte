@@ -1,16 +1,20 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { SvelteMap } from 'svelte/reactivity';
   import { 
     getParent, humanTime, humanCount, 
-    formatBytes, getOptimalColors,
+    formatBytes, getOptimalColors, COLORS,
   } from "../ts/util";
   import { api } from "../ts/api.svelte";
   import { API_URL, State } from "../ts/store.svelte";
   import Svelecte, { addRenderer } from 'svelecte';
   import ColorPicker from 'svelte-awesome-color-picker';
+  import PickerButton from '../lib/PickerButton.svelte';
+  import PickerWrapper from '../lib/PickerWrapper.svelte';
 
   //#region state
-  let COLORS: string[] = []
+  let allColors: string[] = []
+  let showColorPicker = false;
   let path = $state('/');
   let fullPath = $state('/');
   let folders = $state<FileItem[]>([]);
@@ -28,7 +32,7 @@
   let selectedUser = $state("All Users");
   let selectedUserColor = $state('')
   let users = $state<string[]>([]);
-  let userColors = $state(new Map<string, string>()); // cache: username -> color
+  let userColors = $state(new SvelteMap<string, string>()); // cache: username -> color
   let userDropdown = $state<{user:string;color:string}[]>([]);
   let pathInput = $state();
   let isEditing = $state(false);
@@ -38,7 +42,7 @@
   //#region colors
 
   function colorRenderer(item, _isSelection, _inputValue) {
-    const base = "width:16px;height:16px;border:1px solid white;border-radius:3px;flex:none;";
+    const icon_base = "width:16px;height:16px;border:1px solid white;border-radius:3px;flex:none;";
     const a = COLORS[0];
     const b = COLORS[1] ?? a;
     const c = COLORS[2] ?? b;
@@ -46,14 +50,15 @@
 
     const icon_bg =
       item.user === "All Users"
-        ? `background: linear-gradient(90deg, ${a} 0%, ${b} 33%, ${c} 66%, ${d} 100%);`
-        : `background: ${item.color};`;
+        ? `linear-gradient(90deg, ${a} 0%, ${b} 33%, ${c} 66%, ${d} 100%)`
+        : _isSelection ? selectedUserColor : item.color;
     const user_css = !State.isAdmin ? "text-gray-400" : ''
     return `<div class="flex gap-2 items-center">
                 <div class="border border-gray-500 rounded"
-                  style="${base}${icon_bg}"></div>
+                    style="${icon_base} background: ${icon_bg};">
+                </div>
                 <div class="${user_css}">${item.user}</div>              
-              </div>`
+            </div>`    
   }
   addRenderer('color', colorRenderer);
 
@@ -61,24 +66,24 @@
   function seedUserColors(usernames: string[]) {
     usernames.forEach((uname, index) => {
       if (!userColors.has(uname)) {
-        userColors.set(uname, COLORS[index % COLORS.length]);
+        userColors.set(uname, allColors[index % allColors.length]);
       }
     })
     userDropdown = Array.from(userColors.entries()).map(([user, color]) => ({user,color}))
   }
 
   // Deterministic color for any username (stable + cached)
-  function colorForUsername(uname: string): string {
-    const cached = userColors.get(uname);
-    if (cached) return cached;
-    let h = 0;
-    for (let i = 0; i < uname.length; i++) {
-      h = (h * 31 + uname.charCodeAt(i)) >>> 0;
-    }
-    const color = COLORS[h % COLORS.length];
-    userColors.set(uname, color);
-    return color;
-  }
+  // function colorForUsername(uname: string): string {
+  //   const cached = userColors.get(uname);
+  //   if (cached) return cached;
+  //   let h = 0;
+  //   for (let i = 0; i < uname.length; i++) {
+  //     h = (h * 31 + uname.charCodeAt(i)) >>> 0;
+  //   }
+  //   const color = allColors[h % allColors.length];
+  //   userColors.set(uname, color);
+  //   return color;
+  // }
   //#endregion
 
   //#region types
@@ -574,7 +579,6 @@
     selectedUserColor = userColors.get(selectedUser) ?? '#000000'
     // if (!selectedUser || selectedUser===null) {
     //   selectedUser = 'All Users'
-    //   //svelecteRef?.close();
     // }
     refresh()
   }
@@ -666,7 +670,9 @@
   onMount(async () => {
     console.log("api url:", API_URL)
     users = await api.getUsers()
-    COLORS = getOptimalColors(users.length)
+    console.log("Users:", $state.snapshot(users))
+    allColors = getOptimalColors(users.length)
+    console.log("Colors:", allColors)
     users.splice(0,0,"All Users")
     if (State.isAdmin) {
       selectedUser = 'All Users'
@@ -760,6 +766,7 @@
       disabled={!State.isAdmin}
       bind:value={selectedUser} 
       options={userDropdown}
+      name="user-select"
       valueField="user"
       renderer="color"
       highlightFirstItem={false}
@@ -770,14 +777,24 @@
       class="z-20 min-w-40 h-10 border rounded
        border-gray-500 bg-gray-800 text-white"
     />
-    <button class="btn" onclick={pickColor} title="Go to Root Folder">
-      <div class="flex items-center">
-      <span class="material-symbols-outlined">colors</span>
+    {#if selectedUser === 'All Users'}
+      <button class="btn" disabled={true}>
+        <div class="flex items-center">
+          <span class="material-symbols-outlined">colors</span>
+        </div>
+      </button>
+    {:else}
       <ColorPicker 
-	      bind:hex={selectedUserColor} position="responsive"
-      />
-      </div>
-    </button>
+        bind:hex={selectedUserColor} 
+        components={{ input: PickerButton,  wrapper: PickerWrapper }}
+        label="Change User Color"
+        onInput={(e)=>{
+          userColors.set(selectedUser, selectedUserColor)
+          userDropdown = Array.from(userColors.entries()).map(([user, color]) => ({user,color}))
+          //refresh()
+        }}
+      />    
+    {/if}
   </div>
   <div class="flex">
     <input 
@@ -808,7 +825,7 @@
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
             class="h-full transition-all duration-300 min-w-[0.5px] hover:opacity-90"
-            style="width: {userPercent}%; background-color: {colorForUsername(uname)};"
+            style="width: {userPercent}%; background-color: {userColors.get(uname)};"
             onmouseenter={(e) => showTip(e, userData, userPercent)}
             onmousemove={moveTip}
             onmouseleave={hideTip}
@@ -886,7 +903,7 @@
               {@const userPercent = totalMetric > 0 ? (userMetric / totalMetric) * 100 : 0}
               <div
                 class="h-full transition-all duration-300 min-w-[0.5px] hover:opacity-90"
-                style="width: {userPercent}%; background-color: {colorForUsername(uname)};"
+                style="width: {userPercent}%; background-color: {userColors.get(uname)};"
                 onmouseenter={(e) => showTip(e, userData, userPercent)}
                 onmousemove={moveTip}
                 onmouseleave={hideTip}
@@ -917,7 +934,7 @@
 
       <!-- Files (after folders) -->
       {#each sortedfiles as f}
-        {@const color = colorForUsername(f.owner)}
+        {@const color = userColors.get(f.owner)}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div class="flex">
           <span class="material-symbols-outlined text-4xl">subdirectory_arrow_right</span>

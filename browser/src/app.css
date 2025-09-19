@@ -24,7 +24,7 @@ html, body {
   --sv-border-color: #6b7280;    /* gray-500 */
   --sv-bg: #1f2937;              /* bg-gray-800 */
   --sv-disabled-bg: #272d35;
-  --sv-border: 1px solid #6b7280;
+  --sv-border: 1px solid var(--sv-border-color);
   --sv-border-radius: 4px;
   --sv-general-padding: 4px;
   --sv-control-bg: var(--sv-bg);
@@ -40,6 +40,13 @@ html, body {
   --sv-dropdown-height: 320px;
   --sv-dropdown-active-bg: #374151;
   --sv-dropdown-selected-bg: #754545;
+
+  --cp-bg-color: #333;
+  --cp-border-color: var(--sv-border-color);
+  --cp-text-color: white;
+  --cp-input-color: #555;
+  --cp-button-hover-color: #777;
+
 }
 
 .svelecte{

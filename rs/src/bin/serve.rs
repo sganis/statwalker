@@ -78,7 +78,12 @@ async fn main() -> anyhow::Result<()> {
     println!("{}","------------------------------------------------".cyan().bold());
 
     dotenvy::dotenv().ok();
-    std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");     
+    if std::env::var("JWT_SECRET").is_err() {
+        eprintln!("{}","Warning: JWT_SECRET env var is not set.".yellow());
+        unsafe {
+            std::env::set_var("JWT_SECRET", "1234567890abcdef");
+        }
+    }  
 
     let args = Args::parse();
     let csv_path = args.input.clone();
@@ -86,12 +91,21 @@ async fn main() -> anyhow::Result<()> {
         .static_dir
         .or_else(|| std::env::var("STATIC_DIR").ok())
         .unwrap_or_else(default_static_dir);
-
     let frontend = ServeDir::new(&static_dir)
         .not_found_service(ServeFile::new(format!("{}/index.html", static_dir)));
-
+    
+    match std::env::var("ADMIN_GROUP") {
+        Ok(g) => {
+            println!("ADMIN_GROUP={g}");
+        }
+        Err(_) => {
+            eprintln!("{}","Warning: ADMIN_GROUP env var is not set.".yellow());
+        }
+    }
+        
     let mut idx = InMemoryFSIndex::new();
     let users = idx.load_from_csv(Path::new(&csv_path))?;
+
     FS_INDEX.set(idx).expect("FS_INDEX already set");
     USERS.set(users).expect("USERS already set");
 
@@ -683,6 +697,7 @@ fn default_static_dir() -> String {
     let mut exe_dir = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     exe_dir.pop(); // remove the binary name
     let static_dir = exe_dir.join("public");
+    eprintln!("{}",format!("Using default static dir: {}", static_dir.display() ).yellow());
     static_dir.to_string_lossy().into_owned()
 }
 
