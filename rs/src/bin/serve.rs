@@ -12,11 +12,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::{File},
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::OnceLock,
     time::SystemTime,
+    net::TcpListener,
 };
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
@@ -35,8 +36,11 @@ struct Args {
     /// Input CSV file path
     input: PathBuf,
     /// UI folder (defaults to STATIC_DIR env var or local public directory)
-    #[arg(long, value_name="DIR", env="STATIC_DIR")]
+    #[arg(short, long, value_name="DIR", env="STATIC_DIR")]
     static_dir: Option<String>,
+    /// Port number (defaults to PORT env var or 8080)
+    #[arg(short, long, env="PORT")]
+    port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,9 +94,12 @@ async fn main() -> anyhow::Result<()> {
     let static_dir: String = args
         .static_dir
         .or_else(|| std::env::var("STATIC_DIR").ok())
-        .unwrap_or_else(default_static_dir);
-    let frontend = ServeDir::new(&static_dir)
-        .not_found_service(ServeFile::new(format!("{}/index.html", static_dir)));
+        .unwrap_or_else(default_static_dir);    
+    let port = args.port.or_else(|| std::env::var("PORT").ok().and_then(|s| s.parse().ok())).unwrap_or(8080);
+    if is_port_taken(port) {
+        eprintln!("{}",format!("Error: Port {port} is already in use. Try another port with --port or PORT env var.").red());
+        std::process::exit(1);
+    }
     
     match std::env::var("ADMIN_GROUP") {
         Ok(g) => {
@@ -126,6 +133,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/folders", get(get_folders_handler)) // query: path, optional users/uids, optional age
         .route("/files", get(get_files_handler));    // path + optional users/uids
 
+    let frontend = ServeDir::new(&static_dir)
+        .not_found_service(ServeFile::new(format!("{}/index.html", static_dir)));
+
     // App
     let app = Router::new()
         .nest("/api", api)        // frontend calls /api/...
@@ -133,13 +143,33 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors);
 
     // Bind
-    let port: u16 = std::env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
 
     println!("Serving on http://{addr}  (static dir: {static_dir})");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
 }
+
+
+fn is_port_taken(port: u16) -> bool {
+    let addr = format!("127.0.0.1:{port}");
+    match TcpListener::bind(&addr) {
+        Ok(listener) => {
+            // Binding succeeded → port was free, release it immediately
+            drop(listener);
+            false
+        }
+        Err(e) => {
+            if e.kind() == io::ErrorKind::AddrInUse {
+                true
+            } else {
+                // some other error (e.g. permission denied on privileged port)
+                true
+            }
+        }
+    }
+}
+
 
 /// PSOT /api/login
 async fn login_handler(Json(payload): Json<AuthPayload>) -> Result<Json<AuthBody>, AuthError> {

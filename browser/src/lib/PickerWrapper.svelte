@@ -14,7 +14,7 @@
   aria-label="color picker"
   class={`w-max rounded-xl border p-2  overflow-visible
           ${isOpen ? 'inline-block' : 'hidden'}
-          ${isDialog ? 'absolute -mt-2.5 -ml-0.5 z-50' : 'relative'}
+          ${isDialog ? 'absolute -mt-2.5 -ml-0.5 z-20' : 'relative'}
           bg-[var(--cp-bg-color,white)] border-[var(--cp-border-color,black)]`}
 >
   {@render children()}

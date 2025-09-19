@@ -63,12 +63,13 @@
   addRenderer('color', colorRenderer);
 
   // Seed colors for known users (optional)
-  function seedUserColors(usernames: string[]) {
+  function createUserDropdown(usernames: string[]) {
     usernames.forEach((uname, index) => {
       if (!userColors.has(uname)) {
         userColors.set(uname, allColors[index % allColors.length]);
       }
     })
+    userColors.set('All Users', '')
     userDropdown = Array.from(userColors.entries()).map(([user, color]) => ({user,color}))
   }
 
@@ -524,9 +525,7 @@
       // Pass age filter to both endpoints
       const raw: RawFolder[] = await api.getFolders(_p, userFilter, ageFilter);
       folders = transformFolders(raw, ageFilter);
-
       files = await api.getFiles(_p, userFilter, ageFilter);
-      if (users && users.length > 0) seedUserColors(users);
     } finally {
       loading = false;
     }
@@ -673,13 +672,14 @@
     console.log("Users:", $state.snapshot(users))
     allColors = getOptimalColors(users.length)
     console.log("Colors:", allColors)
-    users.splice(0,0,"All Users")
+    createUserDropdown(users);    
+    
     if (State.isAdmin) {
       selectedUser = 'All Users'
     } else {
       selectedUser = State.username
     }
-    seedUserColors(users);
+    
     fullPath = path;
     path = truncatePathFromStart(path);
     refresh();
@@ -777,7 +777,7 @@
       class="z-20 min-w-40 h-10 border rounded
        border-gray-500 bg-gray-800 text-white"
     />
-    {#if selectedUser === 'All Users'}
+    {#if !selectedUser || selectedUser === 'All Users'}
       <button class="btn" disabled={true}>
         <div class="flex items-center">
           <span class="material-symbols-outlined">colors</span>
@@ -791,7 +791,6 @@
         onInput={(e)=>{
           userColors.set(selectedUser, selectedUserColor)
           userDropdown = Array.from(userColors.entries()).map(([user, color]) => ({user,color}))
-          //refresh()
         }}
       />    
     {/if}
