@@ -75,13 +75,13 @@
 
 <div in:fade={{ duration: 500 }} 
     class="flex flex-col gap-4 justify-center items-center h-full text-white">
-    <div class="flex gap-1">
-        {#each getOptimalColors(20) as color}
+    <div class="flex w-full">
+        {#each getOptimalColors(30) as color}
         <div class="w-10 h-2" style="background: {color}"></div>
         {/each}
     </div>
     <div class="flex flex-col gap-4 w-1/2 mt-20 items-center justify-center">
-        <div class="flex flex-col gap-2 p-6 border w-full
+        <div class="flex flex-col gap-2 p-6 border w-1/2 min-w-80
             items-center justify-center
             border-gray-500 bg-gray-800 rounded-lg shadow-lg ">
             <form class="space-y-4 w-full" onsubmit={onSubmit}>

@@ -1,4 +1,0 @@
-publish = false     # don’t run cargo publish
-push = true         # push commits + tags
-tag-name = "v{{version}}"  # tags will be like v1.2.3
-pre-release-commit-message = "chore: release {{version}}"

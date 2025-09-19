@@ -1,6 +1,6 @@
 // src/bin/bincsv.rs
 //
-// Convert Statwalker binary stream (.bin or .zst) to CSV.
+// Convert Statwalker binary stream (.bin or .zst) to CSV, or compress CSV to .zst
 // Autodetects compression via zstd header bytes: magic == 0xFD2FB528
 //
 // Record (repeated):
@@ -16,45 +16,165 @@
 //   u64 size
 //   u64 disk
 //
-// Output CSV header:
+// CSV header:
 // INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH
 
-use clap::{Parser, ColorChoice};
+use clap::{ColorChoice, Parser};
 use colored::Colorize;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write, Seek};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::path::PathBuf;
 
 const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 
+
 #[derive(Parser, Debug)]
 #[command(version, color = ColorChoice::Auto)]
 struct Args {
-    /// Input STWK file (.bin or .zst). Compression is auto-detected from header.
+    /// Input file (.zst or .csv)
     input: PathBuf,
 
-    /// Output CSV path (default: same as input but with .csv)
+    /// Output file path (default: auto-determined based on operation)
     #[arg(short, long)]
     output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct BinaryRecord {
+    path: Vec<u8>,
+    dev: u64,
+    ino: u64,
+    atime: i64,
+    mtime: i64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    size: u64,
+    disk: u64,
 }
 
 fn main() -> io::Result<()> {
     #[cfg(windows)]
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
-    println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Statwaker bincsv: convert binary to csv".cyan().bold());
-    println!("{}", format!("Version    : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Build date : {}", env!("BUILD_DATE")).cyan().bold());
-    println!("{}","------------------------------------------------".cyan().bold());
+    println!("{}", "------------------------------------------------".cyan().bold());
+    println!(
+        "{}",
+        "Statwaker bincsv: convert binary to csv or compress csv to zst"
+            .cyan()
+            .bold()
+    );
+    println!(
+        "{}",
+        format!("Version    : {}", env!("CARGO_PKG_VERSION"))
+            .cyan()
+            .bold()
+    );
+    println!(
+        "{}",
+        format!("Build date : {}", env!("BUILD_DATE")).cyan().bold()
+    );
+    println!("{}", "------------------------------------------------".cyan().bold());
 
     let args = Args::parse();
 
-    // Open input and read STWK header from the raw File (not BufReader) so we can
-    // hand off the same file handle to zstd Decoder positioned after the header.
+    let ext = args
+        .input
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match ext.as_str() {
+        "csv" => csv_to_zst(&args),
+        "zst" => zst_to_csv(&args),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Unsupported input extension: '{}' (expected .csv, .bin, or .zst)",
+                other
+            ),
+        )),
+    }
+}
+
+fn csv_to_zst(args: &Args) -> io::Result<()> {
+    let start = std::time::Instant::now();
+    let input_file = File::open(&args.input)?;
+    let mut reader = BufReader::with_capacity(READ_BUF_SIZE, input_file);
+
+    // Determine output path
+    let out_path = args
+        .output
+        .clone()
+        .unwrap_or_else(|| args.input.with_extension("zst"));
+
+    if out_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("Output file already exists: {}", out_path.display()),
+        ));
+    }
+
+    // Create ZST encoder
+    let out_file = File::create(&out_path)?;
+    let encoder = zstd::stream::write::Encoder::new(out_file, 1)?;
+    let mut writer = BufWriter::with_capacity(WRITE_BUF_SIZE, encoder);
+
+    // Read and validate CSV header
+    let mut header_line = String::new();
+    reader.read_line(&mut header_line)?;
+    let header = header_line.trim();
+
+    if header != "INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Invalid CSV header. Expected: INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH, Got: {}",
+                header
+            ),
+        ));
+    }
+
+    println!("Creating .zst file...");
+
+    let mut line = String::new();
+
+    // Process each CSV line
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            break; // EOF
+        }
+
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue; // Skip empty lines
+        }
+
+        // Parse CSV line
+        let record = parse_csv_record(trimmed)?;
+
+        // Write binary record
+        write_binary_record(&mut writer, &record)?;
+    }
+
+    // Finish compression
+    let encoder = writer.into_inner()?;
+    encoder.finish()?;
+
+    println!("Output       : {}", out_path.display());
+    println!("Elapsed time : {:.3} sec.", start.elapsed().as_secs_f64());
+
+    Ok(())
+}
+
+fn zst_to_csv(args: &Args) -> io::Result<()> {
+    let start = std::time::Instant::now();
     let f = File::open(&args.input)?;
-    let mut f = f; // mutable for Read
+    let mut f = f; // mutable for Read + Seek
 
     // Peek first 4 bytes
     let mut magic_buf = [0u8; 4];
@@ -63,22 +183,20 @@ fn main() -> io::Result<()> {
     let magic = u32::from_le_bytes(magic_buf);
 
     // Detect format
-    let reader: Box<dyn Read> = if magic == 0xFD2FB528 {
-        // Standard Zstd compressed stream
-        let dec = zstd::stream::read::Decoder::new(f)?;
-        Box::new(dec)
-    } else {
-        // Raw uncompressed Statwalker binary
-        Box::new(f)
-    };
+    if magic != 0xFD2FB528 {
+        eprintln!("Invalid format.");
+        std::process::exit(1);
+    } 
 
+    let reader: Box<dyn Read> = Box::new(zstd::stream::read::Decoder::new(f)?);
     let mut r = BufReader::with_capacity(READ_BUF_SIZE, reader);
 
     // Decide output path
     let out_path = args
         .output
+        .clone()
         .unwrap_or_else(|| args.input.with_extension("csv"));
-    
+
     if out_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -88,6 +206,8 @@ fn main() -> io::Result<()> {
 
     let out_file = File::create(&out_path)?;
     let mut w = BufWriter::with_capacity(WRITE_BUF_SIZE, out_file);
+
+    println!("Creating .csv file...");
 
     // CSV header
     w.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n")?;
@@ -151,14 +271,142 @@ fn main() -> io::Result<()> {
     }
 
     w.flush()?;
-    eprintln!(
-        "Wrote CSV: {}",
-        out_path.as_path().to_string_lossy()
-    );
+    println!("Output       : {}", out_path.display());
+    println!("Elapsed time : {:.3} sec.", start.elapsed().as_secs_f64());
+
     Ok(())
 }
 
-// ---------- CSV path quoting (Unix vs Windows) ----------
+fn parse_csv_record(line: &str) -> io::Result<BinaryRecord> {
+    let fields = parse_csv_line(line);
+
+    if fields.len() != 9 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "CSV record must have 9 fields, got {}: {}",
+                fields.len(),
+                line
+            ),
+        ));
+    }
+
+    // Parse INODE field (dev-ino)
+    let inode_parts: Vec<&str> = fields[0].split('-').collect();
+    if inode_parts.len() != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid INODE format, expected dev-ino: {}", fields[0]),
+        ));
+    }
+
+    let dev = inode_parts[0]
+        .parse::<u64>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid dev: {}", e)))?;
+
+    let ino = inode_parts[1]
+        .parse::<u64>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid ino: {}", e)))?;
+
+    let atime = fields[1]
+        .parse::<i64>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid atime: {}", e)))?;
+
+    let mtime = fields[2]
+        .parse::<i64>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid mtime: {}", e)))?;
+
+    let uid = fields[3]
+        .parse::<u32>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid uid: {}", e)))?;
+
+    let gid = fields[4]
+        .parse::<u32>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid gid: {}", e)))?;
+
+    let mode = fields[5]
+        .parse::<u32>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid mode: {}", e)))?;
+
+    let size = fields[6]
+        .parse::<u64>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid size: {}", e)))?;
+
+    let disk = fields[7]
+        .parse::<u64>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid disk: {}", e)))?;
+
+    let path = fields[8].as_bytes().to_vec();
+
+    Ok(BinaryRecord {
+        path,
+        dev,
+        ino,
+        atime,
+        mtime,
+        uid,
+        gid,
+        mode,
+        size,
+        disk,
+    })
+}
+
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current_field = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if !in_quotes => {
+                in_quotes = true;
+            }
+            '"' if in_quotes => {
+                if chars.peek() == Some(&'"') {
+                    // Escaped quote
+                    chars.next(); // consume the second quote
+                    current_field.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            }
+            ',' if !in_quotes => {
+                fields.push(current_field);
+                current_field = String::new();
+            }
+            _ => {
+                current_field.push(ch);
+            }
+        }
+    }
+
+    fields.push(current_field);
+    fields
+}
+
+fn write_binary_record<W: Write>(writer: &mut W, record: &BinaryRecord) -> io::Result<()> {
+    // Write path_len
+    let path_len = record.path.len() as u32;
+    writer.write_all(&path_len.to_le_bytes())?;
+
+    // Write path bytes
+    writer.write_all(&record.path)?;
+
+    // Write fixed fields
+    writer.write_all(&record.dev.to_le_bytes())?;
+    writer.write_all(&record.ino.to_le_bytes())?;
+    writer.write_all(&record.atime.to_le_bytes())?;
+    writer.write_all(&record.mtime.to_le_bytes())?;
+    writer.write_all(&record.uid.to_le_bytes())?;
+    writer.write_all(&record.gid.to_le_bytes())?;
+    writer.write_all(&record.mode.to_le_bytes())?;
+    writer.write_all(&record.size.to_le_bytes())?;
+    writer.write_all(&record.disk.to_le_bytes())?;
+
+    Ok(())
+}
 
 // On Unix we should preserve raw path bytes as written by walk (can be non-UTF8).
 #[cfg(unix)]
@@ -243,7 +491,10 @@ fn read_exact_fully<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<()> {
     while read < buf.len() {
         let n = r.read(&mut buf[read..])?;
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated input"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated input",
+            ));
         }
         read += n;
     }
@@ -302,5 +553,206 @@ fn read_u32_le_opt<R: Read>(r: &mut R) -> io::Result<Option<u32>> {
         if off == 4 {
             return Ok(Some(u32::from_le_bytes(b)));
         }
+    }
+}
+
+// ========== TESTS ==========
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    // Test data
+    fn sample_record() -> BinaryRecord {
+        BinaryRecord {
+            path: b"/home/user/test.txt".to_vec(),
+            dev: 2049,
+            ino: 12345,
+            atime: 1672531200, // 2023-01-01 00:00:00 UTC
+            mtime: 1672617600, // 2023-01-02 00:00:00 UTC
+            uid: 1000,
+            gid: 1000,
+            mode: 33188, // regular file, 644 permissions
+            size: 1024,
+            disk: 42,
+        }
+    }
+
+    fn sample_record_with_quotes() -> BinaryRecord {
+        BinaryRecord {
+            path: b"path with \"quotes\".txt".to_vec(),
+            dev: 2050,
+            ino: 67890,
+            atime: -1,
+            mtime: 0,
+            uid: 0,
+            gid: 0,
+            mode: 16877, // directory, 755 permissions
+            size: 4096,
+            disk: 1,
+        }
+    }
+
+    #[test]
+    fn test_parse_csv_line_simple() {
+        let line = "a,b,c,d";
+        let fields = parse_csv_line(line);
+        assert_eq!(fields, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_parse_csv_line_quoted() {
+        let line = r#"a,"b,c",d"#;
+        let fields = parse_csv_line(line);
+        assert_eq!(fields, vec!["a", "b,c", "d"]);
+    }
+
+    #[test]
+    fn test_parse_csv_line_escaped_quotes() {
+        let line = r#"a,"b""c",d"#;
+        let fields = parse_csv_line(line);
+        assert_eq!(fields, vec!["a", r#"b"c"#, "d"]);
+    }
+
+    #[test]
+    fn test_parse_csv_line_empty_fields() {
+        let line = "a,,c";
+        let fields = parse_csv_line(line);
+        assert_eq!(fields, vec!["a", "", "c"]);
+    }
+
+    #[test]
+    fn test_parse_csv_line_trailing_comma() {
+        let line = "a,b,c,";
+        let fields = parse_csv_line(line);
+        assert_eq!(fields, vec!["a", "b", "c", ""]);
+    }
+
+    #[test]
+    fn test_parse_csv_record_valid() {
+        let csv_line = "2049-12345,1672531200,1672617600,1000,1000,33188,1024,42,/home/user/test.txt";
+        let record = parse_csv_record(csv_line).unwrap();
+        let expected = sample_record();
+        assert_eq!(record, expected);
+    }
+
+    #[test]
+    fn test_parse_csv_record_with_quoted_path() {
+        let csv_line =
+            r#"2050-67890,-1,0,0,0,16877,4096,1,"path with ""quotes"".txt""#;
+        let record = parse_csv_record(csv_line).unwrap();
+        let expected = sample_record_with_quotes();
+        assert_eq!(record, expected);
+    }
+
+    #[test]
+    fn test_parse_csv_record_invalid_fields_count() {
+        let csv_line = "2049-12345,1672531200,1672617600";
+        let result = parse_csv_record(csv_line);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must have 9 fields"));
+    }
+
+    #[test]
+    fn test_parse_csv_record_invalid_inode_format() {
+        // first token cannot be parsed as dev-ino pair
+        let csv_line = "invalid-inode,1672531200,1672617600,1000,1000,33188,1024,42,/path";
+        let result = parse_csv_record(csv_line);
+        // the split yields ["invalid", "inode"]; "invalid" isn't u64
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid dev"));
+    }
+
+    #[test]
+    fn test_parse_csv_record_missing_dev_ino_separator() {
+        // No '-' in the first field, so split yields single part -> explicit format error
+        let csv_line =
+            "204912345,1672531200,1672617600,1000,1000,33188,1024,42,/path";
+        let result = parse_csv_record(csv_line);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid INODE format"));
+    }
+
+    #[test]
+    fn test_format_csv_record() {
+        let record = sample_record();
+        let csv_line = format_csv_record(&record);
+        assert_eq!(
+            csv_line,
+            "2049-12345,1672531200,1672617600,1000,1000,33188,1024,42,/home/user/test.txt"
+        );
+    }
+
+    #[test]
+    fn test_format_csv_record_with_quotes() {
+        let record = sample_record_with_quotes();
+        let csv_line = format_csv_record(&record);
+        assert_eq!(
+            csv_line,
+            r#"2050-67890,-1,0,0,0,16877,4096,1,"path with ""quotes"".txt""#
+        );
+    }
+
+    #[test]
+    fn test_write_and_read_binary_record() {
+        let record = sample_record();
+        let mut buffer = Vec::new();
+
+        // Write record
+        write_binary_record(&mut buffer, &record).unwrap();
+
+        // Read it back
+        let mut cursor = Cursor::new(&buffer);
+        let read_record = read_binary_record(&mut cursor).unwrap().unwrap();
+
+        assert_eq!(record, read_record);
+    }
+
+    #[test]
+    fn test_write_and_read_binary_record_with_quotes() {
+        let record = sample_record_with_quotes();
+        let mut buffer = Vec::new();
+
+        // Write record
+        write_binary_record(&mut buffer, &record).unwrap();
+
+        // Read it back
+        let mut cursor = Cursor::new(&buffer);
+        let read_record = read_binary_record(&mut cursor).unwrap().unwrap();
+
+        assert_eq!(record, read_record);
+    }
+
+    #[test]
+    fn test_read_binary_record_empty() {
+        let buffer = Vec::new();
+        let mut cursor = Cursor::new(&buffer);
+        let result = read_binary_record(&mut cursor).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_binary_record_truncated_path_len() {
+        // Only 2 bytes of path_len provided (should be 4) -> UnexpectedEof
+        let buffer = vec![0x05, 0x00]; // truncated u32
+        let mut cursor = Cursor::new(&buffer);
+        let err = read_binary_record(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(format!("{}", err).contains("path_len"));
+    }
+
+    #[test]
+    fn test_csv_roundtrip_format_then_parse() {
+        let rec = sample_record_with_quotes();
+        let csv = format_csv_record(&rec);
+        let parsed = parse_csv_record(&csv).unwrap();
+        assert_eq!(rec, parsed);
     }
 }

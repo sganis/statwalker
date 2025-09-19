@@ -384,7 +384,15 @@
       case "disk":
         return humanBytes(toNum(folder?.total_disk));
       case "count":
-        return humanCount(toNum(folder?.total_count));
+        return `${humanCount(toNum(folder?.total_count))} Files`;
+    }
+  }
+  function bottomValueFolder(folder: FolderItem) {
+    switch (sortBy) {
+      case "disk":
+        return `${humanCount(toNum(folder?.total_count))} Files`;  
+      case "count":
+        return humanBytes(toNum(folder?.total_disk));  
     }
   }
   function rightValueFile(f: ScannedFile) {
@@ -921,7 +929,7 @@
             </div>
             <div class="flex justify-end">
               <p class="text-sm">
-                {humanCount(folder.total_count)} Files 
+                {bottomValueFolder(folder)}  
                 • Updated {humanTime(folder.modified)} 
                 {#if humanTime(folder.accessed) > humanTime(folder.modified)}
                 • Last file read {humanTime(folder.accessed)} 
@@ -959,7 +967,10 @@
               <div class="relative z-10 flex justify-between">
                 <div class="">{f.owner}</div>
                 <div class="">
-                  Updated {humanTime(f.modified)} • Read {humanTime(f.accessed)}
+                  Updated {humanTime(f.modified)} 
+                  {#if humanTime(f.accessed) > humanTime(f.modified)}
+                  • Read {humanTime(f.accessed)}
+                  {/if}
                 </div>
               </div>
             </div>
