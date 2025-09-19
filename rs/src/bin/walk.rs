@@ -19,6 +19,9 @@ use colored::Colorize;
 use chrono::Local;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+
 // chunk sizes
 const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2MB for file reads
 const FILE_CHUNK: usize = 16384;     // 16k entries per batch (was 8192)
@@ -698,7 +701,6 @@ fn write_row_bin(buf: &mut Vec<u8>, r: Row<'_>, no_atime: bool) {
 fn csv_push_path_smart_quoted(buf: &mut Vec<u8>, p: &Path) {
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStrExt;
         let bytes = p.as_os_str().as_bytes();
         csv_push_bytes_smart_quoted(buf, bytes);
     }
