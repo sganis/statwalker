@@ -41,11 +41,12 @@ html, body {
   --sv-dropdown-active-bg: #374151;
   --sv-dropdown-selected-bg: #754545;
 
-  --cp-bg-color: #333;
+  --cp-bg-color:  var(--sv-bg);
   --cp-border-color: var(--sv-border-color);
   --cp-text-color: white;
-  --cp-input-color: #555;
+  --cp-input-color: #626262;
   --cp-button-hover-color: #777;
+  --focus-color: var(--sv-border-color);
 
 }
 

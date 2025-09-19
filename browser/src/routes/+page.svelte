@@ -2,8 +2,7 @@
   import { onMount } from "svelte";
   import { SvelteMap } from 'svelte/reactivity';
   import { 
-    getParent, humanTime, humanCount, 
-    formatBytes, getOptimalColors, COLORS,
+    getParent, humanTime, humanCount, humanBytes, getOptimalColors, COLORS,
   } from "../ts/util";
   import { api } from "../ts/api.svelte";
   import { API_URL, State } from "../ts/store.svelte";
@@ -11,13 +10,13 @@
   import ColorPicker from 'svelte-awesome-color-picker';
   import PickerButton from '../lib/PickerButton.svelte';
   import PickerWrapper from '../lib/PickerWrapper.svelte';
+  //import PickerIndicator from '../lib/PickerIndicator.svelte';
 
   //#region state
   let allColors: string[] = []
-  let showColorPicker = false;
   let path = $state('/');
   let fullPath = $state('/');
-  let folders = $state<FileItem[]>([]);
+  let folders = $state<FolderItem[]>([]);
   let files = $state<ScannedFile[]>([]);
   let loading = $state(false);
   let initializing = $state(false);
@@ -106,7 +105,7 @@
     atime: number;
     mtime: number;
   }
-  type FileItem = {
+  type FolderItem = {
     path: string;
     total_count: number;
     total_disk: number; // bytes
@@ -190,7 +189,7 @@
       x,
       y,
       username: userData.username,
-      value: rightValueForUser(userData),
+      value: rightValueUser(userData),
       percent: Math.round(percent * 10) / 10,
     };
   }
@@ -226,7 +225,7 @@
 
   //#region folders and files bars
 
-  function transformFolders(raw: RawFolder[], filter: AgeFilter): FileItem[] {
+  function transformFolders(raw: RawFolder[], filter: AgeFilter): FolderItem[] {
     // Ages to include
     const ages: string[] = filter === -1 ? ["0","1","2"] : [String(filter)];
 
@@ -371,7 +370,7 @@
       },
     };
   }
-  const metricValue = (file: FileItem) => {
+  const metricValue = (file: FolderItem) => {
     switch (sortBy) {
       case "disk":
         return toNum(file?.total_disk);
@@ -380,29 +379,37 @@
     }
   }
   // Right label (folders) – sizes already in BYTES
-  function rightValue(file: FileItem) {
+  function rightValueFolder(folder: FolderItem) {
     switch (sortBy) {
       case "disk":
-        return formatBytes(toNum(file?.total_disk));
+        return humanBytes(toNum(folder?.total_disk));
       case "count":
-        return toNum(file?.total_count).toLocaleString();
+        return humanCount(toNum(folder?.total_count));
+    }
+  }
+  function rightValueFile(f: ScannedFile) {
+    switch (sortBy) {
+      case "disk":
+        return humanBytes(toNum(f.size)); // bytes
+      case "count":
+        return "1";
     }
   }
   // Per-user right label – sizes already in BYTES
-  function rightValueForUser(userData: UserStatsJson) {
+  function rightValueUser(userData: UserStatsJson) {
     switch (sortBy) {
       case "disk":
-        return formatBytes(toNum(userData?.disk));
+        return humanBytes(toNum(userData?.disk));
       case "count":
-        return toNum(userData?.count).toLocaleString();
+        return humanCount(toNum(userData?.count));
     }
   }
   const userMetricFor = (ud: UserStatsJson) => sortBy === "disk" ? Number(ud.disk) : Number(ud.count);
-  function sortedUserEntries(file: FileItem) {
+  function sortedUserEntries(file: FolderItem) {
     return Object.entries(file?.users ?? {}).sort(([, a], [, b]) => userMetricFor(a) - userMetricFor(b));
   }
 
-  function aggregatePathTotals(foldersArr: FileItem[], filesArr: ScannedFile[], p: string): FileItem {
+  function aggregatePathTotals(foldersArr: FolderItem[], filesArr: ScannedFile[], p: string): FolderItem {
     let total_count = 0;
     let total_disk = 0;
     let accessed = 0; 
@@ -487,14 +494,7 @@
     return parentTotal > 0 ? parentTotal : 1;
   });
   const filePct = (f: ScannedFile) => Math.round((fileMetricValue(f) / maxFileMetric) * 1000) / 10;
-  function rightValueFile(f: ScannedFile) {
-    switch (sortBy) {
-      case "disk":
-        return formatBytes(toNum(f.size)); // bytes
-      case "count":
-        return "1";
-    }
-  }
+  
   //#endregion
 
   //#region fetch data
@@ -786,7 +786,11 @@
     {:else}
       <ColorPicker 
         bind:hex={selectedUserColor} 
-        components={{ input: PickerButton,  wrapper: PickerWrapper }}
+        components={{ 
+          input: PickerButton,  
+          wrapper: PickerWrapper, 
+          //pickerIndicator: PickerIndicator 
+        }}
         label="Change User Color"
         onInput={(e)=>{
           userColors.set(selectedUser, selectedUserColor)
@@ -812,8 +816,7 @@
   </div>
   
   <!-- Path total header item -->
-  <div class="">
-    <div class="relative px-2 bg-gray-700 border border-gray-500 rounded overflow-hidden">
+  <div class="relative px-2 bg-gray-700 border border-gray-500 rounded overflow-hidden">
       <!-- Total bar background -->
       <div class="absolute left-0 top-0 bottom-0 flex z-0" style="width: 100%">
         {#each sortedUserEntries(pathTotals) as [uname, userData] (uname)}
@@ -828,7 +831,7 @@
             onmouseenter={(e) => showTip(e, userData, userPercent)}
             onmousemove={moveTip}
             onmouseleave={hideTip}
-            aria-label={`${userData.username}: ${rightValueForUser(userData)}`}
+            aria-label={`${userData.username}: ${rightValueUser(userData)}`}
           ></div>
         {/each}
       </div>
@@ -839,13 +842,12 @@
           <p class="">
             {humanCount(pathTotals.total_count)} Files 
             • Changed {humanTime(pathTotals.modified)} 
-            • {formatBytes(pathTotals.total_disk)}                  
+            • {humanBytes(pathTotals.total_disk)}                  
           </p>
         </div>
       </div>
     </div>
-  </div>
-
+  
   {#if initializing}
     <div class="flex flex-col w-full h-full items-center justify-between font-mono">
       <div class="w-full bg-gray-700 rounded-full h-1">
@@ -897,8 +899,7 @@
           <div class="absolute left-0 top-0 bottom-0 flex z-0" style="width: {pct(metricValue(folder))}%">
             {#each sortedUserEntries(folder) as [uname, userData]}
               {@const userMetric = sortBy === "disk" ? userData.disk : userData.count}
-              {@const totalMetric =
-                sortBy === "disk" ? folder.total_disk :folder.total_count}
+              {@const totalMetric = sortBy === "disk" ? folder.total_disk : folder.total_count}
               {@const userPercent = totalMetric > 0 ? (userMetric / totalMetric) * 100 : 0}
               <div
                 class="h-full transition-all duration-300 min-w-[0.5px] hover:opacity-90"
@@ -906,7 +907,7 @@
                 onmouseenter={(e) => showTip(e, userData, userPercent)}
                 onmousemove={moveTip}
                 onmouseleave={hideTip}
-                aria-label={`${userData.username}: ${rightValueForUser(userData)}`}
+                aria-label={`${userData.username}: ${rightValueUser(userData)}`}
               ></div>
             {/each}
           </div>
@@ -916,7 +917,7 @@
               <div class="w-full overflow-hidden text-ellipsis whitespace-nowrap">
                 <div>{folder.path}</div>
               </div>
-              <span class="text-nowrap font-bold">{rightValue(folder)}</span>
+              <span class="text-nowrap font-bold">{rightValueFolder(folder)}</span>
             </div>
             <div class="flex justify-end">
               <p class="text-sm">

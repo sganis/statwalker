@@ -9,7 +9,7 @@ export function humanTime(unix: number): string {
 }
 
 
-export function formatBytes(bytes, decimals = 1) {
+export function humanBytes(bytes: number, decimals = 1): string {
   if (!+bytes) return '0 B';
 
   const k = 1000;
@@ -24,16 +24,6 @@ export function formatBytes(bytes, decimals = 1) {
 export const humanCount = (n, maxFrac = 1, locale = 'en') =>
   new Intl.NumberFormat(locale, { notation: 'compact', compactDisplay: 'short', maximumFractionDigits: maxFrac }).format(n);
 // compact(1234) -> "1.2K"
-
-
-// Examples:
-// formatBytes(1000) → "1 KB"
-// formatBytes(1024) → "1 KB" (still 1KB since we use 1000 as base)
-// formatBytes(1000000) → "1 MB"
-// formatBytes(1500000) → "1.5 MB"
-// formatBytes(1500000, 2) → "1.50 MB"
-// formatBytes(0) → "0 B"
-// formatBytes(500) → "500 B"
 
 
 export function getParent(inputPath) {
