@@ -2,7 +2,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{self, BufWriter, Write, BufRead, BufReader},
+    io::{self, BufWriter, Write, BufRead, BufReader, Read},
     path::{Path, PathBuf},
     time::Instant,
     thread,
@@ -18,15 +18,6 @@ use clap::{Parser, ColorChoice};
 use colored::Colorize;
 use chrono::Local;
 use zstd::stream::write::Encoder as ZstdEncoder;
-
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
-
-#[cfg(windows)]
-use std::time::SystemTime;
-
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
 
 // chunk sizes
 const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2MB for file reads
@@ -52,8 +43,8 @@ struct Args {
     #[arg(long)]
     bin: bool,
     /// Zero the ATIME field in outputs (CSV & BIN) for testing
-    #[arg(long = "skip-atime", aliases = ["no-atime", "zero-atime"])]
-    skip_atime: bool,
+    #[arg(long = "no-atime")]
+    no_atime: bool,
 }
 
 #[derive(Debug)]
@@ -82,7 +73,7 @@ enum OutputFormat { Csv, Bin }
 struct Config {
     skip: Option<String>,
     out_fmt: OutputFormat,
-    skip_atime: bool,  // zero ATIME for reproducible outputs
+    no_atime: bool,  // zero ATIME for reproducible outputs
 }
 
 struct Row<'a> {
@@ -113,8 +104,8 @@ fn main() -> std::io::Result<()> {
     let args = Args::parse();
     let out_fmt = if args.bin { OutputFormat::Bin } else { OutputFormat::Csv };
     
-    if args.skip_atime {
-        eprintln!("{}", "Note: ATIME will be written as 0 for reproducible output (--skip-atime).".yellow());
+    if args.no_atime {
+        eprintln!("{}", "ATIME will be written as 0 and lines sorted for reproducible output.".yellow());
     }
 
     // Canonicalize root
@@ -219,7 +210,7 @@ fn main() -> std::io::Result<()> {
     let cfg = Config { 
         skip: args.skip,
         out_fmt,
-        skip_atime: args.skip_atime,
+        no_atime: args.no_atime,
     };
 
     // ---- spawn workers ----
@@ -245,7 +236,8 @@ fn main() -> std::io::Result<()> {
     let speed = (total.files as f64) / start_time.elapsed().as_secs_f64();
     
     // ---- merge shards ----
-    merge_shards(&out_dir, &final_path, threads, out_fmt).expect("merge shards failed");
+    let sort_csv = args.no_atime && matches!(out_fmt, OutputFormat::Csv);
+    merge_shards(&out_dir, &final_path, threads, out_fmt, sort_csv).expect("merge shards failed");
 
     println!("Total files  : {}", total.files);
     println!("Failed files : {}", total.errors);  
@@ -333,9 +325,9 @@ fn worker(
                 }
                 if let Some(row) = stat_row(&dir) {
                     if is_bin { 
-                        write_row_bin(&mut buf, row, cfg.skip_atime); 
+                        write_row_bin(&mut buf, row, cfg.no_atime); 
                     } else { 
-                        write_row_csv(&mut buf, &row, cfg.skip_atime);
+                        write_row_csv(&mut buf, &row, cfg.no_atime);
                     }
                     stats.files += 1;
                 } else {
@@ -361,9 +353,9 @@ fn worker(
                     let full = base.join(&name);
                     let row = row_from_metadata(&full, &md); // <-- no syscall here
                     if is_bin { 
-                        write_row_bin(&mut buf, row, cfg.skip_atime);
+                        write_row_bin(&mut buf, row, cfg.no_atime);
                     } else { 
-                        write_row_csv(&mut buf, &row, cfg.skip_atime);
+                        write_row_csv(&mut buf, &row, cfg.no_atime);
                     }
                     stats.files += 1;
 
@@ -494,9 +486,10 @@ fn row_from_metadata<'a>(path: &'a Path, md: &fs::Metadata) -> Row<'a> {
         }
         let owner = mode & 0o700;
         mode |= (owner >> 3) | (owner >> 6);
-
+        
+        let uid = get_rid(path).unwrap_or(0);
         Row {
-            path, dev: 0, ino: 0, mode, uid: 0, gid: 0,
+            path, dev: 0, ino: 0, mode, uid, gid: 0,
             size: md.len(), blocks, atime, mtime,
         }
     }
@@ -509,69 +502,123 @@ fn row_from_metadata<'a>(path: &'a Path, md: &fs::Metadata) -> Row<'a> {
 
 fn stat_row<'a>(path: &'a Path) -> Option<Row<'a>> {
     let md = fs::symlink_metadata(path).ok()?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some(Row {
-            path,
-            dev: md.dev(),
-            ino: md.ino(),
-            mode: md.mode(),
-            uid: md.uid(),
-            gid: md.gid(),
-            size: md.size(),
-            blocks: md.blocks() as u64,
-            atime: md.atime(),
-            mtime: md.mtime(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        let is_file = md.is_file();
-
-        let to_unix_timestamp = |time: SystemTime| -> i64 {
-            time.duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0)
-        };
-
-        let atime = md.accessed().ok().map(to_unix_timestamp).unwrap_or(0);
-        let mtime = md.modified().ok().map(to_unix_timestamp).unwrap_or(0);
-        let blocks = (md.len() + 511) / 512;
-
-        let file_attributes = md.file_attributes();
-        const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
-        
-        let mut mode = if is_file { 0o100000 } else { 0o040000 };
-        mode |= 0o400; // Owner read
-        if (file_attributes & FILE_ATTRIBUTE_READONLY) == 0 { mode |= 0o200; }
-        if is_file {
-            if let Some(ext) = path.extension() {
-                match ext.to_str().unwrap_or("").to_lowercase().as_str() {
-                    "exe" | "bat" | "cmd" | "com" | "scr" | "ps1" | "vbs" => mode |= 0o100,
-                    _ => {}
-                }
-            }
-        } else {
-            mode |= 0o100;
-        }
-        let owner_perms = mode & 0o700;
-        mode |= (owner_perms >> 3) | (owner_perms >> 6);
-
-        Some(Row {
-            path, dev: 0, ino: 0, mode, uid: 0, gid: 0,
-            size: md.len(), blocks, atime, mtime,
-        })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        Some(Row {
-            path, dev: 0, ino: 0, mode: 0, uid: 0, gid: 0,
-            size: md.len(), blocks: 0, atime: 0, mtime: 0,
-        })
-    }
+    Some(row_from_metadata(path, &md))
 }
+
+#[cfg(windows)]
+pub fn _get_sid(path: &std::path::Path) -> std::io::Result<String> {
+    use std::{io, iter, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::{
+        GetSidIdentifierAuthority, GetSidSubAuthority, GetSidSubAuthorityCount, IsValidSid,
+        OWNER_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(iter::once(0)).collect();
+    let mut p_owner_sid: *mut core::ffi::c_void = ptr::null_mut();
+    let mut p_sd: *mut core::ffi::c_void = ptr::null_mut();
+
+    let err = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut p_owner_sid as *mut _ as *mut _,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut p_sd, // must LocalFree
+        )
+    };
+    if err != 0 {
+        return Err(io::Error::from_raw_os_error(err as i32));
+    }
+
+    // Validate SID pointer before touching it
+    if unsafe { IsValidSid(p_owner_sid) } == 0 {
+        unsafe { LocalFree(p_sd as *mut _); }
+        return Err(io::Error::new(io::ErrorKind::Other, "Invalid SID"));
+    }
+
+    // Build "S-1-<id_auth>-<sub1>-...-<subN>"
+    let mut s = String::from("S-1");
+
+    // Identifier Authority (6 bytes big-endian)
+    let ia = unsafe { *GetSidIdentifierAuthority(p_owner_sid) }.Value;
+    let id_auth: u64 = ((ia[0] as u64) << 40)
+        | ((ia[1] as u64) << 32)
+        | ((ia[2] as u64) << 24)
+        | ((ia[3] as u64) << 16)
+        | ((ia[4] as u64) << 8)
+        |  (ia[5] as u64);
+    s.push('-');
+    s.push_str(&id_auth.to_string());
+
+    // Subauthorities: clamp to reasonable bounds (Windows max is 15)
+    let sub_count = unsafe { *GetSidSubAuthorityCount(p_owner_sid) } as u32;
+    let sub_count = sub_count.min(15);
+    for i in 0..sub_count {
+        let p_sub = unsafe { GetSidSubAuthority(p_owner_sid, i) }; // -> *mut u32
+        let val = unsafe { *p_sub } as u32;
+        s.push('-');
+        s.push_str(&val.to_string());
+    }
+
+    unsafe { LocalFree(p_sd as *mut _); }
+    Ok(s)
+}
+
+
+#[cfg(windows)]
+pub fn get_rid(path: &std::path::Path) -> std::io::Result<u32> {
+    use std::{io, iter, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::{GetSidSubAuthority, GetSidSubAuthorityCount, IsValidSid, OWNER_SECURITY_INFORMATION};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+
+    // Correct: encode the path's OsStr to wide and null-terminate
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(iter::once(0)).collect();
+
+    let mut p_owner_sid: *mut core::ffi::c_void = ptr::null_mut();
+    let mut p_sd: *mut core::ffi::c_void = ptr::null_mut();
+
+    let err = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut p_owner_sid as *mut _ as *mut _,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut p_sd, // must be freed with LocalFree
+        )
+    };
+    if err != 0 {
+        return Err(io::Error::from_raw_os_error(err as i32));
+    }
+
+    // Validate SID, then read last subauthority (RID)
+    let rid = unsafe {
+        if IsValidSid(p_owner_sid) == 0 {
+            LocalFree(p_sd as *mut _);
+            return Err(io::Error::new(io::ErrorKind::Other, "Invalid SID"));
+        }
+        let count = *GetSidSubAuthorityCount(p_owner_sid) as u32;
+        if count == 0 {
+            LocalFree(p_sd as *mut _);
+            return Err(io::Error::new(io::ErrorKind::Other, "SID has no subauthorities"));
+        }
+        let p_last = GetSidSubAuthority(p_owner_sid, count - 1); // *mut u32
+        let val = *p_last as u32;
+        LocalFree(p_sd as *mut _);
+        val
+    };
+
+    Ok(rid)
+}
+
 
 // Pre-allocate formatters to avoid repeated allocation
 thread_local! {
@@ -581,7 +628,7 @@ thread_local! {
 }
 
 // ----- CSV writing -----
-fn write_row_csv(buf: &mut Vec<u8>, r: &Row<'_>, skip_atime: bool) {
+fn write_row_csv(buf: &mut Vec<u8>, r: &Row<'_>, no_atime: bool) {
     buf.reserve(256);
     // INODE as dev-ino
     push_u64(buf, r.dev);
@@ -590,7 +637,7 @@ fn write_row_csv(buf: &mut Vec<u8>, r: &Row<'_>, skip_atime: bool) {
     push_comma(buf);
 
     // ATIME (zeroed if requested)
-    if skip_atime { push_i64(buf, 0); } else { push_i64(buf, r.atime); }
+    if no_atime { push_i64(buf, 0); } else { push_i64(buf, r.atime); }
     push_comma(buf);   
 
     // MTIME
@@ -598,7 +645,7 @@ fn write_row_csv(buf: &mut Vec<u8>, r: &Row<'_>, skip_atime: bool) {
     push_comma(buf);
 
     // UID, GID, MODE
-    push_u32(buf, r.uid);   
+    push_u32(buf, r.uid);       
     push_comma(buf);
     push_u32(buf, r.gid);   
     push_comma(buf);
@@ -617,7 +664,7 @@ fn write_row_csv(buf: &mut Vec<u8>, r: &Row<'_>, skip_atime: bool) {
 }
 
 // ----- BIN writing -----
-fn write_row_bin(buf: &mut Vec<u8>, r: Row<'_>, skip_atime: bool) {
+fn write_row_bin(buf: &mut Vec<u8>, r: Row<'_>, no_atime: bool) {
     
     #[cfg(unix)]
     let path_bytes: &[u8] = {
@@ -630,7 +677,7 @@ fn write_row_bin(buf: &mut Vec<u8>, r: Row<'_>, skip_atime: bool) {
     let path_bytes: &[u8] = path_lossy.as_bytes(); // borrow from it safely
 
     let path_len = path_bytes.len() as u32;
-    let atime = if skip_atime { 0i64 } else { r.atime };
+    let atime = if no_atime { 0i64 } else { r.atime };
     let disk = r.blocks * 512;
     
     //buf.reserve(64 + 2 * r.path.as_os_str().len());
@@ -720,11 +767,12 @@ fn merge_shards(
     final_path: &Path, 
     threads: usize, 
     out_fmt: OutputFormat,
+    sort_csv: bool,
 ) -> std::io::Result<()> {
     let mut out = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&final_path)?);
 
     match out_fmt {
-        OutputFormat::Csv => merge_shards_csv(out_dir, &mut out, threads),
+        OutputFormat::Csv => merge_shards_csv(out_dir, &mut out, threads, sort_csv),
         OutputFormat::Bin => merge_shards_bin(out_dir, &mut out, threads),
     }?;
 
@@ -732,22 +780,67 @@ fn merge_shards(
     Ok(())
 }
 
-fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, threads: usize) -> std::io::Result<()> {
+fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, threads: usize, sort_csv: bool) -> std::io::Result<()> {
     out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n")?;
     let hostname = get_hostname();
+
+    if !sort_csv {
+        // Old behavior: stream in shard order
+        for tid in 0..threads {
+            let shard = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
+            if !shard.exists() { continue; }
+            let f = File::open(&shard)?;
+            let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
+
+            // Skip shard header line
+            let mut first_line = Vec::<u8>::with_capacity(128);
+            reader.read_until(b'\n', &mut first_line)?; // discard header
+
+            io::copy(&mut reader, out)?;
+            let _ = fs::remove_file(shard);
+        }
+        return Ok(());
+    }
+
+    // Sorted mode (only used when --skip-atime and CSV)
+    let mut lines: Vec<String> = Vec::new();
+
     for tid in 0..threads {
         let shard = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
         if !shard.exists() { continue; }
+
         let f = File::open(&shard)?;
         let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
 
-        // Skip shard header line
-        let mut first_line = Vec::<u8>::with_capacity(128);
-        reader.read_until(b'\n', &mut first_line)?; // discard header
+        // Skip shard header
+        let mut throwaway = Vec::<u8>::with_capacity(128);
+        reader.read_until(b'\n', &mut throwaway)?;
 
-        io::copy(&mut reader, out)?;
+        // Read remainder into buffer and split into lines
+        let mut buf = String::new();
+        reader.read_to_string(&mut buf)?;
+        for line in buf.split_inclusive('\n') {
+            // retain only non-empty rows
+            if line.trim().is_empty() { continue; }
+            // store without trailing newline; we'll add our own
+            let ln = line.strip_suffix('\n').unwrap_or(line).to_string();
+            if !ln.is_empty() {
+                lines.push(ln);
+            }
+        }
+
         let _ = fs::remove_file(shard);
     }
+
+    // Full-line lexicographic sort (deterministic; ATIME is zeroed in the rows)
+    lines.sort_unstable();
+
+    // Write back
+    for ln in lines {
+        out.write_all(ln.as_bytes())?;
+        out.write_all(b"\n")?;
+    }
+
     Ok(())
 }
 
@@ -872,8 +965,8 @@ mod tests {
             w.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\na\n")?;
         }
 
-        // Call with correct signature
-        super::merge_shards(&out_dir, &final_path, 2, OutputFormat::Csv)?;
+        // sort_csv = false → just concatenates
+        super::merge_shards(&out_dir, &final_path, 2, OutputFormat::Csv, false)?;
 
         let mut s = String::new();
         File::open(&final_path)?.read_to_string(&mut s)?;
@@ -885,9 +978,40 @@ mod tests {
         Ok(())
     }
 
-    // Test for skip_atime functionality
     #[test]
-    fn test_skip_atime_in_csv() {
+    fn test_merge_shards_csv_sorted_with_no_atime() -> std::io::Result<()> {
+        let tmp = tempdir()?;
+        let out_dir = tmp.path().to_path_buf();
+        let final_path = out_dir.join("out_sorted.csv");
+
+        // Create 2 CSV shards (out of order)
+        let shard0 = out_dir.join(format!("shard_{}_0.tmp", get_hostname()));
+        let shard1 = out_dir.join(format!("shard_{}_1.tmp", get_hostname()));
+        {
+            let mut w = File::create(&shard0)?;
+            w.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\nb\n")?;
+        }
+        {
+            let mut w = File::create(&shard1)?;
+            w.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\na\n")?;
+        }
+
+        // sort_csv = true → sorted result
+        super::merge_shards(&out_dir, &final_path, 2, OutputFormat::Csv, true)?;
+
+        let mut s = String::new();
+        File::open(&final_path)?.read_to_string(&mut s)?;
+        let mut lines: Vec<&str> = s.lines().collect();
+
+        assert_eq!(lines.remove(0), "INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH");
+        assert_eq!(lines, vec!["a", "b"]);
+        Ok(())
+    }
+
+    // Test for no_atime functionality (Unix-only due to uid type)
+    #[cfg(unix)]
+    #[test]
+    fn test_no_atime_in_csv() {
         let mut buf = Vec::new();
         let dummy_path = Path::new("/test/path");
         let row = Row {

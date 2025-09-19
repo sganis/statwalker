@@ -556,6 +556,89 @@ fn read_u32_le_opt<R: Read>(r: &mut R) -> io::Result<Option<u32>> {
     }
 }
 
+#[cfg(test)]
+fn read_binary_record<R: Read>(r: &mut R) -> io::Result<Option<BinaryRecord>> {
+    // Read path_len with proper EOF semantics:
+    // - Ok(None) if we are exactly at EOF before any byte (clean EOF)
+    // - Err(UnexpectedEof, "truncated record (path_len)") if partial
+    let path_len = match read_u32_le_opt(r)? {
+        None => return Ok(None),
+        Some(v) => v as usize,
+    };
+
+    // Read path bytes
+    let mut path = vec![0u8; path_len];
+    read_exact_fully(r, &mut path)?; // will produce UnexpectedEof if truncated
+
+    // Fixed-width fields (use your exact helpers to keep semantics consistent)
+    let dev   = read_u64_le_exact(r)?;
+    let ino   = read_u64_le_exact(r)?;
+    let atime = read_i64_le_exact(r)?;
+    let mtime = read_i64_le_exact(r)?;
+    let uid   = read_u32_le_exact(r)?;
+    let gid   = read_u32_le_exact(r)?;
+    let mode  = read_u32_le_exact(r)?;
+    let size  = read_u64_le_exact(r)?;
+    let disk  = read_u64_le_exact(r)?;
+
+    Ok(Some(BinaryRecord {
+        path,
+        dev,
+        ino,
+        atime,
+        mtime,
+        uid,
+        gid,
+        mode,
+        size,
+        disk,
+    }))
+}
+
+#[cfg(test)]
+fn format_csv_record(rec: &BinaryRecord) -> String {
+    // PATH as lossy UTF-8, with smart CSV quoting (quote if contains [" , \n \r])
+    fn needs_quote(s: &str) -> bool {
+        s.as_bytes().iter().any(|&b| matches!(b, b',' | b'"' | b'\n' | b'\r'))
+    }
+    fn quote_csv(s: &str) -> String {
+        if !needs_quote(s) {
+            return s.to_string();
+        }
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for ch in s.chars() {
+            if ch == '"' {
+                out.push('"');
+                out.push('"');
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    let inode = format!("{}-{}", rec.dev, rec.ino);
+    let path_str = String::from_utf8_lossy(&rec.path);
+    let path_csv = quote_csv(&path_str);
+
+    // INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH
+    // Use decimal for all integers to match your existing CSV.
+    format!(
+        "{inode},{atime},{mtime},{uid},{gid},{mode},{size},{disk},{path}",
+        inode = inode,
+        atime = rec.atime,
+        mtime = rec.mtime,
+        uid   = rec.uid,
+        gid   = rec.gid,
+        mode  = rec.mode,
+        size  = rec.size,
+        disk  = rec.disk,
+        path  = path_csv
+    )
+}
+
 // ========== TESTS ==========
 
 #[cfg(test)]
