@@ -12,12 +12,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::{File},
-    io::{self, Read, Write},
+    io::{Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::OnceLock,
-    time::SystemTime,
-    net::TcpListener,
+    time::{SystemTime,Duration},
+    net::TcpStream,
 };
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
@@ -151,23 +151,17 @@ async fn main() -> anyhow::Result<()> {
 }
 
 
-fn is_port_taken(port: u16) -> bool {
-    let addr = format!("127.0.0.1:{port}");
-    match TcpListener::bind(&addr) {
-        Ok(listener) => {
-            // Binding succeeded → port was free, release it immediately
-            drop(listener);
-            false
-        }
-        Err(e) => {
-            if e.kind() == io::ErrorKind::AddrInUse {
-                true
-            } else {
-                // some other error (e.g. permission denied on privileged port)
-                true
-            }
+pub fn is_port_taken(port: u16) -> bool {
+    let addrs = [
+        format!("127.0.0.1:{port}"),
+        format!("[::1]:{port}"),
+    ];
+    for a in addrs {
+        if TcpStream::connect_timeout(&a.parse().unwrap(), Duration::from_millis(120)).is_ok() {
+            return true;
         }
     }
+    false
 }
 
 
