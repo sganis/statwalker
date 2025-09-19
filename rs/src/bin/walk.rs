@@ -8,7 +8,7 @@ use std::{
     thread,
 };
 use std::sync::{
-    atomic::{AtomicUsize, Ordering::Relaxed},
+    atomic::{AtomicUsize, AtomicU64, AtomicBool, Ordering::Relaxed},
     Arc,
 };
 use crossbeam::channel::{unbounded, Receiver, Sender};
@@ -48,6 +48,12 @@ struct Args {
     /// Zero the ATIME field in outputs (CSV & BIN) for testing
     #[arg(long = "no-atime")]
     no_atime: bool,
+}
+
+#[derive(Default)]
+struct Progress {
+    files:  AtomicU64,
+    errors: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -191,6 +197,28 @@ fn main() -> std::io::Result<()> {
     let (tx, rx) = unbounded::<Task>();
     let inflight = Arc::new(AtomicUsize::new(0));
 
+    // reporter
+    let progress = Arc::new(Progress::default());
+    let reporting_done = Arc::new(AtomicBool::new(false));
+    let progress_for_reporter = progress.clone();
+    let start_for_reporter = Instant::now();
+
+    let reporter_join = {
+        let reporting_done = reporting_done.clone();
+        thread::spawn(move || {
+            use std::time::Duration;
+            loop {
+                if reporting_done.load(Relaxed) { break; }
+                let f = progress_for_reporter.files.load(Relaxed);
+                let elapsed = start_for_reporter.elapsed().as_secs_f64().max(0.001);
+                let rate = (f as f64 / elapsed) as u64;
+                eprint!("\rFiles: {} [{} files/s]", f, rate);
+                thread::sleep(Duration::from_millis(1000));
+            }
+            eprintln!(); // move to next line once done
+        })
+    };
+
     // seed roots
     inflight.fetch_add(1, Relaxed);
     tx.send(Task::Dir(PathBuf::from(root))).expect("enqueue root");
@@ -224,7 +252,10 @@ fn main() -> std::io::Result<()> {
         let inflight = inflight.clone();
         let out_dir = out_dir.clone();
         let cfg = cfg.clone();
-        joins.push(thread::spawn(move || worker(tid, rx, tx, inflight, out_dir, cfg)));
+        let progress = progress.clone();
+        joins.push(thread::spawn(move || worker(
+            tid, rx, tx, inflight, out_dir, cfg, progress
+        )));
     }
     drop(tx);
 
@@ -242,6 +273,10 @@ fn main() -> std::io::Result<()> {
     let sort_csv = args.no_atime && matches!(out_fmt, OutputFormat::Csv);
     merge_shards(&out_dir, &final_path, threads, out_fmt, sort_csv).expect("merge shards failed");
 
+    reporting_done.store(true, Relaxed);
+    let _ = reporter_join.join();
+    
+    
     println!("Total files  : {}", total.files);
     println!("Failed files : {}", total.errors);  
     println!("Elapsed time : {:.2} seconds", start_time.elapsed().as_secs_f64());
@@ -292,6 +327,7 @@ fn worker(
     inflight: Arc<AtomicUsize>,
     out_dir: PathBuf,
     cfg: Config,
+    progress: Arc<Progress>,
 ) -> Stats {
     let is_bin = cfg.out_fmt == OutputFormat::Bin;
     let hostname = get_hostname();
@@ -345,6 +381,7 @@ fn worker(
                 let error_count = enum_dir(&dir, &tx, &inflight, cfg.skip.as_deref());
                 stats.errors += error_count;
                 inflight.fetch_sub(1, Relaxed);
+                progress.files.fetch_add(1, Relaxed);
             }
 
             Task::Files { base, items } => {
@@ -352,7 +389,7 @@ fn worker(
                     inflight.fetch_sub(1, Relaxed);
                     continue;
                 }
-                for FileItem { name, md } in items {
+                for FileItem { name, md } in &items {
                     let full = base.join(&name);
                     let row = row_from_metadata(&full, &md); // <-- no syscall here
                     if is_bin { 
@@ -368,6 +405,7 @@ fn worker(
                     }
                 }
                 inflight.fetch_sub(1, Relaxed);
+                progress.files.fetch_add(items.len() as u64, Relaxed);
             }
         }
     }
