@@ -1,4 +1,4 @@
-# Statwalker: A Five-Stage Platform for High-Scale Filesystem Analytics
+# Dutopia: A Five-Stage Platform for High-Scale Filesystem Analytics
 
 **Components:** Walk (scanner) · Resolve (optional humanizer) · Aggregate (folder·user·age rollups) · Serve (REST API) · Frontend (Svelte SPA)
 **Languages:** Rust (Walk, Resolve, Aggregate, Serve) · TypeScript/Svelte (Frontend)
@@ -9,7 +9,7 @@
 
 ## 0) Executive Summary
 
-Statwalker is a modular toolchain for turning very large filesystems into fast, filterable, **UTF-8 clean** analytics. It separates concerns so each stage is simple and fast:
+Dutopia is a modular toolchain for turning very large filesystems into fast, filterable, **UTF-8 clean** analytics. It separates concerns so each stage is simple and fast:
 
 1. **Walk** traverses the filesystem with high concurrency and streams a compact CSV with POSIX-like metadata for **both files and directories**.
 2. **Resolve** *(optional)* converts machine data (epochs, uids/gids, mode bits) into human fields (local dates, usernames, types, octal perms). Ideal for BI tools; **not required** by the later stages.
@@ -483,6 +483,6 @@ resolve /tmp/data.csv -o /tmp/data.res.csv
 
 ### Closing
 
-Statwalker’s strength is its **tight contracts** and **modularity**. Walk is ruthlessly fast; Resolve makes CSVs pleasant for BI; Aggregate compacts oceans of files into meaningful per-folder/user/age slices; Serve answers queries in memory; and the Svelte SPA makes the result obvious and actionable.
+Dutopia’s strength is its **tight contracts** and **modularity**. Walk is ruthlessly fast; Resolve makes CSVs pleasant for BI; Aggregate compacts oceans of files into meaningful per-folder/user/age slices; Serve answers queries in memory; and the Svelte SPA makes the result obvious and actionable.
 
 Publish this white paper alongside the binaries, and you give users everything they need to trust the numbers, wire up dashboards, and scale confidently.

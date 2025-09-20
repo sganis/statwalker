@@ -17,7 +17,7 @@ use clap::{Parser, ColorChoice};
 use colored::Colorize;
 use chrono::Local;
 use zstd::stream::write::Encoder as ZstdEncoder;
-use statwalker::util::{
+use dutopia::util::{
     Row, should_skip, 
     csv_push_path_smart_quoted,
     format_duration, get_hostname, strip_verbatim_prefix,
@@ -108,7 +108,8 @@ fn main() -> std::io::Result<()> {
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
     println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Statwaker    : Super fast filesystem scanner".cyan().bold());
+    println!("{}", "Dutopia duscan".cyan().bold());
+    println!("{}", "Summry       : Superfast filesystem scanner".cyan().bold());
     println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
     println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
     // println!("{}", format!("Author: {}",env!("CARGO_PKG_AUTHORS")).cyan().bold());
@@ -170,7 +171,7 @@ fn main() -> std::io::Result<()> {
     }
 
     // Check write access by trying to create a temp file
-    let testfile = out_dir.join(".statwalker_write_test");
+    let testfile = out_dir.join(".dutopia_write_test");
     match File::create(&testfile) {
         Ok(_) => {
             // Clean up the test file immediately
@@ -686,10 +687,10 @@ mod tests {
     use tempfile::tempdir;
     
     #[cfg(windows)]
-    use statwalker::util::csv_push_str_smart_quoted;
+    use dutopia::util::csv_push_str_smart_quoted;
 
     #[cfg(unix)]
-    use statwalker::util::csv_push_bytes_smart_quoted;
+    use dutopia::util::csv_push_bytes_smart_quoted;
     
     #[test]
     fn test_should_skip() {

@@ -11,7 +11,7 @@ use chrono::Utc;
 #[cfg(unix)]
 use std::ffi::CStr;
 
-// POSIX-style type masks as encoded by Statwalker in MODE
+// POSIX-style type masks as encoded by dutopia in MODE
 #[cfg(unix)]
 const S_IFMT:  u32 = 0o170000;
 #[cfg(unix)]
@@ -59,7 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
     println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Statwaker aggregate computes totals per triplet: folder,user,age".cyan().bold());
+    println!("{}", "Dutopia dusum".cyan().bold());
+    println!("{}", "Summry       : Computes totals per folder, user and age".cyan().bold());
     println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
     println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());

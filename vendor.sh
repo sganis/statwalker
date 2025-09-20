@@ -16,6 +16,6 @@ cargo clean
 cargo vendor --versioned-dirs --no-delete ../../vendor
 cd ../..
 echo "compressing..."
-zip -qr ../statwalker.zip .
+zip -qr ../dutopia.zip .
 
 

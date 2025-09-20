@@ -1,5 +1,5 @@
 **********
-Statwalker
+Dutopia
 **********
 
 Walk file systems and collect stats.
@@ -9,7 +9,7 @@ Walk file systems and collect stats.
 Summary
 =======
 
-Statwalker is a command-line program that scan files recursively (normally called as "walk") and collects stats, basically file names and metadata (inode information in Linux systems). It runs in parallel in a single machine, and the output is a comma-separated file (*.csv), one line per file. These results can be analysed using other tools (see below).
+Dutopia is a command-line program that scan files recursively (normally called as "walk") and collects stats, basically file names and metadata (inode information in Linux systems). It runs in parallel in a single machine, and the output is a comma-separated file (*.csv), one line per file. These results can be analysed using other tools (see below).
 
 Output
 ======
@@ -41,7 +41,7 @@ Collecting stats is as simple as this one-liner in bash:
 
 	$ TODO
 
-There are many tools doing the same thing, the problem is performance. After trying some tools in a file system with many terabytes of data and millions of files, the problem became untractable. I run statwalker in a storage with 100+ millions of files, with a reading rate over NFS folders of 3000 files/second on average, and much faster if disks are local.
+There are many tools doing the same thing, the problem is performance. After trying some tools in a file system with many terabytes of data and millions of files, the problem became untractable. I run Dutopia in a storage with 100+ millions of files, with a reading rate over NFS folders of 3000 files/second on average, and much faster if disks are local.
 
 
 Installation
@@ -51,7 +51,7 @@ Use pip:
 
 .. code:: bash
 
-    $ pip install statwalker
+    $ pip install Dutopia
 
 
 Usage
@@ -60,10 +60,10 @@ Usage
 .. code::
 	
 	# run it from the command line to see available parameters:
-	$ statwalker -h
+	$ Dutopia -h
 
 	# run it with options
-	$ statwalker -o output.csv /home
+	$ Dutopia -o output.csv /home
 
 
 Contribute
@@ -73,7 +73,7 @@ Clone the github repository:
 
 .. code:: bash
 
-    $ git clone https://github.com/sganis/statwalker.git
+    $ git clone https://github.com/sganis/Dutopia.git
 
 
 TODO

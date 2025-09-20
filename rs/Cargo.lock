@@ -498,6 +498,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "dutopia"
+version = "3.0.20"
+dependencies = [
+ "anyhow",
+ "atoi",
+ "axum",
+ "axum-extra",
+ "chrono",
+ "clap 4.5.47",
+ "colored",
+ "crossbeam",
+ "csv",
+ "dotenvy",
+ "hostname",
+ "itoa",
+ "jsonwebtoken",
+ "libc",
+ "memchr",
+ "num_cpus",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "tokio",
+ "tower-http",
+ "windows-sys 0.61.0",
+ "zstd",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1353,36 +1383,6 @@ checksum = "233504af464074f9d066d7b5416c5f9b894a5862a6506e306f7b816cdd6f1807"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "statwalker"
-version = "3.0.20"
-dependencies = [
- "anyhow",
- "atoi",
- "axum",
- "axum-extra",
- "chrono",
- "clap 4.5.47",
- "colored",
- "crossbeam",
- "csv",
- "dotenvy",
- "hostname",
- "itoa",
- "jsonwebtoken",
- "libc",
- "memchr",
- "num_cpus",
- "serde",
- "serde_json",
- "serial_test",
- "tempfile",
- "tokio",
- "tower-http",
- "windows-sys 0.61.0",
- "zstd",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 // src/bin/bincsv.rs
 //
-// Convert Statwalker binary stream (.bin or .zst) to CSV, or compress CSV to .zst
+// Convert dutpia binary stream (.bin or .zst) to CSV, or compress CSV to .zst
 // Autodetects compression via zstd header bytes: magic == 0xFD2FB528
 //
 // Record (repeated):
@@ -59,22 +59,10 @@ fn main() -> io::Result<()> {
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
     println!("{}", "------------------------------------------------".cyan().bold());
-    println!(
-        "{}",
-        "Statwaker bincsv converts binary to csv and vice-versa (zst compression)"
-            .cyan()
-            .bold()
-    );
-    println!(
-        "{}",
-        format!("Version      : {}", env!("CARGO_PKG_VERSION"))
-            .cyan()
-            .bold()
-    );
-    println!(
-        "{}",
-        format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold()
-    );
+    println!("{}", "Dutopia duzip".cyan().bold());
+    println!("{}", "Summry       : Converts binary to csv and vice-versa".cyan().bold());
+    println!("{}",format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}", "------------------------------------------------".cyan().bold());
 
     let args = Args::parse();

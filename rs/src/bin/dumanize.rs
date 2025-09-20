@@ -13,7 +13,7 @@ use std::ffi::CStr;
 #[derive(Parser, Debug)]
 #[command(version, color = ColorChoice::Auto)]
 struct Args {
-    /// Input CSV produced by statwalker.py
+    /// Input CSV produced by dutpia.py
     input: PathBuf,
     /// Output CSV (defaults to <stem>.res.csv in the current directory)
     #[arg(short, long)]
@@ -29,7 +29,8 @@ fn main() -> Result<()> {
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
     println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Statwaker resolve converts raw stats into human version".cyan().bold());
+    println!("{}", "Dutopia dumanize".cyan().bold());
+    println!("{}", "Summry       : Converts raw stats into human version".cyan().bold());
     println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
     println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());

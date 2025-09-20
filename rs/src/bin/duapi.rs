@@ -25,7 +25,7 @@ use memchr::memchr_iter;
 use clap::{Parser, ColorChoice};
 use colored::Colorize;
 use jsonwebtoken::{encode, Header};
-use statwalker::auth::{platform, AuthError, AuthPayload, AuthBody, Claims, keys};
+use dutopia::auth::{platform, AuthError, AuthPayload, AuthBody, Claims, keys};
 
 #[cfg(unix)]
 use std::ffi::CStr;
@@ -76,7 +76,8 @@ async fn main() -> anyhow::Result<()> {
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
     println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Statwaker web server".cyan().bold());
+    println!("{}", "Dutopia duapi".cyan().bold());
+    println!("{}", "Summry       : Disk usage API server".cyan().bold());
     println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
     println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());
