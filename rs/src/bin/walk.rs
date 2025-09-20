@@ -13,19 +13,23 @@ use std::sync::{
 };
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use num_cpus;
-use itoa::Buffer;
 use clap::{Parser, ColorChoice};
 use colored::Colorize;
 use chrono::Local;
 use zstd::stream::write::Encoder as ZstdEncoder;
-
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
+use statwalker::util::{
+    Row, should_skip, 
+    csv_push_path_smart_quoted,
+    format_duration, get_hostname, strip_verbatim_prefix,
+    push_u32, push_u64, push_i64, push_comma,
+    row_from_metadata, stat_row,
+    fs_used_bytes, human_bytes,
+};
 
 // chunk sizes
-const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2MB for file reads
-const FILE_CHUNK: usize = 16384;     // 16k entries per batch (was 8192)
-const FLUSH_BYTES: usize = 8 * 1024 * 1024; // 8MB buffer (was 4MB)
+const READ_BUF_SIZE: usize = 2 * 1024 * 1024; 
+const FILE_CHUNK: usize = 2048;     
+const FLUSH_BYTES: usize = 4 * 1024 * 1024; 
 
 
 #[derive(Parser, Debug)]
@@ -48,12 +52,16 @@ struct Args {
     /// Zero the ATIME field in outputs (CSV & BIN) for testing
     #[arg(long = "no-atime")]
     no_atime: bool,
+    /// Manual total-size hint (e.g. 750gb, 1.2tb). Used for % progress when root isn’t a mount/drive.
+    #[arg(long = "size-hint", value_name = "SIZE")]
+    size_hint: Option<String>,
 }
 
 #[derive(Default)]
 struct Progress {
     files:  AtomicU64,
     errors: AtomicU64,
+    bytes:  AtomicU64, // accumulated disk bytes (r.blocks * 512)
 }
 
 #[derive(Debug)]
@@ -85,19 +93,6 @@ struct Config {
     no_atime: bool,  // zero ATIME for reproducible outputs
 }
 
-struct Row<'a> {
-    path: &'a Path,
-    dev: u64,
-    ino: u64,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    size: u64,
-    blocks: u64,
-    atime: i64,
-    mtime: i64,
-}
-
 fn main() -> std::io::Result<()> {
     #[cfg(windows)]
     colored::control::set_virtual_terminal(true).unwrap_or(());
@@ -109,7 +104,6 @@ fn main() -> std::io::Result<()> {
     // println!("{}", format!("Author: {}",env!("CARGO_PKG_AUTHORS")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());
 
-    let start_time = Instant::now();
     let args = Args::parse();
     let out_fmt = if args.bin { OutputFormat::Bin } else { OutputFormat::Csv };
     
@@ -197,28 +191,59 @@ fn main() -> std::io::Result<()> {
     let (tx, rx) = unbounded::<Task>();
     let inflight = Arc::new(AtomicUsize::new(0));
 
-    // reporter
-    let progress = Arc::new(Progress::default());
-    let reporting_done = Arc::new(AtomicBool::new(false));
-    let progress_for_reporter = progress.clone();
-    let start_for_reporter = Instant::now();
+    // // reporter
+    // let total_hint_bytes = fs_used_bytes(&root_normalized);
+    // println!("Disk usage   : {}", match total_hint_bytes {
+    //     Some(b) => human_bytes(b),
+    //     None => "unknown".to_string(),
+    // });
+    // let progress = Arc::new(Progress::default());
+    // let reporting_done = Arc::new(AtomicBool::new(false));
+    // let progress_for_reporter = progress.clone();
+    // let start_for_reporter = Instant::now();
 
-    let reporter_join = {
-        let reporting_done = reporting_done.clone();
-        thread::spawn(move || {
-            use std::time::Duration;
-            loop {
-                if reporting_done.load(Relaxed) { break; }
-                let f = progress_for_reporter.files.load(Relaxed);
-                let elapsed = start_for_reporter.elapsed().as_secs_f64().max(0.001);
-                let rate = (f as f64 / elapsed) as u64;
-                eprint!("\rFiles: {} [{} files/s]", f, rate);
-                thread::sleep(Duration::from_millis(1000));
-            }
-            eprintln!(); // move to next line once done
-        })
-    };
+    // let reporter_join = {
+    //     let reporting_done = reporting_done.clone();
+    //     thread::spawn(move || {
+    //         use std::time::{Duration, Instant};
+    //         let mut last_t = Instant::now();
+    //         let mut last_f = 0u64;            
+    //         loop {
+    //             if reporting_done.load(Relaxed) { break; }
+    //             let f = progress_for_reporter.files.load(Relaxed);
+    //             let e = progress_for_reporter.errors.load(Relaxed);
+    //             let b = progress_for_reporter.bytes.load(Relaxed);
+    //             // instantaneous rates (per second)
+    //             let now = Instant::now();
+    //             let dt = (now - last_t).as_secs_f64().max(0.001);
+    //             let df = f.saturating_sub(last_f) as f64 / dt;                
+    //             last_t = now; last_f = f; 
 
+    //             // cumulative rate
+    //             let elapsed = start_for_reporter.elapsed().as_secs_f64().max(0.001);
+    //             let rate_f = f as f64 / elapsed;
+                
+
+    //             if let Some(total) = total_hint_bytes {
+    //                 let pct = ((b as f64 / total as f64) * 100.0).min(100.0);
+    //                 eprint!(
+    //                     "\rProgress     : Files: {:>12} | Errors: {:>6} | {:>6.2}% | {:>7.0} f/s",
+    //                     f, e, pct, rate_f
+    //                 );
+    //             } else {
+    //                 eprint!(
+    //                     "\rProgress     : Files: {:>12} | Errors: {:>6} | {:>7.0} f/s",
+    //                     f, e, rate_f
+    //                 );
+    //             }
+    //             thread::sleep(Duration::from_millis(1000));
+    //         }
+    //         eprintln!();
+    //     })
+    // };
+
+    let start_time = Instant::now();
+    
     // seed roots
     inflight.fetch_add(1, Relaxed);
     tx.send(Task::Dir(PathBuf::from(root))).expect("enqueue root");
@@ -252,9 +277,10 @@ fn main() -> std::io::Result<()> {
         let inflight = inflight.clone();
         let out_dir = out_dir.clone();
         let cfg = cfg.clone();
-        let progress = progress.clone();
+        //let progress = progress.clone();
         joins.push(thread::spawn(move || worker(
-            tid, rx, tx, inflight, out_dir, cfg, progress
+            tid, rx, tx, inflight, out_dir, cfg, 
+            //progress
         )));
     }
     drop(tx);
@@ -267,58 +293,27 @@ fn main() -> std::io::Result<()> {
         total.errors += s.errors;
     }
     // measure speed before merging
-    let speed = (total.files as f64) / start_time.elapsed().as_secs_f64();
+    let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+    let speed = (total.files as f64) / elapsed;
     
     // ---- merge shards ----
     let sort_csv = args.no_atime && matches!(out_fmt, OutputFormat::Csv);
     merge_shards(&out_dir, &final_path, threads, out_fmt, sort_csv).expect("merge shards failed");
 
-    reporting_done.store(true, Relaxed);
-    let _ = reporter_join.join();
-    
+    // reporting_done.store(true, Relaxed);
+    // let _ = reporter_join.join();
+
+    let elapsed_str = format_duration(start_time.elapsed());
     
     println!("Total files  : {}", total.files);
     println!("Failed files : {}", total.errors);  
-    println!("Elapsed time : {:.2} seconds", start_time.elapsed().as_secs_f64());
+    println!("Elapsed time : {}", elapsed_str);
     println!("Files/sec.   : {:.2}", speed);
     println!("{}","------------------------------------------------".cyan().bold());
     println!("Done.");
     Ok(())
 }
 
-fn get_hostname() -> String {
-    hostname::get().ok().and_then(|s| s.into_string().ok()).unwrap_or("noname".to_string())
-}
-
-#[cfg(windows)]
-fn strip_verbatim_prefix(p: &std::path::Path) -> std::path::PathBuf {
-    let s = match p.to_str() {
-        Some(s) => s,
-        None => return p.to_path_buf(),
-    };
-
-    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{}", rest))
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
-    } else {
-        p.to_path_buf()
-    }
-}
-
-#[cfg(not(windows))]
-fn strip_verbatim_prefix(p: &std::path::Path) -> std::path::PathBuf {
-    p.to_path_buf()
-}
-
-#[inline]
-fn should_skip(path: &Path, skip: Option<&str>) -> bool {
-    if let Some(s) = skip {
-        path.as_os_str().to_string_lossy().contains(s)
-    } else {
-        false
-    }
-}
 
 fn worker(
     tid: usize,
@@ -327,7 +322,7 @@ fn worker(
     inflight: Arc<AtomicUsize>,
     out_dir: PathBuf,
     cfg: Config,
-    progress: Arc<Progress>,
+    //progress: Arc<Progress>,
 ) -> Stats {
     let is_bin = cfg.out_fmt == OutputFormat::Bin;
     let hostname = get_hostname();
@@ -381,7 +376,7 @@ fn worker(
                 let error_count = enum_dir(&dir, &tx, &inflight, cfg.skip.as_deref());
                 stats.errors += error_count;
                 inflight.fetch_sub(1, Relaxed);
-                progress.files.fetch_add(1, Relaxed);
+                //progress.files.fetch_add(1, Relaxed);
             }
 
             Task::Files { base, items } => {
@@ -405,7 +400,7 @@ fn worker(
                     }
                 }
                 inflight.fetch_sub(1, Relaxed);
-                progress.files.fetch_add(items.len() as u64, Relaxed);
+                //progress.files.fetch_add(items.len() as u64, Relaxed);
             }
         }
     }
@@ -478,196 +473,6 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
     error_count
 }
 
-
-fn row_from_metadata<'a>(path: &'a Path, md: &fs::Metadata) -> Row<'a> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Row {
-            path,
-            dev: md.dev(),
-            ino: md.ino(),
-            mode: md.mode(),
-            uid: md.uid(),
-            gid: md.gid(),
-            size: md.size(),
-            blocks: md.blocks() as u64,
-            atime: md.atime(),
-            mtime: md.mtime(),
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use std::time::SystemTime;
-
-        let to_unix = |t: SystemTime| -> i64 {
-            t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
-        };
-        let atime = md.accessed().ok().map(to_unix).unwrap_or(0);
-        let mtime = md.modified().ok().map(to_unix).unwrap_or(0);
-        let blocks = (md.len() + 511) / 512;
-
-        let file_attributes = md.file_attributes();
-        const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
-
-        let is_file = md.is_file();
-        let mut mode = if is_file { 0o100000 } else { 0o040000 };
-        mode |= 0o400; // Owner read
-        if (file_attributes & FILE_ATTRIBUTE_READONLY) == 0 { mode |= 0o200; }
-        if is_file {
-            if let Some(ext) = path.extension() {
-                match ext.to_str().unwrap_or("").to_lowercase().as_str() {
-                    "exe" | "bat" | "cmd" | "com" | "scr" | "ps1" | "vbs" => mode |= 0o100,
-                    _ => {}
-                }
-            }
-        } else {
-            mode |= 0o100;
-        }
-        let owner = mode & 0o700;
-        mode |= (owner >> 3) | (owner >> 6);
-        
-        let uid = get_rid(path).unwrap_or(0);
-        Row {
-            path, dev: 0, ino: 0, mode, uid, gid: 0,
-            size: md.len(), blocks, atime, mtime,
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        Row { path, dev: 0, ino: 0, mode: 0, uid: 0, gid: 0, size: md.len(), blocks: 0, atime: 0, mtime: 0 }
-    }
-}
-
-
-fn stat_row<'a>(path: &'a Path) -> Option<Row<'a>> {
-    let md = fs::symlink_metadata(path).ok()?;
-    Some(row_from_metadata(path, &md))
-}
-
-#[cfg(windows)]
-pub fn _get_sid(path: &std::path::Path) -> std::io::Result<String> {
-    use std::{io, iter, os::windows::ffi::OsStrExt, ptr};
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::{
-        GetSidIdentifierAuthority, GetSidSubAuthority, GetSidSubAuthorityCount, IsValidSid,
-        OWNER_SECURITY_INFORMATION,
-    };
-    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(iter::once(0)).collect();
-    let mut p_owner_sid: *mut core::ffi::c_void = ptr::null_mut();
-    let mut p_sd: *mut core::ffi::c_void = ptr::null_mut();
-
-    let err = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            &mut p_owner_sid as *mut _ as *mut _,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut p_sd, // must LocalFree
-        )
-    };
-    if err != 0 {
-        return Err(io::Error::from_raw_os_error(err as i32));
-    }
-
-    // Validate SID pointer before touching it
-    if unsafe { IsValidSid(p_owner_sid) } == 0 {
-        unsafe { LocalFree(p_sd as *mut _); }
-        return Err(io::Error::new(io::ErrorKind::Other, "Invalid SID"));
-    }
-
-    // Build "S-1-<id_auth>-<sub1>-...-<subN>"
-    let mut s = String::from("S-1");
-
-    // Identifier Authority (6 bytes big-endian)
-    let ia = unsafe { *GetSidIdentifierAuthority(p_owner_sid) }.Value;
-    let id_auth: u64 = ((ia[0] as u64) << 40)
-        | ((ia[1] as u64) << 32)
-        | ((ia[2] as u64) << 24)
-        | ((ia[3] as u64) << 16)
-        | ((ia[4] as u64) << 8)
-        |  (ia[5] as u64);
-    s.push('-');
-    s.push_str(&id_auth.to_string());
-
-    // Subauthorities: clamp to reasonable bounds (Windows max is 15)
-    let sub_count = unsafe { *GetSidSubAuthorityCount(p_owner_sid) } as u32;
-    let sub_count = sub_count.min(15);
-    for i in 0..sub_count {
-        let p_sub = unsafe { GetSidSubAuthority(p_owner_sid, i) }; // -> *mut u32
-        let val = unsafe { *p_sub } as u32;
-        s.push('-');
-        s.push_str(&val.to_string());
-    }
-
-    unsafe { LocalFree(p_sd as *mut _); }
-    Ok(s)
-}
-
-
-#[cfg(windows)]
-pub fn get_rid(path: &std::path::Path) -> std::io::Result<u32> {
-    use std::{io, iter, os::windows::ffi::OsStrExt, ptr};
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::{GetSidSubAuthority, GetSidSubAuthorityCount, IsValidSid, OWNER_SECURITY_INFORMATION};
-    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-
-    // Correct: encode the path's OsStr to wide and null-terminate
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(iter::once(0)).collect();
-
-    let mut p_owner_sid: *mut core::ffi::c_void = ptr::null_mut();
-    let mut p_sd: *mut core::ffi::c_void = ptr::null_mut();
-
-    let err = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            &mut p_owner_sid as *mut _ as *mut _,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut p_sd, // must be freed with LocalFree
-        )
-    };
-    if err != 0 {
-        return Err(io::Error::from_raw_os_error(err as i32));
-    }
-
-    // Validate SID, then read last subauthority (RID)
-    let rid = unsafe {
-        if IsValidSid(p_owner_sid) == 0 {
-            LocalFree(p_sd as *mut _);
-            return Err(io::Error::new(io::ErrorKind::Other, "Invalid SID"));
-        }
-        let count = *GetSidSubAuthorityCount(p_owner_sid) as u32;
-        if count == 0 {
-            LocalFree(p_sd as *mut _);
-            return Err(io::Error::new(io::ErrorKind::Other, "SID has no subauthorities"));
-        }
-        let p_last = GetSidSubAuthority(p_owner_sid, count - 1); // *mut u32
-        let val = *p_last as u32;
-        LocalFree(p_sd as *mut _);
-        val
-    };
-
-    Ok(rid)
-}
-
-
-// Pre-allocate formatters to avoid repeated allocation
-thread_local! {
-    static U32_BUFFER: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new());
-    static U64_BUFFER: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new());
-    static I64_BUFFER: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new());
-}
-
 // ----- CSV writing -----
 fn write_row_csv(buf: &mut Vec<u8>, r: &Row<'_>, no_atime: bool) {
     buf.reserve(256);
@@ -734,71 +539,6 @@ fn write_row_bin(buf: &mut Vec<u8>, r: Row<'_>, no_atime: bool) {
     buf.extend_from_slice(&r.mode.to_le_bytes());
     buf.extend_from_slice(&r.size.to_le_bytes());
     buf.extend_from_slice(&disk.to_le_bytes());
-}
-
-fn csv_push_path_smart_quoted(buf: &mut Vec<u8>, p: &Path) {
-    #[cfg(unix)]
-    {
-        let bytes = p.as_os_str().as_bytes();
-        csv_push_bytes_smart_quoted(buf, bytes);
-    }
-    #[cfg(not(unix))]
-    {
-        let s = p.to_string_lossy();
-        csv_push_str_smart_quoted(buf, &s);
-    }
-}
-
-#[cfg(unix)]
-fn csv_push_bytes_smart_quoted(buf: &mut Vec<u8>, bytes: &[u8]) {
-    let needs_quoting = bytes.iter().any(|&b| b == b'"' || b == b',' || b == b'\n' || b == b'\r');
-    if !needs_quoting {
-        buf.extend_from_slice(bytes);
-    } else {
-        buf.push(b'"');
-        if !bytes.contains(&b'"') {
-            buf.extend_from_slice(bytes);
-        } else {
-            buf.reserve(bytes.len() + bytes.iter().filter(|&&b| b == b'"').count());
-            for &b in bytes {
-                if b == b'"' {
-                    buf.push(b'"');
-                    buf.push(b'"');
-                } else {
-                    buf.push(b);
-                }
-            }
-        }
-        buf.push(b'"');
-    }
-}
-
-#[cfg(windows)]
-fn csv_push_str_smart_quoted(buf: &mut Vec<u8>, s: &str) {
-    let normalized = if s.starts_with(r"\\?\") {
-        if s.starts_with(r"\\?\UNC\") { format!(r"\\{}", &s[8..]) } else { s[4..].to_string() }
-    } else { s.to_string() };
-    let display_str = normalized.as_str();
-    let needs_quoting = display_str.chars().any(|c| c == '"' || c == ',' || c == '\n' || c == '\r');
-    if !needs_quoting {
-        buf.extend_from_slice(display_str.as_bytes());
-    } else {
-        buf.push(b'"');
-        if !display_str.contains('"') {
-            buf.extend_from_slice(display_str.as_bytes());
-        } else {
-            let quote_count = display_str.matches('"').count();
-            buf.reserve(display_str.len() + quote_count);
-            for b in display_str.bytes() {
-                if b == b'"' {
-                    buf.push(b'"'); buf.push(b'"');
-                } else {
-                    buf.push(b);
-                }
-            }
-        }
-        buf.push(b'"');
-    }
 }
 
 // ---- Merge shards (CSV or BIN) ----
@@ -902,37 +642,13 @@ fn merge_shards_bin(
     Ok(())
 }
 
-#[inline] fn push_comma(buf: &mut Vec<u8>) { buf.push(b','); }
-#[inline]
-fn push_u32(out: &mut Vec<u8>, v: u32) {
-    U32_BUFFER.with(|b| {
-        let mut binding = b.borrow_mut();
-        let formatted = binding.format(v);
-        out.extend_from_slice(formatted.as_bytes());
-    });
-}
-#[inline]
-fn push_u64(out: &mut Vec<u8>, v: u64) {
-    U64_BUFFER.with(|b| {
-        let mut binding = b.borrow_mut();
-        let formatted = binding.format(v);
-        out.extend_from_slice(formatted.as_bytes());
-    });
-}
-#[inline]
-fn push_i64(out: &mut Vec<u8>, v: i64) {
-    I64_BUFFER.with(|b| {
-        let mut binding = b.borrow_mut();
-        let formatted = binding.format(v);
-        out.extend_from_slice(formatted.as_bytes());
-    });
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Read;
     use tempfile::tempdir;
+    use statwalker::util::csv_push_str_smart_quoted;
 
     #[test]
     fn test_should_skip() {
@@ -978,11 +694,11 @@ mod tests {
     #[test]
     fn test_csv_push_str_smart_quoted_normalize_verbatim() {
         let mut buf = Vec::new();
-        super::csv_push_str_smart_quoted(&mut buf, r"\\?\C:\foo\bar");
+        csv_push_str_smart_quoted(&mut buf, r"\\?\C:\foo\bar");
         assert_eq!(std::str::from_utf8(&buf).unwrap(), r"C:\foo\bar");
 
         let mut buf2 = Vec::new();
-        super::csv_push_str_smart_quoted(&mut buf2, r"\\?\UNC\server\share\foo");
+        csv_push_str_smart_quoted(&mut buf2, r"\\?\UNC\server\share\foo");
         assert_eq!(std::str::from_utf8(&buf2).unwrap(), r"\\server\share\foo");
     }
 
