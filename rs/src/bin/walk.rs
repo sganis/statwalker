@@ -81,6 +81,7 @@ enum Task {
 struct Stats {
     files: u64,
     errors: u64,
+    bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,7 +186,7 @@ fn main() -> std::io::Result<()> {
     println!("Input        : {}", &root_str);
     println!("Output       : {}", &final_path.display());
     println!("Temp dir     : {}", out_dir.display());
-    println!("Processes    : {}", threads);
+    println!("Workers      : {}", threads);
 
     // ---- work queue + inflight counter ----
     let (tx, rx) = unbounded::<Task>();
@@ -291,6 +292,7 @@ fn main() -> std::io::Result<()> {
         let s = j.join().expect("worker panicked");
         total.files += s.files;
         total.errors += s.errors;
+        total.bytes += s.bytes;
     }
     // measure speed before merging
     let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
@@ -307,6 +309,7 @@ fn main() -> std::io::Result<()> {
     
     println!("Total files  : {}", total.files);
     println!("Failed files : {}", total.errors);  
+    println!("Total disk   : {}", human_bytes(total.bytes));  
     println!("Elapsed time : {}", elapsed_str);
     println!("Files/sec.   : {:.2}", speed);
     println!("{}","------------------------------------------------".cyan().bold());
@@ -346,7 +349,7 @@ fn worker(
     // Pre-allocate buffer for record batching
     let mut buf: Vec<u8> = Vec::with_capacity(32 * 1024 * 1024); 
 
-    let mut stats = Stats { files: 0, errors: 0 };
+    let mut stats = Stats { files: 0, errors: 0, bytes: 0 };
 
     while let Ok(task) = rx.recv() {
         match task {
@@ -359,11 +362,12 @@ fn worker(
                 }
                 if let Some(row) = stat_row(&dir) {
                     if is_bin { 
-                        write_row_bin(&mut buf, row, cfg.no_atime); 
+                        write_row_bin(&mut buf, &row, cfg.no_atime); 
                     } else { 
                         write_row_csv(&mut buf, &row, cfg.no_atime);
                     }
                     stats.files += 1;
+                    //stats.bytes += &row.blocks * 512;
                 } else {
                     stats.errors += 1;
                 }
@@ -388,11 +392,12 @@ fn worker(
                     let full = base.join(&name);
                     let row = row_from_metadata(&full, &md); // <-- no syscall here
                     if is_bin { 
-                        write_row_bin(&mut buf, row, cfg.no_atime);
+                        write_row_bin(&mut buf, &row, cfg.no_atime);
                     } else { 
                         write_row_csv(&mut buf, &row, cfg.no_atime);
                     }
                     stats.files += 1;
+                    stats.bytes += &row.size;
 
                     if buf.len() >= FLUSH_BYTES {
                         let _ = writer.write_all(&buf);
@@ -510,7 +515,7 @@ fn write_row_csv(buf: &mut Vec<u8>, r: &Row<'_>, no_atime: bool) {
 }
 
 // ----- BIN writing -----
-fn write_row_bin(buf: &mut Vec<u8>, r: Row<'_>, no_atime: bool) {
+fn write_row_bin(buf: &mut Vec<u8>, r: &Row<'_>, no_atime: bool) {
     
     #[cfg(unix)]
     let path_bytes: &[u8] = {
