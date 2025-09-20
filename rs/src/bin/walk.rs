@@ -108,9 +108,9 @@ fn main() -> std::io::Result<()> {
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
     println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Statwaker  : Super fast filesystem scanner".cyan().bold());
-    println!("{}", format!("Version    : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Build date : {}", env!("BUILD_DATE")).cyan().bold());
+    println!("{}", "Statwaker    : Super fast filesystem scanner".cyan().bold());
+    println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
     // println!("{}", format!("Author: {}",env!("CARGO_PKG_AUTHORS")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());
 

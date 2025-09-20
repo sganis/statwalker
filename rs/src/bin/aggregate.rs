@@ -59,9 +59,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
     println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Statwaker aggregate: totals per triplet: folder,user,age".cyan().bold());
-    println!("{}", format!("Version    : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Build date : {}", env!("BUILD_DATE")).cyan().bold());
+    println!("{}", "Statwaker aggregate computes totals per triplet: folder,user,age".cyan().bold());
+    println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());
 
 

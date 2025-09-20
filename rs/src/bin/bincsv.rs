@@ -61,19 +61,19 @@ fn main() -> io::Result<()> {
     println!("{}", "------------------------------------------------".cyan().bold());
     println!(
         "{}",
-        "Statwaker bincsv: convert binary to csv or compress csv to zst"
+        "Statwaker bincsv converts binary to csv and vice-versa (zst compression)"
             .cyan()
             .bold()
     );
     println!(
         "{}",
-        format!("Version    : {}", env!("CARGO_PKG_VERSION"))
+        format!("Version      : {}", env!("CARGO_PKG_VERSION"))
             .cyan()
             .bold()
     );
     println!(
         "{}",
-        format!("Build date : {}", env!("BUILD_DATE")).cyan().bold()
+        format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold()
     );
     println!("{}", "------------------------------------------------".cyan().bold());
 

@@ -29,9 +29,9 @@ fn main() -> Result<()> {
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
     println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Statwaker resolve: convert raw stats into human version".cyan().bold());
-    println!("{}", format!("Version    : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Build date : {}", env!("BUILD_DATE")).cyan().bold());
+    println!("{}", "Statwaker resolve converts raw stats into human version".cyan().bold());
+    println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());
 
     let start = std::time::Instant::now();
