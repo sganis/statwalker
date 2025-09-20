@@ -1,6 +1,6 @@
 [package]
 name = "statwalker"
-version = "3.0.12"
+version = "3.0.13"
 authors = ["SAG <sganis@gmail.com>"]
 edition = "2024"
 
