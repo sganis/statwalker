@@ -1357,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "statwalker"
-version = "3.0.17"
+version = "3.0.18"
 dependencies = [
  "anyhow",
  "atoi",
