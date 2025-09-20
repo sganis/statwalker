@@ -61,7 +61,7 @@ struct Args {
     size_hint: Option<String>,
     /// Do not report progress
     #[arg(long)]
-    no_progress: bool,
+    quiet: bool,
 }
 
 #[derive(Default)]
@@ -206,7 +206,7 @@ fn main() -> std::io::Result<()> {
     let reporting_done = Arc::new(AtomicBool::new(false));
     let mut reporter_join: Option<JoinHandle<()>> = None;
 
-    if !args.no_progress {
+    if !args.quiet {
         // 1) Use size-hint if provided
         let hinted_total = args.size_hint.as_deref().and_then(parse_size_hint);
 
@@ -221,9 +221,9 @@ fn main() -> std::io::Result<()> {
 
         // Announce what we know
         match (hinted_total, detected_total) {
-            (Some(b), _) => println!("Disk usage   : {} (from --size-hint)", human_bytes(b)),
-            (None, Some(b)) => println!("Disk usage   : {} (from volume root)", human_bytes(b)),
-            (None, None) => println!("Disk usage   : unknown (no hint, path not a volume root)"),
+            (Some(b), _)    => println!("Size hint    : {} (from --size-hint)", human_bytes(b)),
+            (None, Some(b)) => println!("Size hint    : {} (from volume root)", human_bytes(b)),
+            (None, None)    => println!("Size hint    : unknown (no hint, path not a volume root)"),
         };
               
         let progress_for_reporter = progress.clone();
@@ -287,7 +287,7 @@ fn main() -> std::io::Result<()> {
         skip: args.skip,
         out_fmt,
         no_atime: args.no_atime,
-        progress: (!args.no_progress).then(|| progress.clone()),
+        progress: (!args.quiet).then(|| progress.clone()),
     };
 
     // ---- spawn workers ----
