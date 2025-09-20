@@ -1,6 +1,6 @@
 [package]
 name = "dutopia"
-version = "3.0.23"
+version = "3.0.24"
 authors = ["SAG <sganis@gmail.com>"]
 edition = "2024"
 
