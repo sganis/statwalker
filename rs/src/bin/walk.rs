@@ -656,8 +656,13 @@ mod tests {
     use super::*;
     use std::io::Read;
     use tempfile::tempdir;
+    
+    #[cfg(windows)]
     use statwalker::util::csv_push_str_smart_quoted;
 
+    #[cfg(unix)]
+    use statwalker::util::csv_push_bytes_smart_quoted;
+    
     #[test]
     fn test_should_skip() {
         let p = PathBuf::from("/a/b/c/d");
@@ -670,7 +675,7 @@ mod tests {
     #[test]
     fn test_csv_push_bytes_smart_quoted_fast_path() {
         let mut buf = Vec::new();
-        super::csv_push_bytes_smart_quoted(&mut buf, b"abc_def");
+        csv_push_bytes_smart_quoted(&mut buf, b"abc_def");
         assert_eq!(&buf, b"abc_def");
     }
 
@@ -678,7 +683,7 @@ mod tests {
     #[test]
     fn test_csv_push_bytes_smart_quoted_with_comma() {
         let mut buf = Vec::new();
-        super::csv_push_bytes_smart_quoted(&mut buf, b"a,b");
+        csv_push_bytes_smart_quoted(&mut buf, b"a,b");
         assert_eq!(&buf, b"\"a,b\"");
     }
 
@@ -686,7 +691,7 @@ mod tests {
     #[test]
     fn test_csv_push_bytes_smart_quoted_with_quote() {
         let mut buf = Vec::new();
-        super::csv_push_bytes_smart_quoted(&mut buf, b"a\"b");
+        csv_push_bytes_smart_quoted(&mut buf, b"a\"b");
         assert_eq!(&buf, b"\"a\"\"b\"");
     }
 
@@ -694,7 +699,7 @@ mod tests {
     #[test]
     fn test_csv_push_bytes_smart_quoted_with_newline() {
         let mut buf = Vec::new();
-        super::csv_push_bytes_smart_quoted(&mut buf, b"a\nb");
+        csv_push_bytes_smart_quoted(&mut buf, b"a\nb");
         assert_eq!(&buf, b"\"a\nb\"");
     }
 
