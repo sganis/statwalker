@@ -26,6 +26,9 @@ use statwalker::util::{
     fs_used_bytes, human_bytes,
 };
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+
 // chunk sizes
 const READ_BUF_SIZE: usize = 2 * 1024 * 1024; 
 const FILE_CHUNK: usize = 2048;     
