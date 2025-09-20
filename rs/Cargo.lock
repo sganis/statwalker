@@ -1386,39 +1386,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
-=======
-name = "statwalker"
-version = "3.0.21"
-dependencies = [
- "anyhow",
- "atoi",
- "axum",
- "axum-extra",
- "chrono",
- "clap 4.5.47",
- "colored",
- "crossbeam",
- "csv",
- "dotenvy",
- "hostname",
- "itoa",
- "jsonwebtoken",
- "libc",
- "memchr",
- "num_cpus",
- "serde",
- "serde_json",
- "serial_test",
- "tempfile",
- "tokio",
- "tower-http",
- "windows-sys 0.61.0",
- "zstd",
-]
-
-[[package]]
->>>>>>> 8d36cdb5a808cdfac6b94a0c0e161e6890ce56b2
 name = "strsim"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
