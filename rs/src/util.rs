@@ -236,7 +236,7 @@ pub fn row_from_metadata<'a>(path: &'a Path, md: &fs::Metadata) -> Row<'a> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
+        //use std::os::windows::fs::MetadataExt;
         use std::time::SystemTime;
 
         let to_unix = |t: SystemTime| -> i64 {
@@ -248,8 +248,8 @@ pub fn row_from_metadata<'a>(path: &'a Path, md: &fs::Metadata) -> Row<'a> {
         let mtime = md.modified().ok().map(to_unix).unwrap_or(0);
         let blocks = (md.len() + 511) / 512;
 
-        let file_attributes = md.file_attributes();
-        const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+        //let file_attributes = md.file_attributes();
+        //const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
 
         // let is_file = md.is_file();
         // let mut mode = if is_file { 0o100000 } else { 0o040000 };
@@ -386,107 +386,7 @@ pub fn get_rid(path: &Path) -> std::io::Result<u32> {
     Ok(rid)
 }
 
-// #[cfg(windows)]
-// pub fn get_rid(path: &Path) -> std::io::Result<u32> {
-//     use std::{io, iter, os::windows::ffi::OsStrExt, ptr};
-//     use windows_sys::Win32::Foundation::LocalFree;
-//     use windows_sys::Win32::Security::{
-//         GetSidSubAuthority, GetSidSubAuthorityCount, IsValidSid, OWNER_SECURITY_INFORMATION
-//     };
-//     use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-
-//     // DEBUG: Print the path being processed
-//     eprintln!("Processing path: {:?}", path);
-//     eprintln!("Path length: {}", path.as_os_str().len());
-    
-//     // SAFETY: Reject extremely long paths immediately
-//     if path.as_os_str().len() > 32767 {
-//         eprintln!("Path too long, rejecting");
-//         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Path exceeds Windows maximum"));
-//     }
-
-//     // Check if path contains problematic patterns
-//     let path_str = path.to_string_lossy();
-//     if path_str.contains("\\\\") || path_str.len() > 260 {
-//         eprintln!("WARNING: Potentially problematic path detected");
-//         eprintln!("Path: {}", path_str);
-//     }
-
-//     // Convert to wide string with error handling
-//     let wide_result: Result<Vec<u16>, _> = std::panic::catch_unwind(|| {
-//         path.as_os_str()
-//             .encode_wide()
-//             .chain(iter::once(0))
-//             .collect::<Vec<u16>>()
-//     });
-
-//     let wide = match wide_result {
-//         Ok(w) => {
-//             eprintln!("Successfully converted to wide string, length: {}", w.len());
-//             w
-//         },
-//         Err(_) => {
-//             eprintln!("PANIC during wide string conversion for path: {:?}", path);
-//             return Err(io::Error::new(
-//                 io::ErrorKind::Other,
-//                 format!("Failed to convert path to wide string: {:?}", path)
-//             ));
-//         }
-//     };
-
-//     let mut p_owner_sid: *mut core::ffi::c_void = ptr::null_mut();
-//     let mut p_sd: *mut core::ffi::c_void = ptr::null_mut();
-
-//     eprintln!("Calling GetNamedSecurityInfoW...");
-//     let err = unsafe {
-//         GetNamedSecurityInfoW(
-//             wide.as_ptr(),
-//             SE_FILE_OBJECT,
-//             OWNER_SECURITY_INFORMATION,
-//             &mut p_owner_sid as *mut _ as *mut _,
-//             ptr::null_mut(),
-//             ptr::null_mut(),
-//             ptr::null_mut(),
-//             &mut p_sd,
-//         )
-//     };
-    
-//     eprintln!("GetNamedSecurityInfoW returned: {}", err);
-    
-//     if err != 0 {
-//         eprintln!("GetNamedSecurityInfoW failed with error: {}", err);
-//         return Err(io::Error::from_raw_os_error(err as i32));
-//     }
-
-//     let rid = unsafe {
-//         if IsValidSid(p_owner_sid) == 0 {
-//             eprintln!("Invalid SID detected");
-//             LocalFree(p_sd as *mut _);
-//             return Err(io::Error::new(io::ErrorKind::Other, "Invalid SID"));
-//         }
-        
-//         let count = *GetSidSubAuthorityCount(p_owner_sid) as u32;
-//         eprintln!("SID subauthority count: {}", count);
-        
-//         if count == 0 {
-//             eprintln!("SID has no subauthorities");
-//             LocalFree(p_sd as *mut _);
-//             return Err(io::Error::new(io::ErrorKind::Other, "SID has no subauthorities"));
-//         }
-        
-//         let p_last = GetSidSubAuthority(p_owner_sid, count - 1);
-//         let val = *p_last as u32;
-//         eprintln!("Retrieved RID: {}", val);
-        
-//         LocalFree(p_sd as *mut _);
-//         val
-//     };
-
-//     eprintln!("Successfully processed path: {:?}, RID: {}", path, rid);
-//     Ok(rid)
-// }
-
-pub fn fs_used_bytes(path: &std::path::Path) -> Option<u64> {
+pub fn fs_used_bytes(path: &Path) -> Option<u64> {
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -507,7 +407,7 @@ pub fn fs_used_bytes(path: &std::path::Path) -> Option<u64> {
 
     #[cfg(windows)]
     {
-        use std::ffi::OsStr;
+        //use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
@@ -536,7 +436,7 @@ pub fn fs_used_bytes(path: &std::path::Path) -> Option<u64> {
     None
 }
 
-fn is_volume_root(path: &Path) -> bool {
+pub fn is_volume_root(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -556,7 +456,7 @@ fn is_volume_root(path: &Path) -> bool {
 
     #[cfg(windows)]
     {
-        use std::ffi::OsStr;
+        // use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
 
@@ -592,6 +492,51 @@ fn is_volume_root(path: &Path) -> bool {
     }
 }
 
+/// Print a progress bar like: [====>     ] 42%
+pub fn progress_bar(pct: f64, width: usize) -> String {
+    let pct = pct.clamp(0.0, 100.0);
+    let filled = ((pct / 100.0) * width as f64).round() as usize;
+    let mut bar = String::with_capacity(width + 10);
+
+    bar.push('[');
+    for i in 0..width {
+        if i < filled.saturating_sub(1) {
+            bar.push('=');
+        } else if i == filled.saturating_sub(1) {
+            bar.push('>');
+        } else {
+            bar.push(' ');
+        }
+    }
+    bar.push(']');
+    bar
+}
+
+pub fn parse_size_hint(s: &str) -> Option<u64> {
+    // Accept forms like: 750gb, 1.2tb, 500m, 123456 (bytes)
+    let s = s.trim().to_ascii_lowercase();
+    let mut num = String::new();
+    let mut unit = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            num.push(ch);
+        } else if !ch.is_whitespace() {
+            unit.push(ch);
+        }
+    }
+    let val: f64 = num.parse().ok()?;
+    let mul: f64 = match unit.as_str() {
+        ""        => 1.0,
+        "b"       => 1.0,
+        "k" | "kb" => 1024.0,
+        "m" | "mb" => 1024.0_f64.powi(2),
+        "g" | "gb" => 1024.0_f64.powi(3),
+        "t" | "tb" => 1024.0_f64.powi(4),
+        "p" | "pb" => 1024.0_f64.powi(5),
+        _ => return None,
+    };
+    Some((val * mul) as u64)
+}
 
 #[cfg(test)]
 mod tests {

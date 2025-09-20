@@ -4,8 +4,8 @@ use std::{
     fs::{self, File},
     io::{self, BufWriter, Write, BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    time::Instant,
-    thread,
+    time::{Duration, Instant},
+    thread::{self, JoinHandle},
 };
 use std::sync::{
     atomic::{AtomicUsize, AtomicU64, AtomicBool, Ordering::Relaxed},
@@ -24,6 +24,7 @@ use statwalker::util::{
     push_u32, push_u64, push_i64, push_comma,
     row_from_metadata, stat_row,
     fs_used_bytes, human_bytes,
+    progress_bar, parse_size_hint,is_volume_root
 };
 
 #[cfg(unix)]
@@ -58,6 +59,9 @@ struct Args {
     /// Manual total-size hint (e.g. 750gb, 1.2tb). Used for % progress when root isn’t a mount/drive.
     #[arg(long = "size-hint", value_name = "SIZE")]
     size_hint: Option<String>,
+    /// Do not report progress
+    #[arg(long)]
+    no_progress: bool,
 }
 
 #[derive(Default)]
@@ -94,10 +98,12 @@ enum OutputFormat { Csv, Bin }
 struct Config {
     skip: Option<String>,
     out_fmt: OutputFormat,
-    no_atime: bool,  // zero ATIME for reproducible outputs
+    no_atime: bool,  
+    progress: Option<Arc<Progress>>,
 }
 
 fn main() -> std::io::Result<()> {
+
     #[cfg(windows)]
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
@@ -195,56 +201,66 @@ fn main() -> std::io::Result<()> {
     let (tx, rx) = unbounded::<Task>();
     let inflight = Arc::new(AtomicUsize::new(0));
 
-    // // reporter
-    // let total_hint_bytes = fs_used_bytes(&root_normalized);
-    // println!("Disk usage   : {}", match total_hint_bytes {
-    //     Some(b) => human_bytes(b),
-    //     None => "unknown".to_string(),
-    // });
-    // let progress = Arc::new(Progress::default());
-    // let reporting_done = Arc::new(AtomicBool::new(false));
-    // let progress_for_reporter = progress.clone();
-    // let start_for_reporter = Instant::now();
 
-    // let reporter_join = {
-    //     let reporting_done = reporting_done.clone();
-    //     thread::spawn(move || {
-    //         use std::time::{Duration, Instant};
-    //         let mut last_t = Instant::now();
-    //         let mut last_f = 0u64;            
-    //         loop {
-    //             if reporting_done.load(Relaxed) { break; }
-    //             let f = progress_for_reporter.files.load(Relaxed);
-    //             let e = progress_for_reporter.errors.load(Relaxed);
-    //             let b = progress_for_reporter.bytes.load(Relaxed);
-    //             // instantaneous rates (per second)
-    //             let now = Instant::now();
-    //             let dt = (now - last_t).as_secs_f64().max(0.001);
-    //             let df = f.saturating_sub(last_f) as f64 / dt;                
-    //             last_t = now; last_f = f; 
+    let progress = Arc::new(Progress::default());
+    let reporting_done = Arc::new(AtomicBool::new(false));
+    let mut reporter_join: Option<JoinHandle<()>> = None;
 
-    //             // cumulative rate
-    //             let elapsed = start_for_reporter.elapsed().as_secs_f64().max(0.001);
-    //             let rate_f = f as f64 / elapsed;
+    if !args.no_progress {
+        // 1) Use size-hint if provided
+        let hinted_total = args.size_hint.as_deref().and_then(parse_size_hint);
+
+        // 2) Only try fs_used_bytes if the root is actually a volume root
+        let detected_total = hinted_total.or_else(|| {
+            if is_volume_root(&root_normalized) {
+                fs_used_bytes(&root_normalized)
+            } else {
+                None
+            }
+        });
+
+        // Announce what we know
+        match (hinted_total, detected_total) {
+            (Some(b), _) => println!("Disk usage   : {} (from --size-hint)", human_bytes(b)),
+            (None, Some(b)) => println!("Disk usage   : {} (from volume root)", human_bytes(b)),
+            (None, None) => println!("Disk usage   : unknown (no hint, path not a volume root)"),
+        };
+              
+        let progress_for_reporter = progress.clone();
+        let reporting_done = reporting_done.clone();
+        let start_for_reporter = Instant::now();
+
+        reporter_join = Some(thread::spawn(move || {
+            let mut last_pct = 0.0;     
+            loop {
+                if reporting_done.load(Relaxed) { break; }
+                let f = progress_for_reporter.files.load(Relaxed);
+                let e = progress_for_reporter.errors.load(Relaxed);
+                let b = progress_for_reporter.bytes.load(Relaxed);
+                let elapsed = start_for_reporter.elapsed().as_secs_f64().max(0.001);
+                let rate_f = (f as f64 / elapsed) as u32;
                 
 
-    //             if let Some(total) = total_hint_bytes {
-    //                 let pct = ((b as f64 / total as f64) * 100.0).min(100.0);
-    //                 eprint!(
-    //                     "\rProgress     : Files: {:>12} | Errors: {:>6} | {:>6.2}% | {:>7.0} f/s",
-    //                     f, e, pct, rate_f
-    //                 );
-    //             } else {
-    //                 eprint!(
-    //                     "\rProgress     : Files: {:>12} | Errors: {:>6} | {:>7.0} f/s",
-    //                     f, e, rate_f
-    //                 );
-    //             }
-    //             thread::sleep(Duration::from_millis(1000));
-    //         }
-    //         eprintln!();
-    //     })
-    // };
+                if let Some(total) = detected_total {
+                    let mut pct = ((b as f64 / total as f64) * 100.0).min(100.0);
+                    if pct < last_pct { pct = last_pct; }
+                    last_pct = pct;
+                    let bar = progress_bar(pct.into(), 20);
+                    eprint!(
+                        "\r{}: {} {:>3}% | {} files | {} | {} f/s | {} errors",
+                        "Progress     ".cyan().bold(), bar, pct as u32, f, human_bytes(b), rate_f, e
+                    );
+                } else {
+                    eprint!(
+                        "\r{}: {} files | {} | {} f/s | {} errors",
+                        "Progress     ".cyan().bold(), f, human_bytes(b), rate_f, e
+                    );
+                }
+                thread::sleep(Duration::from_millis(1000));
+            }
+            eprintln!();
+        }));
+    }
 
     let start_time = Instant::now();
     
@@ -271,6 +287,7 @@ fn main() -> std::io::Result<()> {
         skip: args.skip,
         out_fmt,
         no_atime: args.no_atime,
+        progress: (!args.no_progress).then(|| progress.clone()),
     };
 
     // ---- spawn workers ----
@@ -281,10 +298,8 @@ fn main() -> std::io::Result<()> {
         let inflight = inflight.clone();
         let out_dir = out_dir.clone();
         let cfg = cfg.clone();
-        //let progress = progress.clone();
         joins.push(thread::spawn(move || worker(
             tid, rx, tx, inflight, out_dir, cfg, 
-            //progress
         )));
     }
     drop(tx);
@@ -305,13 +320,15 @@ fn main() -> std::io::Result<()> {
     let sort_csv = args.no_atime && matches!(out_fmt, OutputFormat::Csv);
     merge_shards(&out_dir, &final_path, threads, out_fmt, sort_csv).expect("merge shards failed");
 
-    // reporting_done.store(true, Relaxed);
-    // let _ = reporter_join.join();
+    if let Some(h) = reporter_join.take() {
+        reporting_done.store(true, Relaxed);
+        let _ = h.join();
+    }
 
     let elapsed_str = format_duration(start_time.elapsed());
     
     println!("Total files  : {}", total.files);
-    println!("Failed files : {}", total.errors);  
+    println!("Total errors : {}", total.errors);  
     println!("Total disk   : {}", human_bytes(total.bytes));  
     println!("Elapsed time : {}", elapsed_str);
     println!("Files/sec.   : {:.2}", speed);
@@ -328,13 +345,14 @@ fn worker(
     inflight: Arc<AtomicUsize>,
     out_dir: PathBuf,
     cfg: Config,
-    //progress: Arc<Progress>,
 ) -> Stats {
     let is_bin = cfg.out_fmt == OutputFormat::Bin;
     let hostname = get_hostname();
     let shard_path = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
     let file = File::create(&shard_path).expect("open shard");
     let mut base = BufWriter::with_capacity(32 * 1024 * 1024, file);
+    let has_progress = cfg.progress.is_some();  
+    let progress = cfg.progress.unwrap_or_default();
 
     // Header
     if !is_bin {
@@ -359,6 +377,7 @@ fn worker(
             Task::Shutdown => break,
 
             Task::Dir(dir) => {
+                let mut error_count = 0u64;
                 if should_skip(&dir, cfg.skip.as_deref()) {
                     let _ = inflight.fetch_sub(1, Relaxed);
                     continue;
@@ -369,10 +388,10 @@ fn worker(
                     } else { 
                         write_row_csv(&mut buf, &row, cfg.no_atime);
                     }
-                    stats.files += 1;
-                    //stats.bytes += &row.blocks * 512;
+                    stats.files += 1;                    
                 } else {
-                    stats.errors += 1;
+                    stats.errors += 1; 
+                    error_count += 1;                   
                 }
 
                 if buf.len() >= FLUSH_BYTES {
@@ -380,10 +399,13 @@ fn worker(
                     buf.clear();
                 }
 
-                let error_count = enum_dir(&dir, &tx, &inflight, cfg.skip.as_deref());
+                error_count += enum_dir(&dir, &tx, &inflight, cfg.skip.as_deref());
                 stats.errors += error_count;
-                inflight.fetch_sub(1, Relaxed);
-                //progress.files.fetch_add(1, Relaxed);
+                inflight.fetch_sub(1, Relaxed);   
+                if has_progress {
+                    progress.files.fetch_add(1, Relaxed);
+                    progress.errors.fetch_add(error_count, Relaxed);
+                }
             }
 
             Task::Files { base, items } => {
@@ -391,6 +413,8 @@ fn worker(
                     inflight.fetch_sub(1, Relaxed);
                     continue;
                 }
+                let mut files = 0u64;
+                let mut bytes = 0u64;
                 for FileItem { name, md } in &items {
                     let full = base.join(&name);
                     let row = row_from_metadata(&full, &md); // <-- no syscall here
@@ -401,14 +425,18 @@ fn worker(
                     }
                     stats.files += 1;
                     stats.bytes += &row.size;
-
+                    files += 1;
+                    bytes += &row.size;
                     if buf.len() >= FLUSH_BYTES {
                         let _ = writer.write_all(&buf);
                         buf.clear();
                     }
                 }
                 inflight.fetch_sub(1, Relaxed);
-                //progress.files.fetch_add(items.len() as u64, Relaxed);
+                if has_progress {
+                    progress.files.fetch_add(files, Relaxed);
+                    progress.bytes.fetch_add(bytes, Relaxed);                    
+                }
             }
         }
     }
