@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("{}","------------------------------------------------".cyan().bold());
     println!("{}", "Dutopia duapi".cyan().bold());
-    println!("{}", "Summry       : Disk usage API server".cyan().bold());
+    println!("{}", "Summary      : Disk usage API server".cyan().bold());
     println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
     println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());

@@ -109,7 +109,7 @@ fn main() -> std::io::Result<()> {
 
     println!("{}","------------------------------------------------".cyan().bold());
     println!("{}", "Dutopia duscan".cyan().bold());
-    println!("{}", "Summry       : Superfast filesystem scanner".cyan().bold());
+    println!("{}", "Summary      : Superfast filesystem scanner".cyan().bold());
     println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
     println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
     // println!("{}", format!("Author: {}",env!("CARGO_PKG_AUTHORS")).cyan().bold());

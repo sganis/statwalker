@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("{}","------------------------------------------------".cyan().bold());
     println!("{}", "Dutopia dusum".cyan().bold());
-    println!("{}", "Summry       : Computes totals per folder, user and age".cyan().bold());
+    println!("{}", "Summary      : Computes totals per folder, user and age".cyan().bold());
     println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
     println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());

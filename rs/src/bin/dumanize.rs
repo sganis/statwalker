@@ -30,7 +30,7 @@ fn main() -> Result<()> {
 
     println!("{}","------------------------------------------------".cyan().bold());
     println!("{}", "Dutopia dumanize".cyan().bold());
-    println!("{}", "Summry       : Converts raw stats into human version".cyan().bold());
+    println!("{}", "Summary      : Converts raw stats into human version".cyan().bold());
     println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
     println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}","------------------------------------------------".cyan().bold());

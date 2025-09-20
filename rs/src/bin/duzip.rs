@@ -60,7 +60,7 @@ fn main() -> io::Result<()> {
 
     println!("{}", "------------------------------------------------".cyan().bold());
     println!("{}", "Dutopia duzip".cyan().bold());
-    println!("{}", "Summry       : Converts binary to csv and vice-versa".cyan().bold());
+    println!("{}", "Summary      : Converts binary to csv and vice-versa".cyan().bold());
     println!("{}",format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
     println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}", "------------------------------------------------".cyan().bold());
