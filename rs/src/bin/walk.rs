@@ -223,7 +223,7 @@ fn main() -> std::io::Result<()> {
         match (hinted_total, detected_total) {
             (Some(b), _)    => println!("Size hint    : {} (from --size-hint)", human_bytes(b)),
             (None, Some(b)) => println!("Size hint    : {} (from volume root)", human_bytes(b)),
-            (None, None)    => println!("Size hint    : unknown (no hint, path not a volume root)"),
+            (None, None)    => {}
         };
               
         let progress_for_reporter = progress.clone();
@@ -247,18 +247,18 @@ fn main() -> std::io::Result<()> {
                     last_pct = pct;
                     let bar = progress_bar(pct.into(), 20);
                     eprint!(
-                        "\r{}: {} {:>3}% | {} files | {} | {} f/s | {} errors",
+                        "\r{}: {} {:>3}% | Files: {} | {} | {} f/s | Errors: {}",
                         "Progress     ".cyan().bold(), bar, pct as u32, f, human_bytes(b), rate_f, e
                     );
                 } else {
                     eprint!(
-                        "\r{}: {} files | {} | {} f/s | {} errors",
+                        "\r{}: Files: {} | {} | {} f/s | Errors: {}",
                         "Progress     ".cyan().bold(), f, human_bytes(b), rate_f, e
                     );
                 }
                 thread::sleep(Duration::from_millis(1000));
             }
-            eprintln!();
+            eprint!("\r{}"," ".repeat(120));
         }));
     }
 
@@ -327,7 +327,7 @@ fn main() -> std::io::Result<()> {
 
     let elapsed_str = format_duration(start_time.elapsed());
     
-    println!("Total files  : {}", total.files);
+    println!("\rTotal files  : {}", total.files);
     println!("Total errors : {}", total.errors);  
     println!("Total disk   : {}", human_bytes(total.bytes));  
     println!("Elapsed time : {}", elapsed_str);
