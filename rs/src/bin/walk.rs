@@ -245,7 +245,7 @@ fn main() -> std::io::Result<()> {
                     let mut pct = ((b as f64 / total as f64) * 100.0).min(100.0);
                     if pct < last_pct { pct = last_pct; }
                     last_pct = pct;
-                    let bar = progress_bar(pct.into(), 20);
+                    let bar = progress_bar(pct.into(), 25);
                     eprint!(
                         "\r{}: {} {:>3}% | Files: {} | {} | {} f/s | Errors: {}",
                         "Progress     ".cyan().bold(), bar, pct as u32, f, human_bytes(b), rate_f, e
