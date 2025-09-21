@@ -1,5 +1,5 @@
-# .github/workflows/statwaker.yml
-name: Statwaker CI/CD
+# .github/workflows/ci.yml
+name: Dutopia CI
 
 on:
   push:
