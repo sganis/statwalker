@@ -1,4 +1,4 @@
-[![Build](https://github.com/sganis/dutopia/actions/workflows/ci.yml/badge.svg)](https://github.com/sganis/dutopia/actions/workflows/ci.yml)
+[![Release](https://github.com/sganis/dutopia/actions/workflows/version.yml/badge.svg)](https://github.com/sganis/dutopia/actions/workflows/version.yml)
 
 **********
 Dutopia
