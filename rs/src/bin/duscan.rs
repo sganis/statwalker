@@ -21,10 +21,8 @@ use dutopia::util::{
     Row, should_skip, 
     csv_push_path_smart_quoted,
     format_duration, get_hostname, strip_verbatim_prefix,
-    push_u32, push_u64, push_i64, push_comma,
-    row_from_metadata, stat_row,
-    fs_used_bytes, human_bytes,
-    progress_bar, parse_size_hint,is_volume_root
+    push_u32, push_u64, push_i64, push_comma, row_from_metadata, stat_row,
+    human_count, human_bytes, progress_bar, parse_file_hint
 };
 
 #[cfg(unix)]
@@ -37,7 +35,10 @@ const FLUSH_BYTES: usize = 4 * 1024 * 1024;
 
 
 #[derive(Parser, Debug)]
-#[command(version, author, color = ColorChoice::Auto)]
+#[command(
+    version, author, color = ColorChoice::Auto,
+    about = "Scan filesystem and gather file metadata into CSV or binary output"
+)]
 struct Args {
     /// Root folder to scan (positional, required)
     root: String,
@@ -45,22 +46,22 @@ struct Args {
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
     /// Number of worker threads (default: 2×CPU, capped 48)
-    #[arg(short = 't', long)]
+    #[arg(short, long)]
     threads: Option<usize>,
     /// Skip any folder whose full path contains this substring
-    #[arg(long, value_name = "SUBSTR")]
+    #[arg(short, long, value_name = "SUBSTR")]
     skip: Option<String>,
     /// Write a binary .zst compressed file instead of .csv
-    #[arg(long)]
+    #[arg(short, long)]
     bin: bool,
     /// Zero the ATIME field in outputs (CSV & BIN) for testing
     #[arg(long = "no-atime")]
     no_atime: bool,
-    /// Manual total-size hint (e.g. 750gb, 1.2tb). Used for % progress when root isn’t a mount/drive.
-    #[arg(long = "size-hint", value_name = "SIZE")]
-    size_hint: Option<String>,
+    /// Total files hint (e.g. 750m, 1.2b). Used for % progress
+    #[arg(long = "files-hint", value_name = "COUNT")]
+    files_hint: Option<String>,
     /// Do not report progress
-    #[arg(long)]
+    #[arg(short, long)]
     quiet: bool,
 }
 
@@ -68,7 +69,6 @@ struct Args {
 struct Progress {
     files:  AtomicU64,
     errors: AtomicU64,
-    bytes:  AtomicU64, // accumulated disk bytes (r.blocks * 512)
 }
 
 #[derive(Debug)]
@@ -107,13 +107,11 @@ fn main() -> std::io::Result<()> {
     #[cfg(windows)]
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
-    println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Dutopia duscan".cyan().bold());
-    println!("{}", "Summary      : Superfast filesystem scanner".cyan().bold());
-    println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
-    // println!("{}", format!("Author: {}",env!("CARGO_PKG_AUTHORS")).cyan().bold());
-    println!("{}","------------------------------------------------".cyan().bold());
+    println!("{}","-".repeat(40).cyan().bold());
+    println!("{}", format!("Dutopia : Superfast filesystem analyzer").cyan().bold());
+    println!("{}", format!("Version : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Built   : {}", env!("BUILD_DATE")).cyan().bold());
+    println!("{}","-".repeat(40).cyan().bold());
 
     let args = Args::parse();
     let out_fmt = if args.bin { OutputFormat::Bin } else { OutputFormat::Csv };
@@ -208,24 +206,15 @@ fn main() -> std::io::Result<()> {
     let mut reporter_join: Option<JoinHandle<()>> = None;
 
     if !args.quiet {
-        // 1) Use size-hint if provided
-        let hinted_total = args.size_hint.as_deref().and_then(parse_size_hint);
+        // args.files_hint is Option<String>
+        let hinted_files = args
+            .files_hint
+            .as_deref()
+            .and_then(|s| parse_file_hint(s));
 
-        // 2) Only try fs_used_bytes if the root is actually a volume root
-        let detected_total = hinted_total.or_else(|| {
-            if is_volume_root(&root_normalized) {
-                fs_used_bytes(&root_normalized)
-            } else {
-                None
-            }
-        });
-
-        // Announce what we know
-        match (hinted_total, detected_total) {
-            (Some(b), _)    => println!("Size hint    : {} (from --size-hint)", human_bytes(b)),
-            (None, Some(b)) => println!("Size hint    : {} (from volume root)", human_bytes(b)),
-            (None, None)    => {}
-        };
+        if let Some(total_files) = hinted_files {
+            println!("Files hint   : {} (from --files-hint)", human_count(total_files));
+        }
               
         let progress_for_reporter = progress.clone();
         let reporting_done = reporting_done.clone();
@@ -237,24 +226,22 @@ fn main() -> std::io::Result<()> {
                 if reporting_done.load(Relaxed) { break; }
                 let f = progress_for_reporter.files.load(Relaxed);
                 let e = progress_for_reporter.errors.load(Relaxed);
-                let b = progress_for_reporter.bytes.load(Relaxed);
                 let elapsed = start_for_reporter.elapsed().as_secs_f64().max(0.001);
-                let rate_f = (f as f64 / elapsed) as u32;
-                
+                let rate_f = human_count((f as f64 / elapsed) as u64);                
 
-                if let Some(total) = detected_total {
-                    let mut pct = ((b as f64 / total as f64) * 100.0).min(100.0);
+                if let Some(total) = hinted_files {
+                    let mut pct = ((f as f64 / total as f64) * 100.0).min(100.0);
                     if pct < last_pct { pct = last_pct; }
                     last_pct = pct;
                     let bar = progress_bar(pct.into(), 25);
                     eprint!(
-                        "\r{}: {} {:>3}% | Files: {} | {} | {} f/s | Errors: {}",
-                        "Progress     ".cyan().bold(), bar, pct as u32, f, human_bytes(b), rate_f, e
+                        "\r{}: {} {:>3}% | Files: {} | {} f/s | Errors: {}      \r",
+                        "    Progress ".cyan().bold(), bar, pct as u32, human_count(f), rate_f, e
                     );
                 } else {
                     eprint!(
-                        "\r{}: Files: {} | {} | {} f/s | Errors: {}",
-                        "Progress     ".cyan().bold(), f, human_bytes(b), rate_f, e
+                        "\r{}: Files: {} | {} f/s | Errors: {}     ",
+                        "Progress     ".cyan().bold(), human_count(f), rate_f, e
                     );
                 }
                 thread::sleep(Duration::from_millis(1000));
@@ -315,7 +302,7 @@ fn main() -> std::io::Result<()> {
     }
     // measure speed before merging
     let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
-    let speed = (total.files as f64) / elapsed;
+    let speed = ((total.files as f64) / elapsed) as u32;
     
     // ---- merge shards ----
     let sort_csv = args.no_atime && matches!(out_fmt, OutputFormat::Csv);
@@ -333,7 +320,7 @@ fn main() -> std::io::Result<()> {
     println!("Total disk   : {}", human_bytes(total.bytes));  
     println!("Elapsed time : {}", elapsed_str);
     println!("Files/sec.   : {:.2}", speed);
-    println!("{}","------------------------------------------------".cyan().bold());
+    println!("{}","-".repeat(40).cyan().bold());
     println!("Done.");
     Ok(())
 }
@@ -414,8 +401,9 @@ fn worker(
                     inflight.fetch_sub(1, Relaxed);
                     continue;
                 }
+
                 let mut files = 0u64;
-                let mut bytes = 0u64;
+
                 for FileItem { name, md } in &items {
                     let full = base.join(&name);
                     let row = row_from_metadata(&full, &md); // <-- no syscall here
@@ -425,18 +413,19 @@ fn worker(
                         write_row_csv(&mut buf, &row, cfg.no_atime);
                     }
                     stats.files += 1;
-                    stats.bytes += &row.size;
+                    stats.bytes += &row.blocks * 512;
                     files += 1;
-                    bytes += &row.size;
+
                     if buf.len() >= FLUSH_BYTES {
                         let _ = writer.write_all(&buf);
                         buf.clear();
                     }
                 }
+
                 inflight.fetch_sub(1, Relaxed);
+
                 if has_progress {
-                    progress.files.fetch_add(files, Relaxed);
-                    progress.bytes.fetch_add(bytes, Relaxed);                    
+                    progress.files.fetch_add(files, Relaxed);                
                 }
             }
         }

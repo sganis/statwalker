@@ -29,7 +29,7 @@
   let sortBy = $state<SortKey>("disk");
   let sortOpen = $state(false);
   let selectedUser = $state("All Users");
-  let selectedUserColor = $state('')
+  let selectedUserColor = $state('#353599')
   let users = $state<string[]>([]);
   let userColors = $state(new SvelteMap<string, string>()); // cache: username -> color
   let userDropdown = $state<{user:string;color:string}[]>([]);
@@ -41,7 +41,7 @@
   //#region colors
 
   function colorRenderer(item, _isSelection, _inputValue) {
-    const icon_base = "width:16px;height:16px;border:1px solid white;border-radius:3px;flex:none;";
+    const icon_base = "width:16px;height:16px;border:1px solid gray;border-radius:3px;flex:none;";
     const a = COLORS[0];
     const b = COLORS[1] ?? a;
     const c = COLORS[2] ?? b;
@@ -824,9 +824,9 @@
   </div>
   
   <!-- Path total header item -->
-  <div class="relative px-2 bg-gray-700 border border-gray-500 rounded overflow-hidden">
+  <div class="relative px-2 bg-gray-700 border border-gray-500 rounded text-sm p-1">
       <!-- Total bar background -->
-      <div class="absolute left-0 top-0 bottom-0 flex z-0" style="width: 100%">
+      <div class="absolute left-0 top-0 bottom-0 z-0" style="width: 100%">
         {#each sortedUserEntries(pathTotals) as [uname, userData] (uname)}
           {@const userMetric = sortBy === "disk" ? userData.disk : userData.count}
           {@const totalMetric =
@@ -844,14 +844,11 @@
         {/each}
       </div>
       <!-- Total bar foreground -->
-      <div class="relative z-10 p-1 pointer-events-none">        
-        <!-- <div class="" ondblclick={copyPath} role="textbox">{path}</div> -->
+      <div class="relative z-10 pointer-events-none">        
         <div class="flex items-center justify-end">
-          <p class="">
             {humanCount(pathTotals.total_count)} Files 
             • Changed {humanTime(pathTotals.modified)} 
-            • {humanBytes(pathTotals.total_disk)}                  
-          </p>
+            • {humanBytes(pathTotals.total_disk)}                            
         </div>
       </div>
     </div>

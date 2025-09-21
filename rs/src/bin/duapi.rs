@@ -31,7 +31,9 @@ use dutopia::auth::{platform, AuthError, AuthPayload, AuthBody, Claims, keys};
 use std::ffi::CStr;
 
 #[derive(Parser, Debug)]
-#[command(version, color = ColorChoice::Auto)]
+#[command(version, color = ColorChoice::Auto,
+    about="Disk usage API server with web UI"
+)]
 struct Args {
     /// Input CSV file path
     input: PathBuf,

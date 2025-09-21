@@ -37,6 +37,25 @@ pub fn format_duration(duration: Duration) -> String {
         format!("{}h {:02}m {:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
     }
 }
+pub fn human_count(n: u64) -> String {
+    const UNITS: [&str; 5] = ["", "K", "M", "B", "T"];
+    let mut val = n as f64;
+    let mut unit = 0;
+
+    while val >= 1000.0 && unit < UNITS.len() - 1 {
+        val /= 1000.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        // No suffix → show as integer
+        format!("{}", n)
+    } else {
+        // One decimal for large numbers
+        format!("{:.1}{}", val, UNITS[unit])
+    }
+}
+
 
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -50,10 +69,10 @@ pub fn human_bytes(bytes: u64) -> String {
 
     if unit == 0 {
         // Show integer for plain bytes
-        format!("{} {}", size as u64, UNITS[unit])
+        format!("{}{}", size as u64, UNITS[unit])
     } else {
         // Show one decimal for larger units
-        format!("{:.1} {}", size, UNITS[unit])
+        format!("{:.1}{}", size, UNITS[unit])
     }
 }
 
@@ -512,11 +531,12 @@ pub fn progress_bar(pct: f64, width: usize) -> String {
     bar
 }
 
-pub fn parse_size_hint(s: &str) -> Option<u64> {
-    // Accept forms like: 750gb, 1.2tb, 500m, 123456 (bytes)
+pub fn parse_file_hint(s: &str) -> Option<u64> {
+    // Accept forms like: 10k, 2m, 1.5g, or plain 12345
     let s = s.trim().to_ascii_lowercase();
     let mut num = String::new();
     let mut unit = String::new();
+
     for ch in s.chars() {
         if ch.is_ascii_digit() || ch == '.' {
             num.push(ch);
@@ -524,19 +544,19 @@ pub fn parse_size_hint(s: &str) -> Option<u64> {
             unit.push(ch);
         }
     }
+
     let val: f64 = num.parse().ok()?;
     let mul: f64 = match unit.as_str() {
         ""        => 1.0,
-        "b"       => 1.0,
-        "k" | "kb" => 1024.0,
-        "m" | "mb" => 1024.0_f64.powi(2),
-        "g" | "gb" => 1024.0_f64.powi(3),
-        "t" | "tb" => 1024.0_f64.powi(4),
-        "p" | "pb" => 1024.0_f64.powi(5),
+        "k"       => 1_000.0,
+        "m"       => 1_000_000.0,
+        "g"       => 1_000_000_000.0,
         _ => return None,
     };
+
     Some((val * mul) as u64)
 }
+
 
 #[cfg(test)]
 mod tests {

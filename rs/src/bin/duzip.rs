@@ -30,7 +30,8 @@ const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 
 
 #[derive(Parser, Debug)]
-#[command(version, color = ColorChoice::Auto)]
+#[command(version, color = ColorChoice::Auto,
+    about="Convert between CSV and compressed binary (.zst) formats")]
 struct Args {
     /// Input file (.zst or .csv)
     input: PathBuf,
@@ -58,12 +59,11 @@ fn main() -> io::Result<()> {
     #[cfg(windows)]
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
-    println!("{}", "------------------------------------------------".cyan().bold());
-    println!("{}", "Dutopia duzip".cyan().bold());
-    println!("{}", "Summary      : Converts binary to csv and vice-versa".cyan().bold());
-    println!("{}",format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
-    println!("{}", "------------------------------------------------".cyan().bold());
+    println!("{}","-".repeat(40).cyan().bold());
+    println!("{}", format!("Dutopia : Superfast filesystem analyzer").cyan().bold());
+    println!("{}", format!("Version : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Built   : {}", env!("BUILD_DATE")).cyan().bold());
+    println!("{}","-".repeat(40).cyan().bold());
 
     let args = Args::parse();
 

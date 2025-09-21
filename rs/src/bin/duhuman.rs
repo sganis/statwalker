@@ -11,7 +11,9 @@ use chrono::{Local, TimeZone, Utc};
 use std::ffi::CStr;
 
 #[derive(Parser, Debug)]
-#[command(version, color = ColorChoice::Auto)]
+#[command(version, color = ColorChoice::Auto,
+    about="Resolve and humanize fields in CSV input produced by duscan"
+)]
 struct Args {
     /// Input CSV produced by dutpia.py
     input: PathBuf,
@@ -28,12 +30,11 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
-    println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Dutopia dumanize".cyan().bold());
-    println!("{}", "Summary      : Converts raw stats into human version".cyan().bold());
-    println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
-    println!("{}","------------------------------------------------".cyan().bold());
+    println!("{}","-".repeat(40).cyan().bold());
+    println!("{}", format!("Dutopia : Superfast filesystem analyzer").cyan().bold());
+    println!("{}", format!("Version : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Built   : {}", env!("BUILD_DATE")).cyan().bold());
+    println!("{}","-".repeat(40).cyan().bold());
 
     let start = std::time::Instant::now();
     let args = Args::parse();

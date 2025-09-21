@@ -24,11 +24,12 @@ const S_IFDIR: u32 = 0o040000;
 
 
 #[derive(Parser, Debug)]
-#[command(version, color = ColorChoice::Auto)]
+#[command(version, color = ColorChoice::Auto,
+    about="Compute summary statistics from CSV input")]
 struct Args {
     /// Input CSV file path
     input: PathBuf,
-    /// Output CSV file path (defaults to <input_stem>.agg.csv)
+    /// Output CSV file path (defaults to <input_stem>.sum.csv)
     #[arg(short, long)]
     output: Option<PathBuf>,
 }
@@ -58,12 +59,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
-    println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Dutopia dusum".cyan().bold());
-    println!("{}", "Summary      : Computes totals per folder, user and age".cyan().bold());
-    println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
-    println!("{}","------------------------------------------------".cyan().bold());
+    println!("{}","-".repeat(40).cyan().bold());
+    println!("{}", format!("Dutopia : Superfast filesystem analyzer").cyan().bold());
+    println!("{}", format!("Version : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Built   : {}", env!("BUILD_DATE")).cyan().bold());
+    println!("{}","-".repeat(40).cyan().bold());
 
 
     let start_time = std::time::Instant::now();
@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("output");
-        PathBuf::from(format!("{}.agg.csv", stem))
+        PathBuf::from(format!("{}.sum.csv", stem))
     });
 
     // Unknown UID output path is always derived from INPUT stem
@@ -442,7 +442,7 @@ mod tests {
         s.update(512, 1_700_000_000, 1_700_000_000);
         map.insert(key, s);
 
-        let tmp = std::env::temp_dir().join(format!("agg_out_{}.csv", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("sum_out_{}.csv", std::process::id()));
         let _ = fs::remove_file(&tmp);
         write_results(&tmp, &map).unwrap();
 
