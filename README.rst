@@ -1,6 +1,4 @@
-[![Dutopia CI]
-(https://github.com/sganis/dutopia/actions/workflows/ci.yml/badge.svg)]
-(https://github.com/sganis/dutopia/actions/workflows/ci.yml)
+![Dutopia CI](https://github.com/sganis/dutopia/actions/workflows/ci.yml/badge.svg)
 
 **********
 Dutopia
