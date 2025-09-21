@@ -79,13 +79,13 @@ Binaries are under `target/release/`:
 ### Scan (walk filesystem)
 
 ```bash
-./duscan /home
+./duscan /home -o home.csv
 ```
 
 ### Humanize (optional)
 
 ```bash
-.duhuman home.csv
+./duhuman home.csv -o home.human.csv
 ```
 
 ### Aggregate
@@ -98,10 +98,10 @@ Binaries are under `target/release/`:
 
 ```bash
 # compress CSV → Zstd
-./duzip home.csv
+./duzip home.csv -o home.zst
 
 # decompress Zstd → CSV
-./duzip home.zst
+./duzip home.zst -o home.csv
 ```
 
 ### Serve API
