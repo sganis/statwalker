@@ -1,5 +1,5 @@
-# .github/workflows/build-statwaker.yml
-name: Build statwaker (Rust + Svelte)
+# .github/workflows/statwaker.yml
+name: Statwaker CI/CD
 
 on:
   push:
@@ -25,7 +25,6 @@ jobs:
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
-          # Works across all runners
           path: |
             ~/.cargo/registry
             ~/.cargo/git
@@ -59,14 +58,48 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: statwaker-${{ matrix.os }}-rust
-          path: |
-            rs/target/**
+          path: rs/target/**
           if-no-files-found: error
 
       - name: Upload Svelte artifacts
         uses: actions/upload-artifact@v4
         with:
           name: statwaker-${{ matrix.os }}-browser
-          path: |
-            browser/build/**
+          path: browser/build/**
           if-no-files-found: warn
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install cargo-edit
+        run: cargo install cargo-edit
+
+      - name: Bump patch version
+        working-directory: rs
+        run: cargo set-version --bump patch
+
+      - name: Get new version
+        id: cargo_version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Commit and push version bump
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add rs/Cargo.toml rs/Cargo.lock
+          git commit -m "chore: bump version to $VERSION" || echo "No changes to commit"
+          git push origin HEAD:${GITHUB_REF_NAME}
+
+      # - name: Create tag
+      #   run: |
+      #     git tag v${VERSION}
+      #     git push origin v${VERSION}
