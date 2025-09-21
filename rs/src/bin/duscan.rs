@@ -235,13 +235,13 @@ fn main() -> std::io::Result<()> {
                     last_pct = pct;
                     let bar = progress_bar(pct.into(), 25);
                     eprint!(
-                        "\r{}: {} {:>3}% | Files: {} | {} f/s | Errors: {}      \r",
+                        "\r{}: {} {:>3}% | Files: {} | Files/s: {} | Errors: {}        \r",
                         "    Progress ".cyan().bold(), bar, pct as u32, human_count(f), rate_f, e
                     );
                 } else {
                     eprint!(
-                        "\r{}: Files: {} | {} f/s | Errors: {}     ",
-                        "Progress     ".cyan().bold(), human_count(f), rate_f, e
+                        "\r{}: Files: {} | Files/s: {} | Errors: {}        \r",
+                        "    Progress ".cyan().bold(), human_count(f), rate_f, e
                     );
                 }
                 thread::sleep(Duration::from_millis(1000));
