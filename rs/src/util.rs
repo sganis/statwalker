@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 use itoa::Buffer;
+use colored::Colorize;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -24,8 +25,19 @@ pub struct Row<'a> {
 }
 
 // ============================================================================
-// Duration and System Utilities
+// Utilities
 // ============================================================================
+
+pub fn print_about() {
+    #[cfg(windows)]
+    colored::control::set_virtual_terminal(true).unwrap_or(());
+
+    println!("{}","-".repeat(40).cyan().bold());
+    println!("{}", format!("Dutopia : Superfast filesystem analyzer").cyan().bold());
+    println!("{}", format!("Version : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Built   : {}", env!("BUILD_DATE")).cyan().bold());
+    println!("{}","-".repeat(40).cyan().bold());
+}
 
 pub fn format_duration(duration: Duration) -> String {
     let secs = duration.as_secs();
@@ -123,9 +135,9 @@ pub fn should_skip(path: &Path, skip: Option<&str>) -> bool {
 
 // Pre-allocate formatters to avoid repeated allocation
 thread_local! {
-    static U32_BUFFER: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new());
-    static U64_BUFFER: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new());
-    static I64_BUFFER: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new());
+    static U32BUF: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new());
+    static U64BUF: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new());
+    static I64BUF: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new());
 }
 
 #[inline] 
@@ -135,30 +147,27 @@ pub fn push_comma(buf: &mut Vec<u8>) {
 
 #[inline]
 pub fn push_u32(out: &mut Vec<u8>, v: u32) {
-    U32_BUFFER.with(|b| {
-        let mut binding = b.borrow_mut();
-        let formatted = binding.format(v);
-        out.extend_from_slice(formatted.as_bytes());
+    U32BUF.with(|b| {
+        let mut b = b.borrow_mut();
+        out.extend_from_slice(b.format(v).as_bytes());
     });
 }
 
 #[inline]
 pub fn push_u64(out: &mut Vec<u8>, v: u64) {
-    U64_BUFFER.with(|b| {
-        let mut binding = b.borrow_mut();
-        let formatted = binding.format(v);
-        out.extend_from_slice(formatted.as_bytes());
+    U64BUF.with(|b| {
+        let mut b = b.borrow_mut();
+        out.extend_from_slice(b.format(v).as_bytes());
+    });
+}
+#[inline]
+pub fn push_i64(out: &mut Vec<u8>, v: i64) {
+    I64BUF.with(|b| {
+        let mut b = b.borrow_mut();
+        out.extend_from_slice(b.format(v).as_bytes());
     });
 }
 
-#[inline]
-pub fn push_i64(out: &mut Vec<u8>, v: i64) {
-    I64_BUFFER.with(|b| {
-        let mut binding = b.borrow_mut();
-        let formatted = binding.format(v);
-        out.extend_from_slice(formatted.as_bytes());
-    });
-}
 
 pub fn csv_push_path_smart_quoted(buf: &mut Vec<u8>, p: &Path) {
     #[cfg(unix)]
@@ -530,6 +539,23 @@ pub fn progress_bar(pct: f64, width: usize) -> String {
     bar.push(']');
     bar
 }
+
+#[inline]
+pub fn trim_ascii(mut s: &[u8]) -> &[u8] {
+    while !s.is_empty() && s[0].is_ascii_whitespace() { s = &s[1..]; }
+    while !s.is_empty() && s[s.len() - 1].is_ascii_whitespace() { s = &s[..s.len() - 1]; }
+    s
+}
+
+#[inline]
+pub fn parse_int<T>(b: Option<&[u8]>) -> T 
+where
+    T: atoi::FromRadix10SignedChecked + Default,
+{
+    let s = trim_ascii(b.unwrap_or(b"0"));
+    atoi::atoi::<T>(s).unwrap_or_default()
+}
+
 
 pub fn parse_file_hint(s: &str) -> Option<u64> {
     // Accept forms like: 10k, 2m, 1.5g, or plain 12345

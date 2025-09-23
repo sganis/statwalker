@@ -1,4 +1,5 @@
-// walk.rs
+// duscan.rs
+use anyhow::{Context, Result};
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
@@ -22,7 +23,7 @@ use dutopia::util::{
     csv_push_path_smart_quoted,
     format_duration, get_hostname, strip_verbatim_prefix,
     push_u32, push_u64, push_i64, push_comma, row_from_metadata, stat_row,
-    human_count, human_bytes, progress_bar, parse_file_hint
+    human_count, human_bytes, progress_bar, parse_file_hint, print_about,
 };
 
 #[cfg(unix)]
@@ -102,16 +103,9 @@ struct Config {
     progress: Option<Arc<Progress>>,
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<()> {
 
-    #[cfg(windows)]
-    colored::control::set_virtual_terminal(true).unwrap_or(());
-
-    println!("{}","-".repeat(40).cyan().bold());
-    println!("{}", format!("Dutopia : Superfast filesystem analyzer").cyan().bold());
-    println!("{}", format!("Version : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Built   : {}", env!("BUILD_DATE")).cyan().bold());
-    println!("{}","-".repeat(40).cyan().bold());
+    print_about();
 
     let args = Args::parse();
     let out_fmt = if args.bin { OutputFormat::Bin } else { OutputFormat::Csv };
@@ -153,35 +147,20 @@ fn main() -> std::io::Result<()> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or(std::env::current_dir()?);
-
-    if !out_dir.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Output directory does not exist: {}", out_dir.display()),
-        ));
+ 
+   if !out_dir.exists() {
+        anyhow::bail!("Output directory does not exist: {}", out_dir.display());
     }
 
     if !out_dir.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Output path is not a directory: {}", out_dir.display()),
-        ));
+        anyhow::bail!("Output path is not a directory: {}", out_dir.display());
     }
 
     // Check write access by trying to create a temp file
     let testfile = out_dir.join(".dutopia_write_test");
-    match File::create(&testfile) {
-        Ok(_) => {
-            // Clean up the test file immediately
-            let _ = fs::remove_file(&testfile);
-        }
-        Err(e) => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("No write access to directory {}: {e}", out_dir.display()),
-            ));
-        }
-    };
+    File::create(&testfile)
+        .with_context(|| format!("No write access to directory {}", out_dir.display()))?;
+    let _ = fs::remove_file(&testfile);
 
     let threads = args.threads.unwrap_or_else(|| (num_cpus::get()*2).max(4).min(48));
     let cmd: Vec<String> = std::env::args().collect();    
@@ -574,7 +553,7 @@ fn merge_shards(
     threads: usize, 
     out_fmt: OutputFormat,
     sort_csv: bool,
-) -> std::io::Result<()> {
+) -> Result<()> {
     let mut out = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&final_path)?);
 
     match out_fmt {
@@ -586,7 +565,7 @@ fn merge_shards(
     Ok(())
 }
 
-fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, threads: usize, sort_csv: bool) -> std::io::Result<()> {
+fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, threads: usize, sort_csv: bool) -> Result<()> {
     out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n")?;
     let hostname = get_hostname();
 
@@ -654,7 +633,7 @@ fn merge_shards_bin(
     out_dir: &Path, 
     out: &mut BufWriter<File>, 
     threads: usize, 
-) -> std::io::Result<()> {
+) -> Result<()> {
     let hostname = get_hostname();
     for tid in 0..threads {
         let shard = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
@@ -734,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_shards_csv_unsorted_only() -> std::io::Result<()> {
+    fn test_merge_shards_csv_unsorted_only() -> Result<()> {
         let tmp = tempdir()?;
         let out_dir = tmp.path().to_path_buf();
         let final_path = out_dir.join("out_unsorted.csv");
@@ -766,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_shards_csv_sorted_with_no_atime() -> std::io::Result<()> {
+    fn test_merge_shards_csv_sorted_with_no_atime() -> Result<()> {
         let tmp = tempdir()?;
         let out_dir = tmp.path().to_path_buf();
         let final_path = out_dir.join("out_sorted.csv");

@@ -1,5 +1,5 @@
-// serve.rs
-use anyhow::{Context, Result as AResult};
+// duapi.rs
+use anyhow::{Context, Result};
 use axum::{
     extract::Query,
     http::{Method, StatusCode},
@@ -25,7 +25,10 @@ use memchr::memchr_iter;
 use clap::{Parser, ColorChoice};
 use colored::Colorize;
 use jsonwebtoken::{encode, Header};
-use dutopia::auth::{platform, AuthError, AuthPayload, AuthBody, Claims, keys};
+use dutopia::{
+    auth::{platform, AuthError, AuthPayload, AuthBody, Claims, keys},
+    util::print_about,
+};
 
 #[cfg(unix)]
 use std::ffi::CStr;
@@ -73,16 +76,9 @@ static FS_INDEX: OnceLock<InMemoryFSIndex> = OnceLock::new();
 static USERS: OnceLock<Vec<String>> = OnceLock::new();
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    #[cfg(windows)]
-    colored::control::set_virtual_terminal(true).unwrap_or(());
-
-    println!("{}","------------------------------------------------".cyan().bold());
-    println!("{}", "Dutopia duapi".cyan().bold());
-    println!("{}", "Summary      : Disk usage API server".cyan().bold());
-    println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Build date   : {}", env!("BUILD_DATE")).cyan().bold());
-    println!("{}","------------------------------------------------".cyan().bold());
+async fn main() -> Result<()> {
+    
+    print_about();
 
     dotenvy::dotenv().ok();
     if std::env::var("JWT_SECRET").is_err() {
@@ -354,7 +350,7 @@ pub fn get_items<P: AsRef<std::path::Path>>(
     folder: P,
     usernames: &[String],
     age_filter: Option<u8>, // 0 recent (≤60d), 1 mid (≤730d), 2 old (>730d)
-) -> AResult<Vec<FsItemOut>> {
+) -> Result<Vec<FsItemOut>> {
     use std::{collections::HashSet, fs};
     use std::os::unix::fs::MetadataExt;
     use chrono::{Duration, Utc};
@@ -416,12 +412,12 @@ pub fn get_items<P: AsRef<std::path::Path>>(
     _folder: P,
     _usernames: &[String],
     _age_filter: Option<u8>,
-) -> AResult<Vec<FsItemOut>> {
+) -> Result<Vec<FsItemOut>> {
     anyhow::bail!("get_items(folder, usernames, age_filter) is only implemented on Unix-like systems.");
 }
 
 // ===================== Aggregated index (folders) =====================
-pub fn count_lines(path: &Path) -> std::io::Result<usize> {
+pub fn count_lines(path: &Path) -> Result<usize> {
     let mut file = File::open(path)?;
     let mut buf = [0u8; 128 * 1024]; // 128 KiB is plenty; adjust if you like
     let mut count = 0usize;
@@ -481,7 +477,7 @@ impl InMemoryFSIndex {
     }
 
     /// CSV columns (with header): path,user,age,files,disk,modified
-    pub fn load_from_csv(&mut self, path: &Path) -> AResult<Vec<String>> {
+    pub fn load_from_csv(&mut self, path: &Path) -> Result<Vec<String>> {
 
         // Count total lines for progress tracking
         print!("Counting lines in {}... ", path.display());
@@ -569,7 +565,7 @@ impl InMemoryFSIndex {
         dir_path: &str,
         user_filter: &Vec<String>, // [] => all users
         age_filter: Option<u8>,     // Some(0|1|2) or None
-    ) -> AResult<Vec<FolderOut>> {
+    ) -> Result<Vec<FolderOut>> {
         // descend to the directory node
         let components = Self::path_to_components(dir_path);
         let mut current = &self.root;

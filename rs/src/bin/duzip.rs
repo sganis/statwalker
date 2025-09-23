@@ -1,29 +1,10 @@
-// src/bin/bincsv.rs
-//
-// Convert dutpia binary stream (.bin or .zst) to CSV, or compress CSV to .zst
-// Autodetects compression via zstd header bytes: magic == 0xFD2FB528
-//
-// Record (repeated):
-//   u32 path_len
-//   [path_len] path bytes (Unix: raw bytes; Windows: UTF-8 string written by writer)
-//   u64 dev
-//   u64 ino
-//   i64 atime
-//   i64 mtime
-//   u32 uid
-//   u32 gid
-//   u32 mode
-//   u64 size
-//   u64 disk
-//
-// CSV header:
-// INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH
-
+// duzip.rs
+use anyhow::Result;
 use clap::{ColorChoice, Parser};
-use colored::Colorize;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::path::PathBuf;
+use dutopia::util::{print_about, push_i64, push_u32, push_u64};
 
 const READ_BUF_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 const WRITE_BUF_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
@@ -55,15 +36,8 @@ struct BinaryRecord {
     disk: u64,
 }
 
-fn main() -> io::Result<()> {
-    #[cfg(windows)]
-    colored::control::set_virtual_terminal(true).unwrap_or(());
-
-    println!("{}","-".repeat(40).cyan().bold());
-    println!("{}", format!("Dutopia : Superfast filesystem analyzer").cyan().bold());
-    println!("{}", format!("Version : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Built   : {}", env!("BUILD_DATE")).cyan().bold());
-    println!("{}","-".repeat(40).cyan().bold());
+fn main() -> Result<()> {
+    print_about();
 
     let args = Args::parse();
 
@@ -77,17 +51,14 @@ fn main() -> io::Result<()> {
     match ext.as_str() {
         "csv" => csv_to_zst(&args),
         "zst" => zst_to_csv(&args),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "Unsupported input extension: '{}' (expected .csv, .bin, or .zst)",
-                other
-            ),
-        )),
+        other => anyhow::bail!(
+            "Unsupported input extension: '{}' (expected .csv, .bin, or .zst)",
+             other            
+        ),
     }
 }
 
-fn csv_to_zst(args: &Args) -> io::Result<()> {
+fn csv_to_zst(args: &Args) -> Result<()> {
     let start = std::time::Instant::now();
     let input_file = File::open(&args.input)?;
     let mut reader = BufReader::with_capacity(READ_BUF_SIZE, input_file);
@@ -99,10 +70,7 @@ fn csv_to_zst(args: &Args) -> io::Result<()> {
         .unwrap_or_else(|| args.input.with_extension("zst"));
 
     if out_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("Output file already exists: {}", out_path.display()),
-        ));
+        anyhow::bail!("Output file already exists: {}", out_path.display());
     }
 
     // Create ZST encoder
@@ -116,13 +84,10 @@ fn csv_to_zst(args: &Args) -> io::Result<()> {
     let header = header_line.trim();
 
     if header != "INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
+        anyhow::bail!(
                 "Invalid CSV header. Expected: INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH, Got: {}",
                 header
-            ),
-        ));
+        );
     }
 
     println!("Creating .zst file...");
@@ -150,7 +115,9 @@ fn csv_to_zst(args: &Args) -> io::Result<()> {
     }
 
     // Finish compression
-    let encoder = writer.into_inner()?;
+    let encoder = writer.into_inner().map_err(|_| {
+        anyhow::anyhow!("failed to flush buffered zstd encoder")
+    })?;
     encoder.finish()?;
 
     println!("Output       : {}", out_path.display());
@@ -159,7 +126,7 @@ fn csv_to_zst(args: &Args) -> io::Result<()> {
     Ok(())
 }
 
-fn zst_to_csv(args: &Args) -> io::Result<()> {
+fn zst_to_csv(args: &Args) -> Result<()> {
     let start = std::time::Instant::now();
     let f = File::open(&args.input)?;
     let mut f = f; // mutable for Read + Seek
@@ -186,10 +153,7 @@ fn zst_to_csv(args: &Args) -> io::Result<()> {
         .unwrap_or_else(|| args.input.with_extension("csv"));
 
     if out_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("Output file already exists: {}", out_path.display()),
-        ));
+        anyhow::bail!(format!("Output file already exists: {}", out_path.display()));
     }
 
     let out_file = File::create(&out_path)?;
@@ -265,64 +229,54 @@ fn zst_to_csv(args: &Args) -> io::Result<()> {
     Ok(())
 }
 
-fn parse_csv_record(line: &str) -> io::Result<BinaryRecord> {
+fn parse_csv_record(line: &str) -> Result<BinaryRecord> {
     let fields = parse_csv_line(line);
 
     if fields.len() != 9 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "CSV record must have 9 fields, got {}: {}",
-                fields.len(),
-                line
-            ),
-        ));
+        anyhow::bail!(format!("CSV record must have 9 fields, got {}: {}", fields.len(), line));
     }
 
     // Parse INODE field (dev-ino)
     let inode_parts: Vec<&str> = fields[0].split('-').collect();
     if inode_parts.len() != 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Invalid INODE format, expected dev-ino: {}", fields[0]),
-        ));
+       anyhow::bail!(format!("Invalid INODE format, expected dev-ino: {}", fields[0]));
     }
 
     let dev = inode_parts[0]
         .parse::<u64>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid dev: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Invalid dev: {}", e))?;
 
     let ino = inode_parts[1]
         .parse::<u64>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid ino: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Invalid ino: {}", e))?;
 
     let atime = fields[1]
         .parse::<i64>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid atime: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Invalid atime: {}", e))?;
 
     let mtime = fields[2]
         .parse::<i64>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid mtime: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Invalid mtime: {}", e))?;
 
     let uid = fields[3]
         .parse::<u32>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid uid: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Invalid uid: {}", e))?;
 
     let gid = fields[4]
         .parse::<u32>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid gid: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Invalid gid: {}", e))?;
 
     let mode = fields[5]
         .parse::<u32>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid mode: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Invalid mode: {}", e))?;
 
     let size = fields[6]
         .parse::<u64>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid size: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Invalid size: {}", e))?;
 
     let disk = fields[7]
         .parse::<u64>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid disk: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Invalid disk: {}", e))?;
 
     let path = fields[8].as_bytes().to_vec();
 
@@ -374,7 +328,7 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     fields
 }
 
-fn write_binary_record<W: Write>(writer: &mut W, record: &BinaryRecord) -> io::Result<()> {
+fn write_binary_record<W: Write>(writer: &mut W, record: &BinaryRecord) -> Result<()> {
     // Write path_len
     let path_len = record.path.len() as u32;
     writer.write_all(&path_len.to_le_bytes())?;
@@ -441,79 +395,31 @@ fn csv_push_path(out: &mut Vec<u8>, path_bytes: &[u8]) {
     }
 }
 
-// ---------- Fast integer-to-string (itoa) ----------
-use itoa::Buffer as ItoaBuf;
-
-thread_local! {
-    static U32BUF: std::cell::RefCell<ItoaBuf> = std::cell::RefCell::new(ItoaBuf::new());
-    static U64BUF: std::cell::RefCell<ItoaBuf> = std::cell::RefCell::new(ItoaBuf::new());
-    static I64BUF: std::cell::RefCell<itoa::Buffer> = std::cell::RefCell::new(ItoaBuf::new());
-}
-
-#[inline]
-fn push_u32(out: &mut Vec<u8>, v: u32) {
-    U32BUF.with(|b| {
-        let mut b = b.borrow_mut();
-        out.extend_from_slice(b.format(v).as_bytes());
-    });
-}
-#[inline]
-fn push_u64(out: &mut Vec<u8>, v: u64) {
-    U64BUF.with(|b| {
-        let mut b = b.borrow_mut();
-        out.extend_from_slice(b.format(v).as_bytes());
-    });
-}
-#[inline]
-fn push_i64(out: &mut Vec<u8>, v: i64) {
-    I64BUF.with(|b| {
-        let mut b = b.borrow_mut();
-        out.extend_from_slice(b.format(v).as_bytes());
-    });
-}
-
-// ---------- Little-endian readers with EOF handling ----------
-
-fn read_exact_fully<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<()> {
+fn read_exact_fully<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
     let mut read = 0;
     while read < buf.len() {
         let n = r.read(&mut buf[read..])?;
         if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated input",
-            ));
+            anyhow::bail!("truncated input: expected {} bytes, got {}", buf.len(), read);
         }
         read += n;
     }
     Ok(())
 }
 
-fn _read_u8_exact<R: Read>(r: &mut R) -> io::Result<u8> {
-    let mut b = [0u8; 1];
-    read_exact_fully(r, &mut b)?;
-    Ok(b[0])
-}
-
-fn _read_u16_le_exact<R: Read>(r: &mut R) -> io::Result<u16> {
-    let mut b = [0u8; 2];
-    read_exact_fully(r, &mut b)?;
-    Ok(u16::from_le_bytes(b))
-}
-
-fn read_u32_le_exact<R: Read>(r: &mut R) -> io::Result<u32> {
+fn read_u32_le_exact<R: Read>(r: &mut R) -> Result<u32> {
     let mut b = [0u8; 4];
     read_exact_fully(r, &mut b)?;
     Ok(u32::from_le_bytes(b))
 }
 
-fn read_u64_le_exact<R: Read>(r: &mut R) -> io::Result<u64> {
+fn read_u64_le_exact<R: Read>(r: &mut R) -> Result<u64> {
     let mut b = [0u8; 8];
     read_exact_fully(r, &mut b)?;
     Ok(u64::from_le_bytes(b))
 }
 
-fn read_i64_le_exact<R: Read>(r: &mut R) -> io::Result<i64> {
+fn read_i64_le_exact<R: Read>(r: &mut R) -> Result<i64> {
     let mut b = [0u8; 8];
     read_exact_fully(r, &mut b)?;
     Ok(i64::from_le_bytes(b))
@@ -522,7 +428,7 @@ fn read_i64_le_exact<R: Read>(r: &mut R) -> io::Result<i64> {
 // Read u32 that can be EOF at record boundary.
 // Returns Ok(None) if we are exactly at EOF before reading any byte.
 // Returns Err if we hit EOF mid-number (truncated).
-fn read_u32_le_opt<R: Read>(r: &mut R) -> io::Result<Option<u32>> {
+fn read_u32_le_opt<R: Read>(r: &mut R) -> Result<Option<u32>> {
     let mut b = [0u8; 4];
     let mut off = 0usize;
     loop {
@@ -531,10 +437,7 @@ fn read_u32_le_opt<R: Read>(r: &mut R) -> io::Result<Option<u32>> {
             if off == 0 {
                 return Ok(None); // clean EOF
             } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated record (path_len)",
-                ));
+                anyhow::bail!("truncated record (path_len)");
             }
         }
         off += n;
@@ -545,7 +448,7 @@ fn read_u32_le_opt<R: Read>(r: &mut R) -> io::Result<Option<u32>> {
 }
 
 #[cfg(test)]
-fn read_binary_record<R: Read>(r: &mut R) -> io::Result<Option<BinaryRecord>> {
+fn read_binary_record<R: Read>(r: &mut R) -> Result<Option<BinaryRecord>> {
     // Read path_len with proper EOF semantics:
     // - Ok(None) if we are exactly at EOF before any byte (clean EOF)
     // - Err(UnexpectedEof, "truncated record (path_len)") if partial
@@ -815,7 +718,6 @@ mod tests {
         let buffer = vec![0x05, 0x00]; // truncated u32
         let mut cursor = Cursor::new(&buffer);
         let err = read_binary_record(&mut cursor).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert!(format!("{}", err).contains("path_len"));
     }
 

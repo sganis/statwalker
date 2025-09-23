@@ -1,11 +1,11 @@
-// resolve.rs
+// duhuman.rs
 use anyhow::{Context, Result};
 use clap::{Parser, ColorChoice};
-use colored::Colorize;
 use csv::{ReaderBuilder, WriterBuilder};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use chrono::{Local, TimeZone, Utc};
+use dutopia::util::{print_about, parse_int};
 
 #[cfg(unix)]
 use std::ffi::CStr;
@@ -27,14 +27,7 @@ const OUT_HEADER: &[&str] = &[
 ];
 
 fn main() -> Result<()> {
-    #[cfg(windows)]
-    colored::control::set_virtual_terminal(true).unwrap_or(());
-
-    println!("{}","-".repeat(40).cyan().bold());
-    println!("{}", format!("Dutopia : Superfast filesystem analyzer").cyan().bold());
-    println!("{}", format!("Version : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Built   : {}", env!("BUILD_DATE")).cyan().bold());
-    println!("{}","-".repeat(40).cyan().bold());
+    print_about();
 
     let start = std::time::Instant::now();
     let args = Args::parse();
@@ -79,11 +72,11 @@ fn main() -> Result<()> {
 
         // IN: b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH"
         let inode_b = r.get(0).unwrap_or(b"");
-        let atime   = parse_i64_bytes(r.get(1));
-        let mtime   = parse_i64_bytes(r.get(2));
-        let uid     = parse_u32_bytes(r.get(3));
-        let gid     = parse_u32_bytes(r.get(4));
-        let mode    = parse_u32_bytes(r.get(5));
+        let atime   = parse_int::<i64>(r.get(1));
+        let mtime   = parse_int::<i64>(r.get(2));
+        let uid     = parse_int::<u32>(r.get(3));
+        let gid     = parse_int::<u32>(r.get(4));
+        let mode    = parse_int::<u32>(r.get(5));
         let size    = r.get(6).unwrap_or(b"0");
         let disk    = r.get(7).unwrap_or(b"0");
         let path_b  = r.get(8).unwrap_or(b""); // raw bytes (may be non-UTF-8)
@@ -120,25 +113,6 @@ fn main() -> Result<()> {
     println!("Output       : {}", output.display());
     println!("Elapsed time : {:.3} sec.", start.elapsed().as_secs_f64());
     Ok(())
-}
-
-#[inline]
-fn parse_i64_bytes(b: Option<&[u8]>) -> i64 {
-    let s = trim_ascii(b.unwrap_or(b"0"));
-    atoi::atoi::<i64>(s).unwrap_or(0)
-}
-
-#[inline]
-fn parse_u32_bytes(b: Option<&[u8]>) -> u32 {
-    let s = trim_ascii(b.unwrap_or(b"0"));
-    atoi::atoi::<u32>(s).unwrap_or(0)
-}
-
-#[inline]
-fn trim_ascii(mut s: &[u8]) -> &[u8] {
-    while !s.is_empty() && s[0].is_ascii_whitespace() { s = &s[1..]; }
-    while !s.is_empty() && s[s.len() - 1].is_ascii_whitespace() { s = &s[..s.len() - 1]; }
-    s
 }
 
 
@@ -284,40 +258,36 @@ fn octal_perm(mode: u32, cache: &mut HashMap<u32, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dutopia::util;    
 
     // ---------- parse_*_bytes ----------
 
     #[test]
-    fn parse_u32_bytes_basic() {
-        assert_eq!(super::parse_u32_bytes(Some(b"123")), 123);
-        assert_eq!(super::parse_u32_bytes(Some(b"  42  ")), 42);
-        assert_eq!(super::parse_u32_bytes(Some(b"+7")), 7);
-        assert_eq!(super::parse_u32_bytes(Some(b"-1")), 0, "negative -> default 0");
-        assert_eq!(super::parse_u32_bytes(Some(b"4294967296")), 0, "overflow -> default 0");
-        assert_eq!(super::parse_u32_bytes(Some(b"abc")), 0);
-        assert_eq!(super::parse_u32_bytes(None), 0);
-        assert_eq!(super::parse_u32_bytes(Some(b"000000")), 0);
-    }
-
-    #[test]
-    fn parse_i64_bytes_basic() {
-        assert_eq!(super::parse_i64_bytes(Some(b"0")), 0);
-        assert_eq!(super::parse_i64_bytes(Some(b"  -42 ")), -42);
-        assert_eq!(super::parse_i64_bytes(Some(b"+99")), 99);
-        // very large -> atoi returns None -> default 0
-        assert_eq!(super::parse_i64_bytes(Some(b"9223372036854775808")), 0);
-        assert_eq!(super::parse_i64_bytes(Some(b"foo")), 0);
-        assert_eq!(super::parse_i64_bytes(None), 0);
+    fn parse_int_basic() {
+        assert_eq!(util::parse_int::<u32>(Some(b"123")), 123);
+        assert_eq!(util::parse_int::<u32>(Some(b"  42  ")), 42);
+        assert_eq!(util::parse_int::<u32>(Some(b"+7")), 7);
+        assert_eq!(util::parse_int::<u32>(Some(b"-1")), 0, "negative -> default 0");
+        assert_eq!(util::parse_int::<u32>(Some(b"4294967296")), 0, "overflow -> default 0");
+        assert_eq!(util::parse_int::<u32>(Some(b"abc")), 0);
+        assert_eq!(util::parse_int::<u32>(None), 0);
+        assert_eq!(util::parse_int::<u32>(Some(b"000000")), 0);
+        assert_eq!(util::parse_int::<i64>(Some(b"0")), 0);
+        assert_eq!(util::parse_int::<i64>(Some(b"  -42 ")), -42);
+        assert_eq!(util::parse_int::<i64>(Some(b"+99")), 99);
+        assert_eq!(util::parse_int::<i64>(Some(b"9223372036854775808")), 0);
+        assert_eq!(util::parse_int::<i64>(Some(b"foo")), 0);
+        assert_eq!(util::parse_int::<i64>(None), 0);
     }
 
     // ---------- trim_ascii ----------
 
     #[test]
     fn trim_ascii_works() {
-        assert_eq!(super::trim_ascii(b"  a  "), b"a");
-        assert_eq!(super::trim_ascii(b"\t\nabc\r\n"), b"abc");
-        assert_eq!(super::trim_ascii(b""), b"");
-        assert_eq!(super::trim_ascii(b"   "), b"");
+        assert_eq!(util::trim_ascii(b"  a  "), b"a");
+        assert_eq!(util::trim_ascii(b"\t\nabc\r\n"), b"abc");
+        assert_eq!(util::trim_ascii(b""), b"");
+        assert_eq!(util::trim_ascii(b"   "), b"");
     }
 
     // ---------- fmt_day (no TZ assumptions) ----------

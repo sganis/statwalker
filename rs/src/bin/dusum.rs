@@ -1,12 +1,14 @@
+// dusum.rs
+use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use clap::{Parser, ColorChoice};
-use colored::Colorize;
 use csv::{ReaderBuilder, Trim, WriterBuilder};
 use memchr::memchr_iter;
 use chrono::Utc;
+use dutopia::util::{print_about, parse_int};
 
 #[cfg(unix)]
 use std::ffi::CStr;
@@ -14,11 +16,13 @@ use std::ffi::CStr;
 // POSIX-style type masks as encoded by dutopia in MODE
 #[cfg(unix)]
 const S_IFMT:  u32 = 0o170000;
+
 #[cfg(unix)]
 const S_IFDIR: u32 = 0o040000;
 
 #[cfg(not(unix))]
 const S_IFMT:  u32 = 0o170000;
+
 #[cfg(not(unix))]
 const S_IFDIR: u32 = 0o040000;
 
@@ -55,16 +59,8 @@ impl UserStats {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(windows)]
-    colored::control::set_virtual_terminal(true).unwrap_or(());
-
-    println!("{}","-".repeat(40).cyan().bold());
-    println!("{}", format!("Dutopia : Superfast filesystem analyzer").cyan().bold());
-    println!("{}", format!("Version : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Built   : {}", env!("BUILD_DATE")).cyan().bold());
-    println!("{}","-".repeat(40).cyan().bold());
-
+fn main() -> Result<()> {
+    print_about();
 
     let start_time = std::time::Instant::now();
     let args = Args::parse();
@@ -125,20 +121,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Columns: INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH
-        let mode      = parse_field_as_u32(record.get(5));
+        let mode      = parse_int::<u32>(record.get(5));
         let is_dir    = (mode & S_IFMT) == S_IFDIR;
-        let raw_atime = parse_field_as_i64(record.get(1));
-        let raw_mtime = parse_field_as_i64(record.get(2));
+        let raw_atime = parse_int::<i64>(record.get(1));
+        let raw_mtime = parse_int::<i64>(record.get(2));
         let sanitized_atime = if is_dir { 0 } else { sanitize_mtime(now_ts, raw_atime) };
         let sanitized_mtime = sanitize_mtime(now_ts, raw_mtime);
 
-        let uid = parse_field_as_u32(record.get(3));
+        let uid = parse_int::<u32>(record.get(3));
         let user = resolve_user(uid, &mut user_cache);
         if user == "UNK" {
             unk_uids.insert(uid);
         }
 
-        let disk_usage = parse_field_as_u64(record.get(7));
+        let disk_usage = parse_int::<u64>(record.get(7));
         let path_bytes = record.get(8).unwrap_or(b"");
 
         if user.is_empty() || path_bytes.is_empty() {
@@ -229,29 +225,6 @@ fn bytes_to_safe_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-// Fast, no-alloc numeric parsing from bytes (defaults to 0 on any error)
-#[inline]
-fn trim_ascii(mut s: &[u8]) -> &[u8] {
-    while !s.is_empty() && s[0].is_ascii_whitespace() { s = &s[1..]; }
-    while !s.is_empty() && s[s.len() - 1].is_ascii_whitespace() { s = &s[..s.len() - 1]; }
-    s
-}
-#[inline]
-fn parse_field_as_u32(field: Option<&[u8]>) -> u32 {
-    let s = trim_ascii(field.unwrap_or(b"0"));
-    atoi::atoi::<u32>(s).unwrap_or(0)
-}
-#[inline]
-fn parse_field_as_i64(field: Option<&[u8]>) -> i64 {
-    let s = trim_ascii(field.unwrap_or(b"0"));
-    atoi::atoi::<i64>(s).unwrap_or(0)
-}
-#[inline]
-fn parse_field_as_u64(field: Option<&[u8]>) -> u64 {
-    let s = trim_ascii(field.unwrap_or(b"0"));
-    atoi::atoi::<u64>(s).unwrap_or(0)
-}
-
 /// Sanitize mtime: if it's more than 1 day in the future, set to 0
 fn sanitize_mtime(now_ts: i64, mtime_ts: i64) -> i64 {
     const ONE_DAY_SECS: i64 = 86_400;
@@ -281,7 +254,7 @@ fn age_bucket(now_ts: i64, mtime_ts: i64) -> u8 {
     }
 }
 
-pub fn count_lines(path: &Path) -> std::io::Result<usize> {
+pub fn count_lines(path: &Path) -> Result<usize> {
     let mut file = File::open(path)?;
     let mut buf = [0u8; 128 * 1024];
     let mut count = 0usize;
@@ -305,7 +278,7 @@ pub fn count_lines(path: &Path) -> std::io::Result<usize> {
 fn write_results(
     output_path: &Path,
     aggregated_data: &HashMap<(Vec<u8>, String, u8), UserStats>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     // Sort deterministically (bytewise path, then user, then age)
     let mut sorted_entries: Vec<_> = aggregated_data.iter().collect();
     sorted_entries.sort_by(|a, b| {
@@ -347,7 +320,7 @@ fn write_results(
     Ok(())
 }
 
-fn write_unknown_uids(unk_path: &Path, unk_uids: &HashSet<u32>) -> Result<(), Box<dyn std::error::Error>> {
+fn write_unknown_uids(unk_path: &Path, unk_uids: &HashSet<u32>) -> Result<()> {
     // deterministic order
     let mut list: Vec<u32> = unk_uids.iter().copied().collect();
     list.sort_unstable();
@@ -414,13 +387,13 @@ mod tests {
 
     #[test]
     fn parser_trims_and_defaults() {
-        assert_eq!(parse_field_as_u32(Some(b" 42 ")), 42);
-        assert_eq!(parse_field_as_u32(Some(b"-1")), 0);
-        assert_eq!(parse_field_as_u32(Some(b"4294967296")), 0); // overflow -> 0
-        assert_eq!(parse_field_as_u64(Some(b"  100 ")), 100);
-        assert_eq!(parse_field_as_i64(Some(b" +7 ")), 7);
-        assert_eq!(parse_field_as_i64(Some(b" foo ")), 0);
-        assert_eq!(parse_field_as_u32(None), 0);
+        assert_eq!(parse_int::<u32>(Some(b" 42 ")), 42);
+        assert_eq!(parse_int::<u32>(Some(b"-1")), 0);
+        assert_eq!(parse_int::<u32>(Some(b"4294967296")), 0); // overflow -> 0
+        assert_eq!(parse_int::<u32>(Some(b"  100 ")), 100);
+        assert_eq!(parse_int::<i64>(Some(b" +7 ")), 7);
+        assert_eq!(parse_int::<i64>(Some(b" foo ")), 0);
+        assert_eq!(parse_int::<u32>(None), 0);
     }
 
     #[test]
