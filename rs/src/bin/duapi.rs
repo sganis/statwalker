@@ -118,9 +118,7 @@ async fn main() -> Result<()> {
     // CORS (dev)
     let cors = CorsLayer::new()
         .allow_origin([
-            "http://localhost:8080".parse().unwrap(),
             "http://localhost:5173".parse().unwrap(),
-            "http://127.0.0.1:5173".parse().unwrap(),
         ])
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(Any);
