@@ -213,12 +213,12 @@ fn main() -> Result<()> {
                     last_pct = pct;
                     let bar = progress_bar(pct.into(), 25);
                     eprint!(
-                        "\r    {} {} {:>3}% | Files: {} [{} files/s]        \r",
+                        "\r    {} {} {:>3}% | {} files [{} f/s]        \r",
                         "Progress".cyan().bold(), bar, pct as u32, human_count(f), rate_f
                     );
                 } else {
                     eprint!(
-                        "\r    {} : Files: {} [{} files/s]        \r",
+                        "\r    {} : {} files [{} f/s]        \r",
                         "Progress".cyan().bold(), human_count(f), rate_f
                     );
                 }
