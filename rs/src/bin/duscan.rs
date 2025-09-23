@@ -213,8 +213,8 @@ fn main() -> Result<()> {
                     last_pct = pct;
                     let bar = progress_bar(pct.into(), 25);
                     eprint!(
-                        "\r{} {}: {} {:>3}% | Files: {} | Files/s: {} | Errors: {}        \r",
-                        spinner(), "    Progress ".cyan().bold(), bar, pct as u32, human_count(f), rate_f, e
+                        "\r  {} {}: {} {:>3}% | Files: {} | Files/s: {} | Errors: {}        \r",
+                        spinner(), "Progress ".cyan().bold(), bar, pct as u32, human_count(f), rate_f, e
                     );
                 } else {
                     eprint!(
@@ -222,7 +222,7 @@ fn main() -> Result<()> {
                         "    Progress ".cyan().bold(), human_count(f), rate_f, e
                     );
                 }
-                thread::sleep(Duration::from_millis(1000));
+                thread::sleep(Duration::from_millis(200));
             }
             eprint!("\r{}"," ".repeat(120));
         }));
