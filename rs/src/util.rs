@@ -43,9 +43,9 @@ pub fn print_about() {
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
     println!("{}","-".repeat(40).cyan().bold());
-    println!("{}", format!("Dutopia : Superfast filesystem analyzer").cyan().bold());
-    println!("{}", format!("Version : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Built   : {}", env!("BUILD_DATE")).cyan().bold());
+    println!("{}", format!("Dutopia      : Superfast filesystem analyzer").cyan().bold());
+    println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!("{}", format!("Built        : {}", env!("BUILD_DATE")).cyan().bold());
     println!("{}","-".repeat(40).cyan().bold());
 }
 

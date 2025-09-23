@@ -203,7 +203,7 @@ fn main() -> Result<()> {
             loop {
                 if reporting_done.load(Relaxed) { break; }
                 let f = progress_for_reporter.files.load(Relaxed);
-                let e = progress_for_reporter.errors.load(Relaxed);
+                //let e = progress_for_reporter.errors.load(Relaxed);
                 let elapsed = start_for_reporter.elapsed().as_secs_f64().max(0.001);
                 let rate_f = human_count((f as f64 / elapsed) as u64);                
 
@@ -213,13 +213,13 @@ fn main() -> Result<()> {
                     last_pct = pct;
                     let bar = progress_bar(pct.into(), 25);
                     eprint!(
-                        "\r    {} {} {:>3}% | Files: {} | Files/s: {} | Errors: {}        \r",
-                        "Progress".cyan().bold(), bar, pct as u32, human_count(f), rate_f, e
+                        "\r    {} {} {:>3}% | Files: {} [{} files/s]        \r",
+                        "Progress".cyan().bold(), bar, pct as u32, human_count(f), rate_f
                     );
                 } else {
                     eprint!(
-                        "\r    {} : Files: {} | Files/s: {} | Errors: {}        \r",
-                        "Progress".cyan().bold(), human_count(f), rate_f, e
+                        "\r    {} : Files: {} [{} files/s]        \r",
+                        "Progress".cyan().bold(), human_count(f), rate_f
                     );
                 }
                 thread::sleep(Duration::from_millis(1000));
@@ -297,7 +297,7 @@ fn main() -> Result<()> {
     println!("Total errors : {}", total.errors);  
     println!("Total disk   : {}", human_bytes(total.bytes));  
     println!("Elapsed time : {}", elapsed_str);
-    println!("Files/sec.   : {:.2}", speed);
+    println!("Files/s      : {:.2}", speed);
     println!("{}","-".repeat(40).cyan().bold());
     println!("Done.");
     Ok(())

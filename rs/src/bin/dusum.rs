@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use clap::{Parser, ColorChoice};
+// use colored::Colorize;
 use csv::{ReaderBuilder, Trim, WriterBuilder};
 use memchr::memchr_iter;
 use chrono::Utc;
@@ -36,6 +37,40 @@ struct Args {
     /// Output CSV file path (defaults to <input_stem>.sum.csv)
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Age buckets in days as YOUNG,OLD  (defaults to 60,600)
+    #[arg(long, value_parser = parse_age_pair, value_name = "YOUNG,OLD")]
+    age: Option<(i64, i64)>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct AgeCfg { young: i64, old: i64 }
+
+impl Default for AgeCfg {
+    fn default() -> Self { Self { young: 60, old: 600 } }
+}
+fn parse_age_pair(s: &str) -> Result<(i64,i64), String> {
+    let mut it = s.split(',');
+    let a = it.next().ok_or("expected two comma-separated integers, e.g. 60,600")?;
+    let b = it.next().ok_or("expected two comma-separated integers, e.g. 60,600")?;
+    if it.next().is_some() {
+        return Err("expected exactly two values: YOUNG,OLD".into());
+    }
+    let a: i64 = a.trim().parse().map_err(|_| "YOUNG must be an integer")?;
+    let b: i64 = b.trim().parse().map_err(|_| "OLD must be an integer")?;
+    if a <= 0 || b <= 0 || a >= b {
+        return Err("must be positive and increasing (e.g. 60,600)".into());
+    }
+    Ok((a,b))
+}
+impl AgeCfg {
+    fn from_args(age: &Option<(i64,i64)>) -> Self {
+        let mut cfg = AgeCfg::default();
+        if let Some((a,b)) = age {
+            cfg.young = *a;
+            cfg.old = *b;
+        }
+        cfg
+    }
 }
 
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -65,6 +100,9 @@ fn main() -> Result<()> {
     let start_time = std::time::Instant::now();
     let args = Args::parse();
 
+    let age_cfg = AgeCfg::from_args(&args.age);
+    println!("Age (days)   : recent < {}, not too old < {}, old > {}", age_cfg.young, age_cfg.old, age_cfg.old);
+    
     // Determine output path
     let output_path = args.output.clone().unwrap_or_else(|| {
         let stem = args
@@ -89,10 +127,10 @@ fn main() -> Result<()> {
     let mut unk_uids: HashSet<u32> = HashSet::new(); // collect UIDs that resolve to UNK
 
     // Count total lines for progress tracking
-    println!("Counting lines in {}", args.input.display());
+    // println!("Counting lines in {}", args.input.display());
     let total_lines = count_lines(&args.input)?;
     let data_lines = total_lines.saturating_sub(1);
-    println!("Total lines: {}", total_lines);
+    println!("Total lines  : {}", total_lines);
 
     // Set up CSV reader
     // IMPORTANT: Trim::None so we never alter raw PATH bytes.
@@ -102,7 +140,7 @@ fn main() -> Result<()> {
         .trim(Trim::None)
         .from_path(&args.input)?;
 
-    println!("Aggregating {}...", args.input.display());
+    // println!("Aggregating {}...", args.input.display());
 
     // path, user, age -> stats
     let mut aggregated_data: HashMap<(Vec<u8>, String, u8), UserStats> = HashMap::new();
@@ -141,8 +179,8 @@ fn main() -> Result<()> {
             continue;
         }
 
-        let bucket = age_bucket(now_ts, sanitized_mtime);
-
+        let bucket = age_bucket(now_ts, sanitized_mtime, age_cfg);
+        
         // Update statistics for each ancestor folder
         for folder_path in get_folder_ancestors(path_bytes) {
             let key = (folder_path, user.clone(), bucket);
@@ -235,24 +273,25 @@ fn sanitize_mtime(now_ts: i64, mtime_ts: i64) -> i64 {
     }
 }
 
-/// Bucket age in days into:
-/// 0: <= 60 days
-/// 1: 61..=600 days
-/// 2: > 600 days OR unknown/invalid mtime
-fn age_bucket(now_ts: i64, mtime_ts: i64) -> u8 {
+/// Bucket age in days using configurable thresholds:
+/// 0: recent (< young)
+/// 1: not too old (>= young and < old)
+/// 2: old (>= old or invalid/unknown)
+fn age_bucket(now_ts: i64, mtime_ts: i64, cfg: AgeCfg) -> u8 {
     if mtime_ts <= 0 {
         return 2;
     }
     let age_secs = now_ts.saturating_sub(mtime_ts);
     let days = age_secs / 86_400;
-    if days <= 60 {
+    if days < cfg.young {
         0
-    } else if days <= 600 {
+    } else if days < cfg.old {
         1
     } else {
         2
     }
 }
+
 
 pub fn count_lines(path: &Path) -> Result<usize> {
     let mut file = File::open(path)?;

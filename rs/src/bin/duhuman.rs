@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         .output
         .unwrap_or_else(|| PathBuf::from(format!("{}.res.csv", stem)));
 
-    println!("Resolving file {}", input.display());
+    // println!("Resolving file {}", input.display());
 
     // CSV reader/writer
     let mut rdr = ReaderBuilder::new()
