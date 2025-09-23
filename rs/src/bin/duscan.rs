@@ -41,14 +41,14 @@ const FLUSH_BYTES: usize = 4 * 1024 * 1024;
     about = "Scan filesystem and gather file metadata into CSV or binary output"
 )]
 struct Args {
-    /// Root folder to scan (positional, required)
-    root: String,
-    /// Output path (default: "<root>.csv" or ".bin" if --bin)
-    #[arg(short, long, value_name = "FILE")]
+    /// Folder to scan (required)
+    folder: String,
+    /// Output path (default: folder.csv or folder.zst if --bin)
+    #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
-    /// Number of worker threads (default: 2×CPU, capped 48)
-    #[arg(short, long)]
-    threads: Option<usize>,
+    /// Number of worker (default: 2xCPU, capped to 48)
+    #[arg(short, long, value_name = "N")]
+    workers: Option<usize>,
     /// Skip any folder whose full path contains this substring
     #[arg(short, long, value_name = "SUBSTR")]
     skip: Option<String>,
@@ -59,7 +59,7 @@ struct Args {
     #[arg(long = "no-atime")]
     no_atime: bool,
     /// Total files hint (e.g. 750m, 1.2b). Used for % progress
-    #[arg(long = "files-hint", value_name = "COUNT")]
+    #[arg(long = "files-hint", value_name = "N")]
     files_hint: Option<String>,
     /// Do not report progress
     #[arg(short, long)]
@@ -115,7 +115,7 @@ fn main() -> Result<()> {
     }
 
     // Canonicalize root
-    let root = fs::canonicalize(&args.root)?;
+    let root = fs::canonicalize(&args.folder)?;
     let root_normalized = strip_verbatim_prefix(&root);
     let root_str = root_normalized.display().to_string();
 
@@ -162,7 +162,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("No write access to directory {}", out_dir.display()))?;
     let _ = fs::remove_file(&testfile);
 
-    let threads = args.threads.unwrap_or_else(|| (num_cpus::get()*2).max(4).min(48));
+    let workers = args.workers.unwrap_or_else(|| (num_cpus::get()*2).max(4).min(48));
     let cmd: Vec<String> = std::env::args().collect();    
     let now = Local::now();
     let hostname = get_hostname();
@@ -173,7 +173,7 @@ fn main() -> Result<()> {
     println!("Input        : {}", &root_str);
     println!("Output       : {}", &final_path.display());
     println!("Temp dir     : {}", out_dir.display());
-    println!("Workers      : {}", threads);
+    println!("Workers      : {}", workers);
 
     // ---- work queue + inflight counter ----
     let (tx, rx) = unbounded::<Task>();
@@ -241,7 +241,7 @@ fn main() -> Result<()> {
         let inflight = inflight.clone();
         thread::spawn(move || loop {
             if inflight.load(Relaxed) == 0 {
-                for _ in 0..threads {
+                for _ in 0..workers {
                     let _ = tx.send(Task::Shutdown);
                 }
                 break;
@@ -258,8 +258,8 @@ fn main() -> Result<()> {
     };
 
     // ---- spawn workers ----
-    let mut joins = Vec::with_capacity(threads);
-    for tid in 0..threads {
+    let mut joins = Vec::with_capacity(workers);
+    for tid in 0..workers {
         let rx = rx.clone();
         let tx = tx.clone();
         let inflight = inflight.clone();
@@ -285,7 +285,7 @@ fn main() -> Result<()> {
     
     // ---- merge shards ----
     let sort_csv = args.no_atime && matches!(out_fmt, OutputFormat::Csv);
-    merge_shards(&out_dir, &final_path, threads, out_fmt, sort_csv).expect("merge shards failed");
+    merge_shards(&out_dir, &final_path, workers, out_fmt, sort_csv).expect("merge shards failed");
 
     if let Some(h) = reporter_join.take() {
         reporting_done.store(true, Relaxed);
@@ -550,28 +550,28 @@ fn write_row_bin(buf: &mut Vec<u8>, r: &Row<'_>, no_atime: bool) {
 fn merge_shards(
     out_dir: &Path, 
     final_path: &Path, 
-    threads: usize, 
+    workers: usize, 
     out_fmt: OutputFormat,
     sort_csv: bool,
 ) -> Result<()> {
     let mut out = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&final_path)?);
 
     match out_fmt {
-        OutputFormat::Csv => merge_shards_csv(out_dir, &mut out, threads, sort_csv),
-        OutputFormat::Bin => merge_shards_bin(out_dir, &mut out, threads),
+        OutputFormat::Csv => merge_shards_csv(out_dir, &mut out, workers, sort_csv),
+        OutputFormat::Bin => merge_shards_bin(out_dir, &mut out, workers),
     }?;
 
     out.flush()?;
     Ok(())
 }
 
-fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, threads: usize, sort_csv: bool) -> Result<()> {
+fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, workers: usize, sort_csv: bool) -> Result<()> {
     out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n")?;
     let hostname = get_hostname();
 
     if !sort_csv {
         // Old behavior: stream in shard order
-        for tid in 0..threads {
+        for tid in 0..workers {
             let shard = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
             if !shard.exists() { continue; }
             let f = File::open(&shard)?;
@@ -590,7 +590,7 @@ fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, threads: usize, s
     // Sorted mode (only used when --skip-atime and CSV)
     let mut lines: Vec<String> = Vec::new();
 
-    for tid in 0..threads {
+    for tid in 0..workers {
         let shard = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
         if !shard.exists() { continue; }
 
@@ -632,10 +632,10 @@ fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, threads: usize, s
 fn merge_shards_bin(
     out_dir: &Path, 
     out: &mut BufWriter<File>, 
-    threads: usize, 
+    workers: usize, 
 ) -> Result<()> {
     let hostname = get_hostname();
-    for tid in 0..threads {
+    for tid in 0..workers {
         let shard = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
         if !shard.exists() { continue; }
         let f = File::open(&shard)?;
