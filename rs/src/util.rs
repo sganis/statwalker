@@ -7,6 +7,7 @@ use std::{
 };
 use itoa::Buffer;
 use colored::Colorize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -27,6 +28,15 @@ pub struct Row<'a> {
 // ============================================================================
 // Utilities
 // ============================================================================
+
+
+static SPINNER: [&str; 4] = ["/", "-", "\\", "|"];
+static FRAME: AtomicUsize = AtomicUsize::new(0);
+
+pub fn spinner() -> &'static str {
+    let i = FRAME.fetch_add(1, Ordering::Relaxed) % SPINNER.len();
+    SPINNER[i]
+}
 
 pub fn print_about() {
     #[cfg(windows)]
