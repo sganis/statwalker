@@ -826,7 +826,7 @@
   <!-- Path total header item -->
   <div class="relative px-2 bg-gray-700 border border-gray-500 rounded text-sm p-1">
       <!-- Total bar background -->
-      <div class="absolute left-0 top-0 bottom-0 z-0" style="width: 100%">
+      <div class="flex absolute left-0 top-0 bottom-0 z-0" style="width: 100%">
         {#each sortedUserEntries(pathTotals) as [uname, userData] (uname)}
           {@const userMetric = sortBy === "disk" ? userData.disk : userData.count}
           {@const totalMetric =
