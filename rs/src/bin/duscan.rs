@@ -19,7 +19,7 @@ use colored::Colorize;
 use chrono::Local;
 use zstd::stream::write::Encoder as ZstdEncoder;
 use dutopia::util::{
-    Row, should_skip, spinner,
+    Row, should_skip, 
     csv_push_path_smart_quoted, format_duration, get_hostname, strip_verbatim_prefix,
     push_u32, push_u64, push_i64, push_comma, row_from_metadata, stat_row,
     human_count, human_bytes, progress_bar, parse_file_hint, print_about,
@@ -213,16 +213,16 @@ fn main() -> Result<()> {
                     last_pct = pct;
                     let bar = progress_bar(pct.into(), 25);
                     eprint!(
-                        "\r  {} {}: {} {:>3}% | Files: {} | Files/s: {} | Errors: {}        \r",
-                        spinner(), "Progress ".cyan().bold(), bar, pct as u32, human_count(f), rate_f, e
+                        "\r    {} {} {:>3}% | Files: {} | Files/s: {} | Errors: {}        \r",
+                        "Progress".cyan().bold(), bar, pct as u32, human_count(f), rate_f, e
                     );
                 } else {
                     eprint!(
-                        "\r{}: Files: {} | Files/s: {} | Errors: {}        \r",
-                        "    Progress ".cyan().bold(), human_count(f), rate_f, e
+                        "\r    {} : Files: {} | Files/s: {} | Errors: {}        \r",
+                        "Progress".cyan().bold(), human_count(f), rate_f, e
                     );
                 }
-                thread::sleep(Duration::from_millis(200));
+                thread::sleep(Duration::from_millis(1000));
             }
             eprint!("\r{}"," ".repeat(120));
         }));
