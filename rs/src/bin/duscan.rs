@@ -40,8 +40,8 @@ const FLUSH_BYTES: usize = 4 * 1024 * 1024;
     about = "Scan filesystem and gather file metadata into CSV or binary output"
 )]
 struct Args {
-    /// Folder to scan (required)
-    folder: String,
+    /// Folders to scan (required, one or more)
+    folders: Vec<String>,
     /// Output path (default: folder.csv or folder.zst if --bin)
     #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
@@ -100,7 +100,7 @@ struct Config {
     out_fmt: OutputFormat,
     no_atime: bool,  
     progress: Option<Arc<Progress>>,
-    pid: u32,  
+    pid: u32,
 }
 
 fn main() -> Result<()> {
@@ -108,16 +108,39 @@ fn main() -> Result<()> {
     print_about();
 
     let args = Args::parse();
+    
+    if args.folders.is_empty() {
+        anyhow::bail!("At least one folder must be specified");
+    }
+    
     let out_fmt = if args.bin { OutputFormat::Bin } else { OutputFormat::Csv };
     
     if args.no_atime {
         eprintln!("{}", "ATIME will be written as 0 and lines sorted for reproducible output.".yellow());
     }
 
-    // Canonicalize root
-    let root = fs::canonicalize(&args.folder)?;
-    let root_normalized = strip_verbatim_prefix(&root);
-    let root_str = root_normalized.display().to_string();
+    // Canonicalize all root folders
+    let mut roots = Vec::new();
+    for folder in &args.folders {
+        let root = fs::canonicalize(folder)
+            .with_context(|| format!("Failed to canonicalize folder: {}", folder))?;
+        roots.push(root);
+    }
+
+    // Create a combined name for default output
+    let combined_name = if roots.len() == 1 {
+        let root_normalized = strip_verbatim_prefix(&roots[0]);
+        #[cfg(windows)]
+        {
+            root_normalized.to_string_lossy().replace('\\', "-").replace(':', "")
+        }
+        #[cfg(not(windows))]
+        {
+            root_normalized.to_string_lossy().trim_start_matches('/').replace('/', "-")
+        }
+    } else {
+        format!("stats_{}", roots.len())
+    };
 
     // Decide default output by out_fmt
     let final_path: PathBuf = match args.output {
@@ -128,17 +151,7 @@ fn main() -> Result<()> {
                 OutputFormat::Csv => "csv",
                 OutputFormat::Bin => "zst",
             };
-            #[cfg(windows)]
-            {
-                let normalized = strip_verbatim_prefix(&root);
-                let name = normalized.to_string_lossy().replace('\\', "-").replace(':', "");
-                std::env::current_dir()?.join(format!("{name}.{ext}"))
-            }
-            #[cfg(not(windows))]
-            {
-                let name = root_normalized.to_string_lossy().trim_start_matches('/').replace('/', "-");
-                std::env::current_dir()?.join(format!("{name}.{ext}"))
-            }
+            std::env::current_dir()?.join(format!("{combined_name}.{ext}"))
         }
     };
 
@@ -170,8 +183,14 @@ fn main() -> Result<()> {
 
     println!("Local time   : {}", now.format("%Y-%m-%d %H:%M:%S").to_string());
     println!("Host         : {}", hostname);
+    println!("Process ID   : {}", pid);
     println!("Command      : {}", cmd.join(" "));
-    println!("Input        : {}", &root_str);
+    
+    for (i, root) in roots.iter().enumerate() {
+        let root_normalized = strip_verbatim_prefix(root);
+        println!("Input {}      : {}", i + 1, root_normalized.display());
+    }
+
     println!("Output       : {}", &final_path.display());
     println!("Temp dir     : {}", out_dir.display());
     println!("Workers      : {}", workers);
@@ -232,9 +251,11 @@ fn main() -> Result<()> {
 
     let start_time = Instant::now();
     
-    // seed roots
-    inflight.fetch_add(1, Relaxed);
-    tx.send(Task::Dir(PathBuf::from(root))).expect("enqueue root");
+    // seed all root folders
+    for root in roots {
+        inflight.fetch_add(1, Relaxed);
+        tx.send(Task::Dir(root)).expect("enqueue root");
+    }
 
     // shutdown notifier
     {
@@ -261,14 +282,14 @@ fn main() -> Result<()> {
 
     // ---- spawn workers ----
     let mut joins = Vec::with_capacity(workers);
-    for wid in 0..workers {
+    for tid in 0..workers {
         let rx = rx.clone();
         let tx = tx.clone();
         let inflight = inflight.clone();
         let out_dir = out_dir.clone();
         let cfg = cfg.clone();
         joins.push(thread::spawn(move || worker(
-            wid, rx, tx, inflight, out_dir, cfg, 
+            tid, rx, tx, inflight, out_dir, cfg, 
         )));
     }
     drop(tx);
@@ -308,7 +329,7 @@ fn main() -> Result<()> {
 
 
 fn worker(
-    wid: usize,
+    tid: usize,
     rx: Receiver<Task>,
     tx: Sender<Task>,
     inflight: Arc<AtomicUsize>,
@@ -317,8 +338,8 @@ fn worker(
 ) -> Stats {
     let is_bin = cfg.out_fmt == OutputFormat::Bin;
     let hostname = get_hostname();
-    // Use instance_id to make shard files unique across instances
-    let shard_path = out_dir.join(format!("shard_{}_{}_{}.tmp", hostname, cfg.pid, wid));
+    // Use pid to make shard files unique across instances
+    let shard_path = out_dir.join(format!("shard_{}_{}_{}.tmp", hostname, cfg.pid, tid));
     let file = File::create(&shard_path).expect("open shard");
     let base = BufWriter::with_capacity(32 * 1024 * 1024, file);
     let has_progress = cfg.progress.is_some();  
@@ -569,15 +590,21 @@ fn merge_shards(
     Ok(())
 }
 
-fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, workers: usize, sort_csv: bool, pid: u32) -> Result<()> {
+fn merge_shards_csv(
+    out_dir: &Path, 
+    out: &mut BufWriter<File>,
+    workers: usize, 
+    sort_csv: bool, 
+    pid: u32
+) -> Result<()> {
     out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n")?;
     let hostname = get_hostname();
 
     if !sort_csv {
         // Old behavior: stream in shard order
-        for wid in 0..workers {
+        for tid in 0..workers {
             // Find all shard files for this worker thread (may have different thread IDs)
-            let pattern = format!("shard_{}_{}_{}", hostname, pid, wid);
+            let pattern = format!("shard_{}_{}_{}", hostname, pid, tid);
             let shard_files: Vec<_> = fs::read_dir(out_dir)?
                 .filter_map(|entry| entry.ok())
                 .filter(|entry| {
@@ -606,9 +633,9 @@ fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, workers: usize, s
     // Sorted mode (only used when --skip-atime and CSV)
     let mut lines: Vec<String> = Vec::new();
 
-    for wid in 0..workers {
+    for tid in 0..workers {
         // Find all shard files for this worker thread
-        let pattern = format!("shard_{}_{}_{}", hostname, pid, wid);
+        let pattern = format!("shard_{}_{}_{}", hostname, pid, tid);
         let shard_files: Vec<_> = fs::read_dir(out_dir)?
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
@@ -659,13 +686,13 @@ fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, workers: usize, s
 fn merge_shards_bin(
     out_dir: &Path, 
     out: &mut BufWriter<File>, 
-    workers: usize, 
+    workers: usize,
     pid: u32,
 ) -> Result<()> {
     let hostname = get_hostname();
-    for wid in 0..workers {
+    for tid in 0..workers {
         // Find all shard files for this worker thread
-        let pattern = format!("shard_{}_{}_{}", hostname, pid, wid);
+        let pattern = format!("shard_{}_{}_{}", hostname, pid, tid);
         let shard_files: Vec<_> = fs::read_dir(out_dir)?
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
@@ -759,7 +786,7 @@ mod tests {
         let final_path = out_dir.join("out_unsorted.csv");
         let pid = 123;
 
-        // Create 2 CSV shard files with headers - using pid_wid pattern
+        // Create 2 CSV shard files without headers
         let shard0 = out_dir.join(format!("shard_{}_{}_0.tmp", get_hostname(), pid));
         let shard1 = out_dir.join(format!("shard_{}_{}_1.tmp", get_hostname(), pid));
 
@@ -792,7 +819,7 @@ mod tests {
         let final_path = out_dir.join("out_sorted.csv");
         let pid = 123;
 
-        // Create 2 CSV shards (out of order) - using pid_wid pattern
+        // Create 2 CSV shards (out of order) without headers
         let shard0 = out_dir.join(format!("shard_{}_{}_0.tmp", get_hostname(), pid));
         let shard1 = out_dir.join(format!("shard_{}_{}_1.tmp", get_hostname(), pid));
         {
