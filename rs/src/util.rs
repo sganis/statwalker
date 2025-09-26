@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 
-pub struct Row<'a> {
-    pub path: &'a Path,
+pub struct Row {
+    //pub path: &'a Path,
     pub dev: u64,
     pub ino: u64,
     pub mode: u32,
@@ -254,13 +254,12 @@ pub fn csv_push_str_smart_quoted(buf: &mut Vec<u8>, s: &str) {
 // ============================================================================
 // Metadata and File Stats
 // ============================================================================
-
-pub fn row_from_metadata<'a>(path: &'a Path, md: &fs::Metadata) -> Row<'a> {
+pub fn row_from_metadata(md: &fs::Metadata) -> Row {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         Row {
-            path,
+            //path,
             dev: md.dev(),
             ino: md.ino(),
             mode: md.mode(),
@@ -312,7 +311,7 @@ pub fn row_from_metadata<'a>(path: &'a Path, md: &fs::Metadata) -> Row<'a> {
         //let uid = get_rid(path).unwrap_or(0);
         
         Row {
-            path, 
+            //path, 
             dev: 0, 
             ino: 0, 
             mode: 0, 
@@ -327,7 +326,7 @@ pub fn row_from_metadata<'a>(path: &'a Path, md: &fs::Metadata) -> Row<'a> {
     #[cfg(not(any(unix, windows)))]
     {
         Row { 
-            path, 
+            //path, 
             dev: 0, 
             ino: 0, 
             mode: 0, 
@@ -341,15 +340,14 @@ pub fn row_from_metadata<'a>(path: &'a Path, md: &fs::Metadata) -> Row<'a> {
     }
 }
 
-pub fn stat_row<'a>(path: &'a Path) -> Option<Row<'a>> {
+pub fn stat_row(path: &Path) -> Option<Row> {
     let md = fs::symlink_metadata(path).ok()?;
-    Some(row_from_metadata(path, &md))
+    Some(row_from_metadata(&md))
 }
 
 // ============================================================================
 // Windows Security Functions
 // ============================================================================
-
 #[cfg(windows)]
 pub fn get_rid(path: &Path) -> std::io::Result<u32> {
     use std::{io, iter, os::windows::ffi::OsStrExt, ptr};

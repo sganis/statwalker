@@ -376,9 +376,9 @@ fn worker(
                 }
                 if let Some(row) = stat_row(&dir) {
                     if is_bin { 
-                        write_row_bin(&mut buf, &row, cfg.no_atime); 
+                        write_row_bin(&mut buf, &dir, &row, cfg.no_atime); 
                     } else { 
-                        write_row_csv(&mut buf, &row, cfg.no_atime);
+                        write_row_csv(&mut buf, &dir, &row, cfg.no_atime);
                     }
                     stats.files += 1;                    
                 } else {
@@ -410,11 +410,11 @@ fn worker(
 
                 for FileItem { name, md } in &items {
                     let full = base.join(&name);
-                    let row = row_from_metadata(&full, &md); // <-- no syscall here
+                    let row = row_from_metadata(&md); // <-- no syscall here
                     if is_bin { 
-                        write_row_bin(&mut buf, &row, cfg.no_atime);
+                        write_row_bin(&mut buf, &full, &row, cfg.no_atime);
                     } else { 
-                        write_row_csv(&mut buf, &row, cfg.no_atime);
+                        write_row_csv(&mut buf, &full, &row, cfg.no_atime);
                     }
                     stats.files += 1;
                     stats.bytes += &row.blocks * 512;
@@ -504,7 +504,7 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
 }
 
 // ----- CSV writing -----
-fn write_row_csv(buf: &mut Vec<u8>, r: &Row<'_>, no_atime: bool) {
+fn write_row_csv(buf: &mut Vec<u8>, path: &Path, r: &Row, no_atime: bool) {
     buf.reserve(256);
     // INODE as dev-ino
     push_u64(buf, r.dev);
@@ -535,20 +535,17 @@ fn write_row_csv(buf: &mut Vec<u8>, r: &Row<'_>, no_atime: bool) {
     push_u64(buf, disk); 
     push_comma(buf);
 
-    csv_push_path_smart_quoted(buf, r.path);
+    csv_push_path_smart_quoted(buf, path);
     buf.push(b'\n');
 }
 
 // ----- BIN writing -----
-fn write_row_bin(buf: &mut Vec<u8>, r: &Row<'_>, no_atime: bool) {
+fn write_row_bin(buf: &mut Vec<u8>, path: &Path, r: &Row, no_atime: bool) {
     
     #[cfg(unix)]
-    let path_bytes: &[u8] = {
-        r.path.as_os_str().as_bytes()
-    };
-
+    let path_bytes: &[u8] = path.as_os_str().as_bytes();
     #[cfg(not(unix))]
-    let path_lossy = r.path.to_string_lossy();     // keep the Cow alive
+    let path_lossy = path.to_string_lossy();     // keep the Cow alive
     #[cfg(not(unix))]
     let path_bytes: &[u8] = path_lossy.as_bytes(); // borrow from it safely
 
