@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{self, BufWriter, Write, BufRead, BufReader, Read},
+    io::{self, BufWriter, Write, BufReader, Read},
     path::{Path, PathBuf},
     time::{Duration, Instant},
     thread::{self, JoinHandle},
@@ -100,6 +100,7 @@ struct Config {
     out_fmt: OutputFormat,
     no_atime: bool,  
     progress: Option<Arc<Progress>>,
+    pid: u32,  
 }
 
 fn main() -> Result<()> {
@@ -165,6 +166,7 @@ fn main() -> Result<()> {
     let cmd: Vec<String> = std::env::args().collect();    
     let now = Local::now();
     let hostname = get_hostname();
+    let pid = std::process::id();
 
     println!("Local time   : {}", now.format("%Y-%m-%d %H:%M:%S").to_string());
     println!("Host         : {}", hostname);
@@ -254,18 +256,19 @@ fn main() -> Result<()> {
         out_fmt,
         no_atime: args.no_atime,
         progress: (!args.quiet).then(|| progress.clone()),
+        pid,
     };
 
     // ---- spawn workers ----
     let mut joins = Vec::with_capacity(workers);
-    for tid in 0..workers {
+    for wid in 0..workers {
         let rx = rx.clone();
         let tx = tx.clone();
         let inflight = inflight.clone();
         let out_dir = out_dir.clone();
         let cfg = cfg.clone();
         joins.push(thread::spawn(move || worker(
-            tid, rx, tx, inflight, out_dir, cfg, 
+            wid, rx, tx, inflight, out_dir, cfg, 
         )));
     }
     drop(tx);
@@ -284,7 +287,7 @@ fn main() -> Result<()> {
     
     // ---- merge shards ----
     let sort_csv = args.no_atime && matches!(out_fmt, OutputFormat::Csv);
-    merge_shards(&out_dir, &final_path, workers, out_fmt, sort_csv).expect("merge shards failed");
+    merge_shards(&out_dir, &final_path, workers, out_fmt, sort_csv, pid).expect("merge shards failed");
 
     if let Some(h) = reporter_join.take() {
         reporting_done.store(true, Relaxed);
@@ -305,7 +308,7 @@ fn main() -> Result<()> {
 
 
 fn worker(
-    tid: usize,
+    wid: usize,
     rx: Receiver<Task>,
     tx: Sender<Task>,
     inflight: Arc<AtomicUsize>,
@@ -314,16 +317,17 @@ fn worker(
 ) -> Stats {
     let is_bin = cfg.out_fmt == OutputFormat::Bin;
     let hostname = get_hostname();
-    let shard_path = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
+    // Use instance_id to make shard files unique across instances
+    let shard_path = out_dir.join(format!("shard_{}_{}_{}.tmp", hostname, cfg.pid, wid));
     let file = File::create(&shard_path).expect("open shard");
-    let mut base = BufWriter::with_capacity(32 * 1024 * 1024, file);
+    let base = BufWriter::with_capacity(32 * 1024 * 1024, file);
     let has_progress = cfg.progress.is_some();  
     let progress = cfg.progress.unwrap_or_default();
 
     // Header
-    if !is_bin {
-        base.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n").expect("write csv header"); 
-    }
+    // if !is_bin {
+    //     base.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n").expect("write csv header"); 
+    // }
 
     // Choose writer: zstd encoder for binary; otherwise the base writer
     let mut writer: Box<dyn Write + Send> = if is_bin {
@@ -552,36 +556,49 @@ fn merge_shards(
     workers: usize, 
     out_fmt: OutputFormat,
     sort_csv: bool,
+    pid: u32,
 ) -> Result<()> {
     let mut out = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&final_path)?);
 
     match out_fmt {
-        OutputFormat::Csv => merge_shards_csv(out_dir, &mut out, workers, sort_csv),
-        OutputFormat::Bin => merge_shards_bin(out_dir, &mut out, workers),
+        OutputFormat::Csv => merge_shards_csv(out_dir, &mut out, workers, sort_csv, pid),
+        OutputFormat::Bin => merge_shards_bin(out_dir, &mut out, workers, pid),
     }?;
 
     out.flush()?;
     Ok(())
 }
 
-fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, workers: usize, sort_csv: bool) -> Result<()> {
+fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, workers: usize, sort_csv: bool, pid: u32) -> Result<()> {
     out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n")?;
     let hostname = get_hostname();
 
     if !sort_csv {
         // Old behavior: stream in shard order
-        for tid in 0..workers {
-            let shard = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
-            if !shard.exists() { continue; }
-            let f = File::open(&shard)?;
-            let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
+        for wid in 0..workers {
+            // Find all shard files for this worker thread (may have different thread IDs)
+            let pattern = format!("shard_{}_{}_{}", hostname, pid, wid);
+            let shard_files: Vec<_> = fs::read_dir(out_dir)?
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.file_name()
+                        .to_string_lossy()
+                        .starts_with(&pattern)
+                })
+                .collect();
 
-            // Skip shard header line
-            let mut first_line = Vec::<u8>::with_capacity(128);
-            reader.read_until(b'\n', &mut first_line)?; // discard header
+            for entry in shard_files {
+                let shard_path = entry.path();
+                let f = File::open(&shard_path)?;
+                let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
 
-            io::copy(&mut reader, out)?;
-            let _ = fs::remove_file(shard);
+                // Skip shard header line
+                //let mut first_line = Vec::<u8>::with_capacity(128);
+                //reader.read_until(b'\n', &mut first_line)?; // discard header
+
+                io::copy(&mut reader, out)?;
+                let _ = fs::remove_file(shard_path);
+            }
         }
         return Ok(());
     }
@@ -589,31 +606,42 @@ fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, workers: usize, s
     // Sorted mode (only used when --skip-atime and CSV)
     let mut lines: Vec<String> = Vec::new();
 
-    for tid in 0..workers {
-        let shard = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
-        if !shard.exists() { continue; }
+    for wid in 0..workers {
+        // Find all shard files for this worker thread
+        let pattern = format!("shard_{}_{}_{}", hostname, pid, wid);
+        let shard_files: Vec<_> = fs::read_dir(out_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.file_name()
+                    .to_string_lossy()
+                    .starts_with(&pattern)
+            })
+            .collect();
 
-        let f = File::open(&shard)?;
-        let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
+        for entry in shard_files {
+            let shard_path = entry.path();
+            let f = File::open(&shard_path)?;
+            let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
 
-        // Skip shard header
-        let mut throwaway = Vec::<u8>::with_capacity(128);
-        reader.read_until(b'\n', &mut throwaway)?;
+            // Skip shard header
+            //let mut throwaway = Vec::<u8>::with_capacity(128);
+            //reader.read_until(b'\n', &mut throwaway)?;
 
-        // Read remainder into buffer and split into lines
-        let mut buf = String::new();
-        reader.read_to_string(&mut buf)?;
-        for line in buf.split_inclusive('\n') {
-            // retain only non-empty rows
-            if line.trim().is_empty() { continue; }
-            // store without trailing newline; we'll add our own
-            let ln = line.strip_suffix('\n').unwrap_or(line).to_string();
-            if !ln.is_empty() {
-                lines.push(ln);
+            // Read remainder into buffer and split into lines
+            let mut buf = String::new();
+            reader.read_to_string(&mut buf)?;
+            for line in buf.split_inclusive('\n') {
+                // retain only non-empty rows
+                if line.trim().is_empty() { continue; }
+                // store without trailing newline; we'll add our own
+                let ln = line.strip_suffix('\n').unwrap_or(line).to_string();
+                if !ln.is_empty() {
+                    lines.push(ln);
+                }
             }
-        }
 
-        let _ = fs::remove_file(shard);
+            let _ = fs::remove_file(shard_path);
+        }
     }
 
     // Full-line lexicographic sort (deterministic; ATIME is zeroed in the rows)
@@ -632,15 +660,28 @@ fn merge_shards_bin(
     out_dir: &Path, 
     out: &mut BufWriter<File>, 
     workers: usize, 
+    pid: u32,
 ) -> Result<()> {
     let hostname = get_hostname();
-    for tid in 0..workers {
-        let shard = out_dir.join(format!("shard_{hostname}_{tid}.tmp"));
-        if !shard.exists() { continue; }
-        let f = File::open(&shard)?;
-        let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
-        io::copy(&mut reader, out)?;
-        let _ = fs::remove_file(shard);
+    for wid in 0..workers {
+        // Find all shard files for this worker thread
+        let pattern = format!("shard_{}_{}_{}", hostname, pid, wid);
+        let shard_files: Vec<_> = fs::read_dir(out_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.file_name()
+                    .to_string_lossy()
+                    .starts_with(&pattern)
+            })
+            .collect();
+
+        for entry in shard_files {
+            let shard_path = entry.path();
+            let f = File::open(&shard_path)?;
+            let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
+            io::copy(&mut reader, out)?;
+            let _ = fs::remove_file(shard_path);
+        }
     }
 
     Ok(())
@@ -716,22 +757,23 @@ mod tests {
         let tmp = tempdir()?;
         let out_dir = tmp.path().to_path_buf();
         let final_path = out_dir.join("out_unsorted.csv");
+        let pid = 123;
 
-        // Create 2 CSV shard files with headers
-        let shard0 = out_dir.join(format!("shard_{}_0.tmp", get_hostname()));
-        let shard1 = out_dir.join(format!("shard_{}_1.tmp", get_hostname()));
+        // Create 2 CSV shard files with headers - using pid_wid pattern
+        let shard0 = out_dir.join(format!("shard_{}_{}_0.tmp", get_hostname(), pid));
+        let shard1 = out_dir.join(format!("shard_{}_{}_1.tmp", get_hostname(), pid));
 
         {
             let mut w = File::create(&shard0)?;
-            w.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\nb\n")?;
+            w.write_all(b"b\n")?;
         }
         {
             let mut w = File::create(&shard1)?;
-            w.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\na\n")?;
+            w.write_all(b"a\n")?;
         }
 
         // sort_csv = false → just concatenates
-        super::merge_shards(&out_dir, &final_path, 2, OutputFormat::Csv, false)?;
+        super::merge_shards(&out_dir, &final_path, 2, OutputFormat::Csv, false, pid)?;
 
         let mut s = String::new();
         File::open(&final_path)?.read_to_string(&mut s)?;
@@ -748,21 +790,22 @@ mod tests {
         let tmp = tempdir()?;
         let out_dir = tmp.path().to_path_buf();
         let final_path = out_dir.join("out_sorted.csv");
+        let pid = 123;
 
-        // Create 2 CSV shards (out of order)
-        let shard0 = out_dir.join(format!("shard_{}_0.tmp", get_hostname()));
-        let shard1 = out_dir.join(format!("shard_{}_1.tmp", get_hostname()));
+        // Create 2 CSV shards (out of order) - using pid_wid pattern
+        let shard0 = out_dir.join(format!("shard_{}_{}_0.tmp", get_hostname(), pid));
+        let shard1 = out_dir.join(format!("shard_{}_{}_1.tmp", get_hostname(), pid));
         {
             let mut w = File::create(&shard0)?;
-            w.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\nb\n")?;
+            w.write_all(b"b\n")?;
         }
         {
             let mut w = File::create(&shard1)?;
-            w.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\na\n")?;
+            w.write_all(b"a\n")?;
         }
 
         // sort_csv = true → sorted result
-        super::merge_shards(&out_dir, &final_path, 2, OutputFormat::Csv, true)?;
+        super::merge_shards(&out_dir, &final_path, 2, OutputFormat::Csv, true, pid)?;
 
         let mut s = String::new();
         File::open(&final_path)?.read_to_string(&mut s)?;
