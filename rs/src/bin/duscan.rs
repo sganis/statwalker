@@ -69,6 +69,7 @@ struct Args {
 struct Progress {
     files:  AtomicU64,
     errors: AtomicU64,
+
 }
 
 #[derive(Debug)]
@@ -235,12 +236,12 @@ fn main() -> Result<()> {
                     let bar = progress_bar(pct.into(), 25);
                     eprint!(
                         "\r    {} {} {:>3}% | {} files [{} f/s]        \r",
-                        "Progress".cyan().bold(), bar, pct as u32, human_count(f), rate_f
+                        "Progress".bright_cyan(), bar, pct as u32, human_count(f), rate_f
                     );
                 } else {
                     eprint!(
                         "\r    {} : {} files [{} f/s]        \r",
-                        "Progress".cyan().bold(), human_count(f), rate_f
+                        "Progress".bright_cyan(), human_count(f), rate_f
                     );
                 }
                 thread::sleep(Duration::from_millis(1000));
@@ -322,7 +323,7 @@ fn main() -> Result<()> {
     println!("Total disk   : {}", human_bytes(total.bytes));  
     println!("Elapsed time : {}", elapsed_str);
     println!("Files/s      : {:.2}", speed);
-    println!("{}","-".repeat(40).cyan().bold());
+    println!("{}","-".repeat(44).bright_cyan());
     println!("Done.");
     Ok(())
 }
@@ -482,7 +483,7 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
                     Err(_) => { error_count += 1; continue; }
                 }
             };
-
+            
             page.push(FileItem { name, md });
             if page.len() == FILE_CHUNK {
                 inflight.fetch_add(1, Relaxed);

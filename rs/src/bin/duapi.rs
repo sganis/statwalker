@@ -476,7 +476,6 @@ impl InMemoryFSIndex {
 
     /// CSV columns (with header): path,user,age,files,disk,modified
     pub fn load_from_csv(&mut self, path: &Path) -> Result<Vec<String>> {
-
         // Count total lines for progress tracking
         print!("Counting lines in {}... ", path.display());
         std::io::stdout().flush().unwrap(); 

@@ -42,11 +42,11 @@ pub fn print_about() {
     #[cfg(windows)]
     colored::control::set_virtual_terminal(true).unwrap_or(());
 
-    println!("{}","-".repeat(40).cyan().bold());
-    println!("{}", format!("Dutopia      : Superfast filesystem analyzer").cyan().bold());
-    println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", format!("Built        : {}", env!("BUILD_DATE")).cyan().bold());
-    println!("{}","-".repeat(40).cyan().bold());
+    println!("{}","-".repeat(44).bright_cyan());
+    println!("{}", format!("Dutopia      : Superfast filesystem analyzer").bright_cyan());
+    println!("{}", format!("Version      : {}", env!("CARGO_PKG_VERSION")).bright_cyan());
+    println!("{}", format!("Built        : {}", env!("BUILD_DATE")).bright_cyan());
+    println!("{}","-".repeat(44).bright_cyan());
 }
 
 pub fn format_duration(duration: Duration) -> String {
@@ -530,23 +530,30 @@ pub fn is_volume_root(path: &Path) -> bool {
     }
 }
 
-/// Print a progress bar like: [====>     ] 42%
+/// Print a colorized progress bar like: [====>-----] 42%
+/// - Filled: cyan
+/// - Head: bright cyan
+/// - Empty: gray (bright black)
 pub fn progress_bar(pct: f64, width: usize) -> String {
     let pct = pct.clamp(0.0, 100.0);
     let filled = ((pct / 100.0) * width as f64).round() as usize;
-    let mut bar = String::with_capacity(width + 10);
-
+    let body_len = filled.saturating_sub(1); // '=' repeated
+    let has_head = (filled > 0) as usize;    // '>' if any filled
+    let tail_len = width.saturating_sub(body_len + has_head); // '-' repeated
+    let mut bar = String::with_capacity(width + 8);
     bar.push('[');
-    for i in 0..width {
-        if i < filled.saturating_sub(1) {
-            bar.push('=');
-        } else if i == filled.saturating_sub(1) {
-            bar.push('>');
-        } else {
-            bar.push(' ');
-        }
+
+    if body_len > 0 {
+        bar.push_str(&"=".repeat(body_len).bright_cyan().to_string());
+    }
+    if has_head == 1 {
+        bar.push_str(&">".bright_cyan().to_string());
+    }
+    if tail_len > 0 {
+        bar.push_str(&"-".repeat(tail_len).bright_black().to_string());
     }
     bar.push(']');
+
     bar
 }
 
