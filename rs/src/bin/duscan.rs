@@ -68,8 +68,6 @@ struct Args {
 #[derive(Default)]
 struct Progress {
     files:  AtomicU64,
-    errors: AtomicU64,
-
 }
 
 #[derive(Debug)]
@@ -225,7 +223,6 @@ fn main() -> Result<()> {
             loop {
                 if reporting_done.load(Relaxed) { break; }
                 let f = progress_for_reporter.files.load(Relaxed);
-                //let e = progress_for_reporter.errors.load(Relaxed);
                 let elapsed = start_for_reporter.elapsed().as_secs_f64().max(0.001);
                 let rate_f = human_count((f as f64 / elapsed) as u64);                
 
@@ -345,11 +342,8 @@ fn worker(
     let base = BufWriter::with_capacity(32 * 1024 * 1024, file);
     let has_progress = cfg.progress.is_some();  
     let progress = cfg.progress.unwrap_or_default();
-
-    // Header
-    // if !is_bin {
-    //     base.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n").expect("write csv header"); 
-    // }
+    let batch_size = 1000;
+    let mut local_files = 0u64;
 
     // Choose writer: zstd encoder for binary; otherwise the base writer
     let mut writer: Box<dyn Write + Send> = if is_bin {
@@ -361,7 +355,6 @@ fn worker(
 
     // Pre-allocate buffer for record batching
     let mut buf: Vec<u8> = Vec::with_capacity(32 * 1024 * 1024); 
-
     let mut stats = Stats { files: 0, errors: 0, bytes: 0 };
 
     while let Ok(task) = rx.recv() {
@@ -380,7 +373,7 @@ fn worker(
                     } else { 
                         write_row_csv(&mut buf, &dir, &row, cfg.no_atime);
                     }
-                    stats.files += 1;                    
+                    stats.files += 1;                          
                 } else {
                     stats.errors += 1; 
                     error_count += 1;                   
@@ -394,9 +387,11 @@ fn worker(
                 error_count += enum_dir(&dir, &tx, &inflight, cfg.skip.as_deref());
                 stats.errors += error_count;
                 inflight.fetch_sub(1, Relaxed);   
-                if has_progress {
-                    progress.files.fetch_add(1, Relaxed);
-                    progress.errors.fetch_add(error_count, Relaxed);
+
+                local_files += 1;
+                if has_progress && local_files >= batch_size {
+                    progress.files.fetch_add(local_files, Relaxed);
+                    local_files = 0;
                 }
             }
 
@@ -405,8 +400,6 @@ fn worker(
                     inflight.fetch_sub(1, Relaxed);
                     continue;
                 }
-
-                let mut files = 0u64;
 
                 for FileItem { name, md } in &items {
                     let full = base.join(&name);
@@ -417,22 +410,26 @@ fn worker(
                         write_row_csv(&mut buf, &full, &row, cfg.no_atime);
                     }
                     stats.files += 1;
-                    stats.bytes += &row.blocks * 512;
-                    files += 1;
+                    stats.bytes += &row.blocks * 512;                    
+                    local_files += 1;
 
                     if buf.len() >= FLUSH_BYTES {
                         let _ = writer.write_all(&buf);
                         buf.clear();
-                    }
+                    }                    
                 }
-
                 inflight.fetch_sub(1, Relaxed);
 
-                if has_progress {
-                    progress.files.fetch_add(files, Relaxed);                
+                if has_progress && local_files >= batch_size {
+                    progress.files.fetch_add(local_files, Relaxed);
+                    local_files = 0;
                 }
             }
         }
+    }
+    
+    if has_progress && local_files > 0 {
+        progress.files.fetch_add(local_files, Relaxed);
     }
 
     if !buf.is_empty() {
