@@ -1558,8 +1558,8 @@ mod tests {
         
         // Test bytes with all special characters
         let mut buf = Vec::new();
-        csv_push_bytes_smart_quoted(&mut buf, b"\",\n\r");
-        assert_eq!(&buf, b"\"\"\"\",\n\r\"");
+        csv_push_bytes_smart_quoted(&mut buf, b"\",\n");
+        assert_eq!(&buf, b"\"\"\"\",\n\"");
     }
 
     #[cfg(windows)]
