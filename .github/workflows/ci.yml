@@ -104,11 +104,11 @@ jobs:
           git commit -m "chore: bump version to $VERSION" || echo "No changes to commit"
           git push origin HEAD:${GITHUB_REF_NAME}
 
-      - name: Create tag
-        if: ${{ steps.cargo_version.outputs.version != '' }}
-        env:
-          VERSION: ${{ steps.cargo_version.outputs.version }}
-        run: |
-          echo "Tagging v$VERSION"
-          git tag v$VERSION
-          git push origin v$VERSION
+      # - name: Create tag
+      #   if: ${{ steps.cargo_version.outputs.version != '' }}
+      #   env:
+      #     VERSION: ${{ steps.cargo_version.outputs.version }}
+      #   run: |
+      #     echo "Tagging v$VERSION"
+      #     git tag v$VERSION
+      #     git push origin v$VERSION
