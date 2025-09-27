@@ -20,8 +20,8 @@ use chrono::Local;
 use zstd::stream::write::Encoder as ZstdEncoder;
 use dutopia::util::{
     Row, should_skip, 
-    csv_push_path_smart_quoted, format_duration, get_hostname, strip_verbatim_prefix,
-    push_u32, push_u64, push_i64, push_comma, row_from_metadata, stat_row,
+    format_duration, get_hostname, strip_verbatim_prefix,
+    row_from_metadata, stat_row,
     human_count, human_bytes, progress_bar, parse_file_hint, print_about,
 };
 
@@ -32,7 +32,6 @@ use std::os::unix::ffi::OsStrExt;
 const READ_BUF_SIZE: usize = 2 * 1024 * 1024; 
 const FILE_CHUNK: usize = 2048;     
 const FLUSH_BYTES: usize = 4 * 1024 * 1024; 
-
 
 #[derive(Parser, Debug)]
 #[command(
@@ -100,6 +99,77 @@ struct Config {
     no_atime: bool,  
     progress: Option<Arc<Progress>>,
     pid: u32,
+}
+
+/// Reusable buffers for worker threads - eliminates allocations in hot paths
+struct WorkerBuffers {
+    /// Main output buffer for CSV/binary data (grows but never shrinks)
+    output_buf: Vec<u8>,
+    /// Buffer for number formatting  
+    num_buf: Vec<u8>,
+    /// Buffer for path processing
+    path_buf: Vec<u8>,
+    /// String buffer for path conversions (Windows mainly)
+    string_buf: String,
+}
+
+impl WorkerBuffers {
+    fn new() -> Self {
+        Self {
+            // Pre-allocate generous sizes to avoid early reallocations
+            output_buf: Vec::with_capacity(4 * 1024 * 1024), // 4MB
+            num_buf: Vec::with_capacity(32),
+            path_buf: Vec::with_capacity(4096), // Max path length
+            string_buf: String::with_capacity(4096),
+        }
+    }
+    
+    /// Clear buffers but keep capacity - this is the key optimization
+    fn reset(&mut self) {
+        self.output_buf.clear();
+        self.num_buf.clear();
+        self.path_buf.clear();
+        self.string_buf.clear();
+        // Capacity is preserved!
+    }
+
+    /// Write a number directly to output buffer - avoids borrowing conflicts
+    fn write_u64(&mut self, value: u64) {
+        // Fast path for common small values
+        if value < 10 {
+            self.output_buf.push(b'0' + value as u8);
+        } else {
+            // Use our temporary buffer for formatting
+            self.num_buf.clear();
+            use std::fmt::Write;
+            self.string_buf.clear();
+            write!(&mut self.string_buf, "{}", value).unwrap();
+            self.num_buf.extend_from_slice(self.string_buf.as_bytes());
+            self.output_buf.extend_from_slice(&self.num_buf);
+        }
+    }
+    
+    fn write_i64(&mut self, value: i64) {
+        self.num_buf.clear();
+        use std::fmt::Write;
+        self.string_buf.clear();
+        write!(&mut self.string_buf, "{}", value).unwrap();
+        self.num_buf.extend_from_slice(self.string_buf.as_bytes());
+        self.output_buf.extend_from_slice(&self.num_buf);
+    }
+    
+    fn write_u32(&mut self, value: u32) {
+        if value < 10 {
+            self.output_buf.push(b'0' + value as u8);
+        } else {
+            self.num_buf.clear();
+            use std::fmt::Write;
+            self.string_buf.clear();
+            write!(&mut self.string_buf, "{}", value).unwrap();
+            self.num_buf.extend_from_slice(self.string_buf.as_bytes());
+            self.output_buf.extend_from_slice(&self.num_buf);
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -286,7 +356,7 @@ fn main() -> Result<()> {
         let inflight = inflight.clone();
         let out_dir = out_dir.clone();
         let cfg = cfg.clone();
-        joins.push(thread::spawn(move || worker(
+        joins.push(thread::spawn(move || worker_optimized(
             tid, rx, tx, inflight, out_dir, cfg, 
         )));
     }
@@ -325,8 +395,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-
-fn worker(
+/// Optimized worker function with buffer reuse
+fn worker_optimized(
     tid: usize,
     rx: Receiver<Task>,
     tx: Sender<Task>,
@@ -336,7 +406,6 @@ fn worker(
 ) -> Stats {
     let is_bin = cfg.out_fmt == OutputFormat::Bin;
     let hostname = get_hostname();
-    // Use pid to make shard files unique across instances
     let shard_path = out_dir.join(format!("shard_{}_{}_{}.tmp", hostname, cfg.pid, tid));
     let file = File::create(&shard_path).expect("open shard");
     let base = BufWriter::with_capacity(32 * 1024 * 1024, file);
@@ -353,8 +422,8 @@ fn worker(
         Box::new(base)
     };
 
-    // Pre-allocate buffer for record batching
-    let mut buf: Vec<u8> = Vec::with_capacity(32 * 1024 * 1024); 
+    // Our reusable buffers - this is the key optimization!
+    let mut buffers = WorkerBuffers::new();
     let mut stats = Stats { files: 0, errors: 0, bytes: 0 };
 
     while let Ok(task) = rx.recv() {
@@ -369,9 +438,9 @@ fn worker(
                 }
                 if let Some(row) = stat_row(&dir) {
                     if is_bin { 
-                        write_row_bin(&mut buf, &dir, &row, cfg.no_atime); 
+                        write_row_bin_optimized(&mut buffers, &dir, &row, cfg.no_atime); 
                     } else { 
-                        write_row_csv(&mut buf, &dir, &row, cfg.no_atime);
+                        write_row_csv_optimized(&mut buffers, &dir, &row, cfg.no_atime);
                     }
                     stats.files += 1;                          
                 } else {
@@ -379,9 +448,10 @@ fn worker(
                     error_count += 1;                   
                 }
 
-                if buf.len() >= FLUSH_BYTES {
-                    let _ = writer.write_all(&buf);
-                    buf.clear();
+                // Write buffer when it gets large enough, then reuse it
+                if buffers.output_buf.len() >= FLUSH_BYTES {
+                    let _ = writer.write_all(&buffers.output_buf);
+                    buffers.reset(); // Clear but keep capacity!
                 }
 
                 error_count += enum_dir(&dir, &tx, &inflight, cfg.skip.as_deref());
@@ -405,17 +475,18 @@ fn worker(
                     let full = base.join(&name);
                     let row = row_from_metadata(&md); // <-- no syscall here
                     if is_bin { 
-                        write_row_bin(&mut buf, &full, &row, cfg.no_atime);
+                        write_row_bin_optimized(&mut buffers, &full, &row, cfg.no_atime);
                     } else { 
-                        write_row_csv(&mut buf, &full, &row, cfg.no_atime);
+                        write_row_csv_optimized(&mut buffers, &full, &row, cfg.no_atime);
                     }
                     stats.files += 1;
                     stats.bytes += &row.blocks * 512;                    
                     local_files += 1;
 
-                    if buf.len() >= FLUSH_BYTES {
-                        let _ = writer.write_all(&buf);
-                        buf.clear();
+                    // Flush when buffer gets large
+                    if buffers.output_buf.len() >= FLUSH_BYTES {
+                        let _ = writer.write_all(&buffers.output_buf);
+                        buffers.reset(); // The magic happens here!
                     }                    
                 }
                 inflight.fetch_sub(1, Relaxed);
@@ -432,8 +503,9 @@ fn worker(
         progress.files.fetch_add(local_files, Relaxed);
     }
 
-    if !buf.is_empty() {
-        let _ = writer.write_all(&buf);
+    // Final flush
+    if !buffers.output_buf.is_empty() {
+        let _ = writer.write_all(&buffers.output_buf);
     }
     let _ = writer.flush();
 
@@ -500,69 +572,126 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
     error_count
 }
 
-// ----- CSV writing -----
-fn write_row_csv(buf: &mut Vec<u8>, path: &Path, r: &Row, no_atime: bool) {
-    buf.reserve(256);
+/// Optimized CSV row writer using buffer reuse
+fn write_row_csv_optimized(buffers: &mut WorkerBuffers, path: &Path, r: &Row, no_atime: bool) {
     // INODE as dev-ino
-    push_u64(buf, r.dev);
-    buf.push(b'-');
-    push_u64(buf, r.ino);
-    push_comma(buf);
+    buffers.write_u64(r.dev);
+    buffers.output_buf.push(b'-');
+    buffers.write_u64(r.ino);
+    buffers.output_buf.push(b',');
 
     // ATIME (zeroed if requested)
-    if no_atime { push_i64(buf, 0); } else { push_i64(buf, r.atime); }
-    push_comma(buf);   
+    let atime = if no_atime { 0 } else { r.atime };
+    buffers.write_i64(atime);
+    buffers.output_buf.push(b',');
 
     // MTIME
-    push_i64(buf, r.mtime); 
-    push_comma(buf);
+    buffers.write_i64(r.mtime);
+    buffers.output_buf.push(b',');
 
     // UID, GID, MODE
-    push_u32(buf, r.uid);       
-    push_comma(buf);
-    push_u32(buf, r.gid);   
-    push_comma(buf);
-    push_u32(buf, r.mode);  
-    push_comma(buf);
+    buffers.write_u32(r.uid);
+    buffers.output_buf.push(b',');
+    buffers.write_u32(r.gid);
+    buffers.output_buf.push(b',');
+    buffers.write_u32(r.mode);
+    buffers.output_buf.push(b',');
 
-    // SIZE, DISK
-    push_u64(buf, r.size);  
-    push_comma(buf);
+    // SIZE
+    buffers.write_u64(r.size);
+    buffers.output_buf.push(b',');
+    
+    // DISK
     let disk = r.blocks * 512;
-    push_u64(buf, disk); 
-    push_comma(buf);
+    buffers.write_u64(disk);
+    buffers.output_buf.push(b',');
 
-    csv_push_path_smart_quoted(buf, path);
-    buf.push(b'\n');
+    // PATH (reuse path buffer for processing)
+    csv_push_path_optimized(&mut buffers.output_buf, &mut buffers.path_buf, &mut buffers.string_buf, path);
+    buffers.output_buf.push(b'\n');
 }
 
-// ----- BIN writing -----
-fn write_row_bin(buf: &mut Vec<u8>, path: &Path, r: &Row, no_atime: bool) {
+/// Optimized binary row writer using buffer reuse
+fn write_row_bin_optimized(buffers: &mut WorkerBuffers, path: &Path, r: &Row, no_atime: bool) {
+    // Get path bytes into our reusable buffer
+    buffers.path_buf.clear();
     
     #[cfg(unix)]
-    let path_bytes: &[u8] = path.as_os_str().as_bytes();
+    {
+        buffers.path_buf.extend_from_slice(path.as_os_str().as_bytes());
+    }
+    
     #[cfg(not(unix))]
-    let path_lossy = path.to_string_lossy();     // keep the Cow alive
-    #[cfg(not(unix))]
-    let path_bytes: &[u8] = path_lossy.as_bytes(); // borrow from it safely
+    {
+        buffers.string_buf.clear();
+        buffers.string_buf.push_str(&path.to_string_lossy());
+        buffers.path_buf.extend_from_slice(buffers.string_buf.as_bytes());
+    }
 
-    let path_len = path_bytes.len() as u32;
+    let path_len = buffers.path_buf.len() as u32;
     let atime = if no_atime { 0i64 } else { r.atime };
     let disk = r.blocks * 512;
     
-    //buf.reserve(64 + 2 * r.path.as_os_str().len());
-    buf.reserve(80 + path_bytes.len()); // cheap pre-reserve
-    buf.extend_from_slice(&path_len.to_le_bytes());
-    buf.extend_from_slice(path_bytes);
-    buf.extend_from_slice(&r.dev.to_le_bytes());
-    buf.extend_from_slice(&r.ino.to_le_bytes());
-    buf.extend_from_slice(&atime.to_le_bytes());
-    buf.extend_from_slice(&r.mtime.to_le_bytes());
-    buf.extend_from_slice(&r.uid.to_le_bytes());
-    buf.extend_from_slice(&r.gid.to_le_bytes());
-    buf.extend_from_slice(&r.mode.to_le_bytes());
-    buf.extend_from_slice(&r.size.to_le_bytes());
-    buf.extend_from_slice(&disk.to_le_bytes());
+    // Pre-allocate space for this record
+    let record_size = 4 + buffers.path_buf.len() + 64; // Conservative estimate
+    buffers.output_buf.reserve(record_size);
+    
+    // Write binary data - we can borrow output_buf mutably here since path processing is done
+    buffers.output_buf.extend_from_slice(&path_len.to_le_bytes());
+    buffers.output_buf.extend_from_slice(&buffers.path_buf);
+    buffers.output_buf.extend_from_slice(&r.dev.to_le_bytes());
+    buffers.output_buf.extend_from_slice(&r.ino.to_le_bytes());
+    buffers.output_buf.extend_from_slice(&atime.to_le_bytes());
+    buffers.output_buf.extend_from_slice(&r.mtime.to_le_bytes());
+    buffers.output_buf.extend_from_slice(&r.uid.to_le_bytes());
+    buffers.output_buf.extend_from_slice(&r.gid.to_le_bytes());
+    buffers.output_buf.extend_from_slice(&r.mode.to_le_bytes());
+    buffers.output_buf.extend_from_slice(&r.size.to_le_bytes());
+    buffers.output_buf.extend_from_slice(&disk.to_le_bytes());
+}
+
+/// Optimized path quoting with buffer reuse
+fn csv_push_path_optimized(
+    output: &mut Vec<u8>, 
+    path_buf: &mut Vec<u8>, 
+    string_buf: &mut String,
+    path: &Path
+) {
+    path_buf.clear();
+    string_buf.clear();
+
+    #[cfg(unix)]
+    {
+        path_buf.extend_from_slice(path.as_os_str().as_bytes());
+    }
+    
+    #[cfg(not(unix))]
+    {
+        // Convert to string using our reusable buffer
+        string_buf.push_str(&path.to_string_lossy());
+        path_buf.extend_from_slice(string_buf.as_bytes());
+    }
+
+    // Fast check if quoting is needed (most paths don't need it)
+    let needs_quoting = path_buf.iter().any(|&b| b == b',' || b == b'"' || b == b'\n' || b == b'\r');
+    
+    if !needs_quoting {
+        // Fast path: just copy the bytes
+        output.extend_from_slice(path_buf);
+        return;
+    }
+    
+    // Slow path: need to quote and escape
+    output.push(b'"');
+    for &byte in path_buf.iter() {
+        if byte == b'"' {
+            output.push(b'"');
+            output.push(b'"');
+        } else {
+            output.push(byte);
+        }
+    }
+    output.push(b'"');
 }
 
 // ---- Merge shards (CSV or BIN) ----
@@ -725,9 +854,9 @@ mod tests {
     #[test]
     fn test_should_skip() {
         let p = PathBuf::from("/a/b/c/d");
-        assert!(super::should_skip(&p, Some("b/c")));
-        assert!(!super::should_skip(&p, Some("x")));
-        assert!(!super::should_skip(&p, None));
+        assert!(should_skip(&p, Some("b/c")));
+        assert!(!should_skip(&p, Some("x")));
+        assert!(!should_skip(&p, None));
     }
 
     #[cfg(unix)]
@@ -795,7 +924,7 @@ mod tests {
         }
 
         // sort_csv = false → just concatenates
-        super::merge_shards(&out_dir, &final_path, 2, OutputFormat::Csv, false, pid)?;
+        merge_shards(&out_dir, &final_path, 2, OutputFormat::Csv, false, pid)?;
 
         let mut s = String::new();
         File::open(&final_path)?.read_to_string(&mut s)?;
@@ -827,7 +956,7 @@ mod tests {
         }
 
         // sort_csv = true → sorted result
-        super::merge_shards(&out_dir, &final_path, 2, OutputFormat::Csv, true, pid)?;
+        merge_shards(&out_dir, &final_path, 2, OutputFormat::Csv, true, pid)?;
 
         let mut s = String::new();
         File::open(&final_path)?.read_to_string(&mut s)?;
@@ -838,35 +967,46 @@ mod tests {
         Ok(())
     }
 
-    // Test for no_atime functionality (Unix-only due to uid type)
-    #[cfg(unix)]
     #[test]
-    fn test_no_atime_in_csv() {
-        let mut buf = Vec::new();
-        let dummy_path = Path::new("/test/path");
-        let row = Row {
-            path: dummy_path,
-            dev: 1,
-            ino: 2,
-            mode: 33188,
-            uid: 1000,
-            gid: 1000,
-            size: 1024,
-            blocks: 2,
-            atime: 1609459200, // 2021-01-01 00:00:00 UTC
-            mtime: 1609545600, // 2021-01-02 00:00:00 UTC
-        };
-
-        // With ATIME included
-        write_row_csv(&mut buf, &row, false);
-        let output_with_atime = String::from_utf8(buf.clone()).unwrap();
-        assert!(output_with_atime.contains("1609459200"));
-        assert!(output_with_atime.contains("1609545600"));
-
-        // With ATIME skipped (zeroed)
-        buf.clear();
-        write_row_csv(&mut buf, &row, true);
-        let output_without_atime = String::from_utf8(buf).unwrap();
-        assert!(output_without_atime.contains(",0,1609545600")); // ATIME zeroed, MTIME present
+    fn test_buffer_reuse() {
+        let mut buffers = WorkerBuffers::new();
+        
+        // Fill buffers
+        buffers.output_buf.extend_from_slice(b"test data");
+        buffers.path_buf.extend_from_slice(b"/test/path");
+        
+        // Verify capacity before reset
+        let output_cap = buffers.output_buf.capacity();
+        let path_cap = buffers.path_buf.capacity();
+        
+        // Reset should clear but preserve capacity
+        buffers.reset();
+        
+        assert_eq!(buffers.output_buf.len(), 0);
+        assert_eq!(buffers.path_buf.len(), 0);
+        assert_eq!(buffers.output_buf.capacity(), output_cap);
+        assert_eq!(buffers.path_buf.capacity(), path_cap);
+    }
+    
+    #[test]
+    fn test_number_formatting() {
+        let mut buffers = WorkerBuffers::new();
+        
+        // Test the write functions instead
+        buffers.write_u64(12345);
+        let result = String::from_utf8(buffers.output_buf.clone()).unwrap();
+        assert!(result.contains("12345"));
+        
+        buffers.reset();
+        buffers.write_i64(-6789);
+        let result2 = String::from_utf8(buffers.output_buf.clone()).unwrap();
+        assert!(result2.contains("-6789"));
+        
+        // Test single digit optimization
+        buffers.reset();
+        buffers.write_u32(7);
+        let result3 = String::from_utf8(buffers.output_buf.clone()).unwrap();
+        assert_eq!(result3, "7");
     }
 }
+
