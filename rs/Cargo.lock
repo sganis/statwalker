@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "dutopia"
-version = "3.0.44"
+version = "3.0.45"
 dependencies = [
  "anyhow",
  "atoi",
