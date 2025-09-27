@@ -8,13 +8,13 @@ import statistics
 TEST_DIR = "testdata"            # Folder to scan
 RUNS = 5                         # Number of times to run each exe
 PATTERN = "*.exe"                # Match all executables
-BINARY_PREFIX = "duscan.exe-"        # Filter prefix; set "" to include all .exe
+BINARY_PREFIX = "duscan-"        # Filter prefix; set "" to include all .exe
 
 def supports_q(exe_path: Path) -> bool:
     """Check if executable supports the --quiet flag."""
     try:
         result = subprocess.run(
-            [str(exe_path), "--help"],
+            [str(f'./{exe_path}'), "--help"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
