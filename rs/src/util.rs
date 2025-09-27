@@ -1,7 +1,5 @@
 // util.rs - Utility functions for the filesystem scanner
 use std::{
-    //ffi::OsStr,
-    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -150,11 +148,6 @@ thread_local! {
     static I64BUF: std::cell::RefCell<Buffer> = std::cell::RefCell::new(Buffer::new());
 }
 
-#[inline] 
-pub fn push_comma(buf: &mut Vec<u8>) { 
-    buf.push(b','); 
-}
-
 #[inline]
 pub fn push_u32(out: &mut Vec<u8>, v: u32) {
     U32BUF.with(|b| {
@@ -176,173 +169,6 @@ pub fn push_i64(out: &mut Vec<u8>, v: i64) {
         let mut b = b.borrow_mut();
         out.extend_from_slice(b.format(v).as_bytes());
     });
-}
-
-
-pub fn csv_push_path_smart_quoted(buf: &mut Vec<u8>, p: &Path) {
-    #[cfg(unix)]
-    {
-        let bytes = p.as_os_str().as_bytes();
-        csv_push_bytes_smart_quoted(buf, bytes);
-    }
-    #[cfg(not(unix))]
-    {
-        let s = p.to_string_lossy();
-        csv_push_str_smart_quoted(buf, &s);
-    }
-}
-
-#[cfg(unix)]
-pub fn csv_push_bytes_smart_quoted(buf: &mut Vec<u8>, bytes: &[u8]) {
-    let needs_quoting = bytes.iter().any(|&b| b == b'"' || b == b',' || b == b'\n' || b == b'\r');
-    if !needs_quoting {
-        buf.extend_from_slice(bytes);
-    } else {
-        buf.push(b'"');
-        if !bytes.contains(&b'"') {
-            buf.extend_from_slice(bytes);
-        } else {
-            buf.reserve(bytes.len() + bytes.iter().filter(|&&b| b == b'"').count());
-            for &b in bytes {
-                if b == b'"' {
-                    buf.push(b'"');
-                    buf.push(b'"');
-                } else {
-                    buf.push(b);
-                }
-            }
-        }
-        buf.push(b'"');
-    }
-}
-
-#[cfg(windows)]
-pub fn csv_push_str_smart_quoted(buf: &mut Vec<u8>, s: &str) {
-    let normalized = if s.starts_with(r"\\?\") {
-        if s.starts_with(r"\\?\UNC\") { 
-            format!(r"\\{}", &s[8..]) 
-        } else { 
-            s[4..].to_string() 
-        }
-    } else { 
-        s.to_string() 
-    };
-    let display_str = normalized.as_str();
-    let needs_quoting = display_str.chars().any(|c| c == '"' || c == ',' || c == '\n' || c == '\r');
-    if !needs_quoting {
-        buf.extend_from_slice(display_str.as_bytes());
-    } else {
-        buf.push(b'"');
-        if !display_str.contains('"') {
-            buf.extend_from_slice(display_str.as_bytes());
-        } else {
-            let quote_count = display_str.matches('"').count();
-            buf.reserve(display_str.len() + quote_count);
-            for b in display_str.bytes() {
-                if b == b'"' {
-                    buf.push(b'"'); 
-                    buf.push(b'"');
-                } else {
-                    buf.push(b);
-                }
-            }
-        }
-        buf.push(b'"');
-    }
-}
-
-// ============================================================================
-// Metadata and File Stats
-// ============================================================================
-pub fn row_from_metadata(md: &fs::Metadata) -> Row {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Row {
-            //path,
-            dev: md.dev(),
-            ino: md.ino(),
-            mode: md.mode(),
-            uid: md.uid(),
-            gid: md.gid(),
-            size: md.size(),
-            blocks: md.blocks() as u64,
-            atime: md.atime(),
-            mtime: md.mtime(),
-        }
-    }
-    #[cfg(windows)]
-    {
-        //use std::os::windows::fs::MetadataExt;
-        use std::time::SystemTime;
-
-        let to_unix = |t: SystemTime| -> i64 {
-            t.duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0)
-        };
-        let atime = md.accessed().ok().map(to_unix).unwrap_or(0);
-        let mtime = md.modified().ok().map(to_unix).unwrap_or(0);
-        let blocks = (md.len() + 511) / 512;
-
-        //let file_attributes = md.file_attributes();
-        //const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
-
-        // let is_file = md.is_file();
-        // let mut mode = if is_file { 0o100000 } else { 0o040000 };
-        // mode |= 0o400; // Owner read
-        // if (file_attributes & FILE_ATTRIBUTE_READONLY) == 0 { 
-        //     mode |= 0o200; 
-        // }
-        // if is_file {
-        //     if let Some(ext) = path.extension() {
-        //         match ext.to_str().unwrap_or("").to_lowercase().as_str() {
-        //             "exe" | "bat" | "cmd" | "com" | "scr" | "ps1" | "vbs" => mode |= 0o100,
-        //             _ => {}
-        //         }
-        //     }
-        // } else {
-        //     mode |= 0o100;
-        // }
-        // let owner = mode & 0o700;
-        // mode |= (owner >> 3) | (owner >> 6);
-        
-        // very expensive and problematic
-        //let uid = get_rid(path).unwrap_or(0);
-        
-        Row {
-            //path, 
-            dev: 0, 
-            ino: 0, 
-            mode: 0, 
-            uid: 0, 
-            gid: 0,
-            size: md.len(), 
-            blocks, 
-            atime, 
-            mtime,
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        Row { 
-            //path, 
-            dev: 0, 
-            ino: 0, 
-            mode: 0, 
-            uid: 0, 
-            gid: 0, 
-            size: md.len(), 
-            blocks: 0, 
-            atime: 0, 
-            mtime: 0 
-        }
-    }
-}
-
-pub fn stat_row(path: &Path) -> Option<Row> {
-    let md = fs::symlink_metadata(path).ok()?;
-    Some(row_from_metadata(&md))
 }
 
 // ============================================================================
