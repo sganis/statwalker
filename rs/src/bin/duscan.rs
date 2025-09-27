@@ -1195,8 +1195,7 @@ mod tests {
         {
             assert!(row.dev > 0);
             assert!(row.ino > 0);
-            assert!(row.uid >= 0);
-            assert!(row.gid >= 0);
+            // uid and gid are u32, so they're always >= 0
             assert!(row.mode > 0);
         }
         
