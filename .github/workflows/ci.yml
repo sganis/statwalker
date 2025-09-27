@@ -92,6 +92,8 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Commit and push version bump
+        env:
+          VERSION: ${{ steps.cargo_version.outputs.version }}
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
