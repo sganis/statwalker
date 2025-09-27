@@ -26,7 +26,7 @@ def supports_q(exe_path: Path) -> bool:
 
 def run_once(exe_path: Path, use_q: bool) -> float | None:
     """Run the executable once and extract Files/s value."""
-    cmd = [str(exe_path)]
+    cmd = [str(f'{exe_path}')]
     if use_q:
         cmd.append("--quiet")
     cmd.append(TEST_DIR)
