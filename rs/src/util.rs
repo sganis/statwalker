@@ -57,6 +57,7 @@ pub fn format_duration(duration: Duration) -> String {
         format!("{}h {:02}m {:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
     }
 }
+
 pub fn human_count(n: u64) -> String {
     const UNITS: [&str; 5] = ["", "K", "M", "B", "T"];
     let mut val = n as f64;
@@ -75,7 +76,6 @@ pub fn human_count(n: u64) -> String {
         format!("{:.1}{}", val, UNITS[unit])
     }
 }
-
 
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];

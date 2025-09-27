@@ -834,12 +834,6 @@ mod tests {
     use std::io::Read;
     use tempfile::tempdir;
     
-    #[cfg(windows)]
-    use dutopia::util::csv_push_str_smart_quoted;
-
-    #[cfg(unix)]
-    use dutopia::util::csv_push_bytes_smart_quoted;
-    
     #[test]
     fn test_should_skip() {
         let p = PathBuf::from("/a/b/c/d");
