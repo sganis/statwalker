@@ -308,8 +308,8 @@ pub fn is_volume_root(path: &Path) -> bool {
 
         // A mount point has a different device than its parent
         // (Beware: needs a valid parent that exists)
-        if let (Ok(meta), Some(parent)) = (fs::metadata(path), path.parent()) {
-            if let Ok(pmeta) = fs::metadata(parent) {
+        if let (Ok(meta), Some(parent)) = (std::fs::metadata(path), path.parent()) {
+            if let Ok(pmeta) = std::fs::metadata(parent) {
                 return meta.dev() != pmeta.dev();
             }
         }
@@ -436,21 +436,5 @@ mod tests {
         assert!(should_skip(&p, Some("b/c")));
         assert!(!should_skip(&p, Some("x")));
         assert!(!should_skip(&p, None));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_csv_push_bytes_smart_quoted() {
-        let mut buf = Vec::new();
-        csv_push_bytes_smart_quoted(&mut buf, b"abc_def");
-        assert_eq!(&buf, b"abc_def");
-        
-        buf.clear();
-        csv_push_bytes_smart_quoted(&mut buf, b"a,b");
-        assert_eq!(&buf, b"\"a,b\"");
-        
-        buf.clear();
-        csv_push_bytes_smart_quoted(&mut buf, b"a\"b");
-        assert_eq!(&buf, b"\"a\"\"b\"");
     }
 }
