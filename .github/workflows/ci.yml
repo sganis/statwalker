@@ -86,22 +86,28 @@ jobs:
 
       - name: Get new version
         id: cargo_version
+        working-directory: rs
         run: |
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Detected version: $VERSION"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Commit and push version bump
         env:
           VERSION: ${{ steps.cargo_version.outputs.version }}
         run: |
+          echo "Committing version bump to $VERSION"
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add rs/Cargo.toml rs/Cargo.lock
           git commit -m "chore: bump version to $VERSION" || echo "No changes to commit"
           git push origin HEAD:${GITHUB_REF_NAME}
 
-      # - name: Create tag
-      #   run: |
-      #     git tag v${VERSION}
-      #     git push origin v${VERSION}
+      - name: Create tag
+        if: ${{ steps.cargo_version.outputs.version != '' }}
+        env:
+          VERSION: ${{ steps.cargo_version.outputs.version }}
+        run: |
+          echo "Tagging v$VERSION"
+          git tag v$VERSION
+          git push origin v$VERSION
