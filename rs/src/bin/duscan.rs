@@ -1549,17 +1549,18 @@ mod tests {
         // Test with only quote character
         let mut buf = Vec::new();
         csv_push_bytes_smart_quoted(&mut buf, b"\"");
-        assert_eq!(&buf, b"\"\"\"\"");
+        assert_eq!(&buf, b"\"\"\"\""); // Wrapping quotes + doubled inner quote = """"
         
         // Test empty bytes
         let mut buf = Vec::new();
         csv_push_bytes_smart_quoted(&mut buf, b"");
         assert_eq!(&buf, b"");
         
-        // Test bytes with all special characters
+        // Test bytes with all special characters: quote, comma, newline, carriage return
         let mut buf = Vec::new();
-        csv_push_bytes_smart_quoted(&mut buf, b"\",\n");
-        assert_eq!(&buf, b"\"\"\"\",\n\"");
+        csv_push_bytes_smart_quoted(&mut buf, b"\",\n\r");
+        // Should be: wrapping quote + doubled quote + comma + newline + carriage return + wrapping quote
+        assert_eq!(&buf, b"\"\"\",\n\r\"");
     }
 
     #[cfg(windows)]
