@@ -19,7 +19,7 @@ use colored::Colorize;
 use chrono::Local;
 use zstd::stream::write::Encoder as ZstdEncoder;
 use dutopia::util::{
-    Row, should_skip, push_comma, push_u32, push_u64, push_i64,
+    Row, should_skip, push_u32, push_u64, push_i64,
     format_duration, get_hostname, strip_verbatim_prefix,
     row_from_metadata, stat_row, csv_push_path_smart_quoted,
     human_count, human_bytes, progress_bar, parse_file_hint, print_about,
@@ -499,30 +499,30 @@ fn write_row_csv(buf: &mut Vec<u8>, path: &Path, r: &Row, no_atime: bool) {
     push_u64(buf, r.dev);
     buf.push(b'-');
     push_u64(buf, r.ino);
-    push_comma(buf);
+    buf.push(b',');
 
     // ATIME (zeroed if requested)
     if no_atime { push_i64(buf, 0); } else { push_i64(buf, r.atime); }
-    push_comma(buf);   
+    buf.push(b',');   
 
     // MTIME
     push_i64(buf, r.mtime); 
-    push_comma(buf);
+    buf.push(b',');
 
     // UID, GID, MODE
     push_u32(buf, r.uid);       
-    push_comma(buf);
+    buf.push(b',');
     push_u32(buf, r.gid);   
-    push_comma(buf);
+    buf.push(b',');
     push_u32(buf, r.mode);  
-    push_comma(buf);
+    buf.push(b',');
 
     // SIZE, DISK
     push_u64(buf, r.size);  
-    push_comma(buf);
+    buf.push(b',');
     let disk = r.blocks * 512;
     push_u64(buf, disk); 
-    push_comma(buf);
+    buf.push(b',');
 
     csv_push_path_smart_quoted(buf, path);
     buf.push(b'\n');
