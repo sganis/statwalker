@@ -19,9 +19,9 @@ use colored::Colorize;
 use chrono::Local;
 use zstd::stream::write::Encoder as ZstdEncoder;
 use dutopia::util::{
-    Row, should_skip, 
+    Row, should_skip, push_comma, push_u32, push_u64, push_i64,
     format_duration, get_hostname, strip_verbatim_prefix,
-    row_from_metadata, stat_row,
+    row_from_metadata, stat_row, csv_push_path_smart_quoted,
     human_count, human_bytes, progress_bar, parse_file_hint, print_about,
 };
 
@@ -99,77 +99,6 @@ struct Config {
     no_atime: bool,  
     progress: Option<Arc<Progress>>,
     pid: u32,
-}
-
-/// Reusable buffers for worker threads - eliminates allocations in hot paths
-struct WorkerBuffers {
-    /// Main output buffer for CSV/binary data (grows but never shrinks)
-    output_buf: Vec<u8>,
-    /// Buffer for number formatting  
-    num_buf: Vec<u8>,
-    /// Buffer for path processing
-    path_buf: Vec<u8>,
-    /// String buffer for path conversions (Windows mainly)
-    string_buf: String,
-}
-
-impl WorkerBuffers {
-    fn new() -> Self {
-        Self {
-            // Pre-allocate generous sizes to avoid early reallocations
-            output_buf: Vec::with_capacity(4 * 1024 * 1024), // 4MB
-            num_buf: Vec::with_capacity(32),
-            path_buf: Vec::with_capacity(4096), // Max path length
-            string_buf: String::with_capacity(4096),
-        }
-    }
-    
-    /// Clear buffers but keep capacity - this is the key optimization
-    fn reset(&mut self) {
-        self.output_buf.clear();
-        self.num_buf.clear();
-        self.path_buf.clear();
-        self.string_buf.clear();
-        // Capacity is preserved!
-    }
-
-    /// Write a number directly to output buffer - avoids borrowing conflicts
-    fn write_u64(&mut self, value: u64) {
-        // Fast path for common small values
-        if value < 10 {
-            self.output_buf.push(b'0' + value as u8);
-        } else {
-            // Use our temporary buffer for formatting
-            self.num_buf.clear();
-            use std::fmt::Write;
-            self.string_buf.clear();
-            write!(&mut self.string_buf, "{}", value).unwrap();
-            self.num_buf.extend_from_slice(self.string_buf.as_bytes());
-            self.output_buf.extend_from_slice(&self.num_buf);
-        }
-    }
-    
-    fn write_i64(&mut self, value: i64) {
-        self.num_buf.clear();
-        use std::fmt::Write;
-        self.string_buf.clear();
-        write!(&mut self.string_buf, "{}", value).unwrap();
-        self.num_buf.extend_from_slice(self.string_buf.as_bytes());
-        self.output_buf.extend_from_slice(&self.num_buf);
-    }
-    
-    fn write_u32(&mut self, value: u32) {
-        if value < 10 {
-            self.output_buf.push(b'0' + value as u8);
-        } else {
-            self.num_buf.clear();
-            use std::fmt::Write;
-            self.string_buf.clear();
-            write!(&mut self.string_buf, "{}", value).unwrap();
-            self.num_buf.extend_from_slice(self.string_buf.as_bytes());
-            self.output_buf.extend_from_slice(&self.num_buf);
-        }
-    }
 }
 
 fn main() -> Result<()> {
@@ -356,7 +285,7 @@ fn main() -> Result<()> {
         let inflight = inflight.clone();
         let out_dir = out_dir.clone();
         let cfg = cfg.clone();
-        joins.push(thread::spawn(move || worker_optimized(
+        joins.push(thread::spawn(move || worker(
             tid, rx, tx, inflight, out_dir, cfg, 
         )));
     }
@@ -395,8 +324,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Optimized worker function with buffer reuse
-fn worker_optimized(
+
+fn worker(
     tid: usize,
     rx: Receiver<Task>,
     tx: Sender<Task>,
@@ -406,13 +335,13 @@ fn worker_optimized(
 ) -> Stats {
     let is_bin = cfg.out_fmt == OutputFormat::Bin;
     let hostname = get_hostname();
-    let shard_path = out_dir.join(format!("shard_{}_{}_{}.tmp", hostname, cfg.pid, tid));
+    let pid = cfg.pid;
+    let shard_path = out_dir.join(format!("shard_{hostname}_{pid}_{tid}.tmp"));
     let file = File::create(&shard_path).expect("open shard");
     let base = BufWriter::with_capacity(32 * 1024 * 1024, file);
     let has_progress = cfg.progress.is_some();  
     let progress = cfg.progress.unwrap_or_default();
-    let batch_size = 1000;
-    let mut local_files = 0u64;
+    
 
     // Choose writer: zstd encoder for binary; otherwise the base writer
     let mut writer: Box<dyn Write + Send> = if is_bin {
@@ -422,8 +351,9 @@ fn worker_optimized(
         Box::new(base)
     };
 
-    // Our reusable buffers - this is the key optimization!
-    let mut buffers = WorkerBuffers::new();
+    // Pre-allocate buffer for record batching
+    let mut buf: Vec<u8> = Vec::with_capacity(32 * 1024 * 1024); 
+
     let mut stats = Stats { files: 0, errors: 0, bytes: 0 };
 
     while let Ok(task) = rx.recv() {
@@ -438,30 +368,26 @@ fn worker_optimized(
                 }
                 if let Some(row) = stat_row(&dir) {
                     if is_bin { 
-                        write_row_bin_optimized(&mut buffers, &dir, &row, cfg.no_atime); 
+                        write_row_bin(&mut buf, &dir, &row, cfg.no_atime); 
                     } else { 
-                        write_row_csv_optimized(&mut buffers, &dir, &row, cfg.no_atime);
+                        write_row_csv(&mut buf, &dir, &row, cfg.no_atime);
                     }
-                    stats.files += 1;                          
+                    stats.files += 1;                    
                 } else {
                     stats.errors += 1; 
                     error_count += 1;                   
                 }
 
-                // Write buffer when it gets large enough, then reuse it
-                if buffers.output_buf.len() >= FLUSH_BYTES {
-                    let _ = writer.write_all(&buffers.output_buf);
-                    buffers.reset(); // Clear but keep capacity!
+                if buf.len() >= FLUSH_BYTES {
+                    let _ = writer.write_all(&buf);
+                    buf.clear();
                 }
 
                 error_count += enum_dir(&dir, &tx, &inflight, cfg.skip.as_deref());
                 stats.errors += error_count;
                 inflight.fetch_sub(1, Relaxed);   
-
-                local_files += 1;
-                if has_progress && local_files >= batch_size {
-                    progress.files.fetch_add(local_files, Relaxed);
-                    local_files = 0;
+                if has_progress {
+                    progress.files.fetch_add(1, Relaxed);
                 }
             }
 
@@ -470,47 +396,40 @@ fn worker_optimized(
                     inflight.fetch_sub(1, Relaxed);
                     continue;
                 }
+                let mut files = 0u64;
 
                 for FileItem { name, md } in &items {
                     let full = base.join(&name);
-                    let row = row_from_metadata(&md); // <-- no syscall here
+                    let row = row_from_metadata(&md);
                     if is_bin { 
-                        write_row_bin_optimized(&mut buffers, &full, &row, cfg.no_atime);
+                        write_row_bin(&mut buf, &full, &row, cfg.no_atime);
                     } else { 
-                        write_row_csv_optimized(&mut buffers, &full, &row, cfg.no_atime);
+                        write_row_csv(&mut buf, &full, &row, cfg.no_atime);
                     }
                     stats.files += 1;
-                    stats.bytes += &row.blocks * 512;                    
-                    local_files += 1;
-
-                    // Flush when buffer gets large
-                    if buffers.output_buf.len() >= FLUSH_BYTES {
-                        let _ = writer.write_all(&buffers.output_buf);
-                        buffers.reset(); // The magic happens here!
-                    }                    
+                    stats.bytes += &row.size;
+                    files += 1;
+                    if buf.len() >= FLUSH_BYTES {
+                        let _ = writer.write_all(&buf);
+                        buf.clear();
+                    }
                 }
                 inflight.fetch_sub(1, Relaxed);
-
-                if has_progress && local_files >= batch_size {
-                    progress.files.fetch_add(local_files, Relaxed);
-                    local_files = 0;
+                if has_progress {
+                    progress.files.fetch_add(files, Relaxed);                 
                 }
             }
         }
     }
-    
-    if has_progress && local_files > 0 {
-        progress.files.fetch_add(local_files, Relaxed);
-    }
 
-    // Final flush
-    if !buffers.output_buf.is_empty() {
-        let _ = writer.write_all(&buffers.output_buf);
+    if !buf.is_empty() {
+        let _ = writer.write_all(&buf);
     }
     let _ = writer.flush();
 
     stats
 }
+
 
 fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<&str>) -> u64 {
     let rd = match fs::read_dir(dir) {
@@ -572,184 +491,111 @@ fn enum_dir(dir: &Path, tx: &Sender<Task>, inflight: &AtomicUsize, skip: Option<
     error_count
 }
 
-/// Optimized CSV row writer using buffer reuse
-fn write_row_csv_optimized(buffers: &mut WorkerBuffers, path: &Path, r: &Row, no_atime: bool) {
+
+// ----- CSV writing -----
+fn write_row_csv(buf: &mut Vec<u8>, path: &Path, r: &Row, no_atime: bool) {
+    buf.reserve(256);
     // INODE as dev-ino
-    buffers.write_u64(r.dev);
-    buffers.output_buf.push(b'-');
-    buffers.write_u64(r.ino);
-    buffers.output_buf.push(b',');
+    push_u64(buf, r.dev);
+    buf.push(b'-');
+    push_u64(buf, r.ino);
+    push_comma(buf);
 
     // ATIME (zeroed if requested)
-    let atime = if no_atime { 0 } else { r.atime };
-    buffers.write_i64(atime);
-    buffers.output_buf.push(b',');
+    if no_atime { push_i64(buf, 0); } else { push_i64(buf, r.atime); }
+    push_comma(buf);   
 
     // MTIME
-    buffers.write_i64(r.mtime);
-    buffers.output_buf.push(b',');
+    push_i64(buf, r.mtime); 
+    push_comma(buf);
 
     // UID, GID, MODE
-    buffers.write_u32(r.uid);
-    buffers.output_buf.push(b',');
-    buffers.write_u32(r.gid);
-    buffers.output_buf.push(b',');
-    buffers.write_u32(r.mode);
-    buffers.output_buf.push(b',');
+    push_u32(buf, r.uid);       
+    push_comma(buf);
+    push_u32(buf, r.gid);   
+    push_comma(buf);
+    push_u32(buf, r.mode);  
+    push_comma(buf);
 
-    // SIZE
-    buffers.write_u64(r.size);
-    buffers.output_buf.push(b',');
-    
-    // DISK
+    // SIZE, DISK
+    push_u64(buf, r.size);  
+    push_comma(buf);
     let disk = r.blocks * 512;
-    buffers.write_u64(disk);
-    buffers.output_buf.push(b',');
+    push_u64(buf, disk); 
+    push_comma(buf);
 
-    // PATH (reuse path buffer for processing)
-    csv_push_path_optimized(&mut buffers.output_buf, &mut buffers.path_buf, &mut buffers.string_buf, path);
-    buffers.output_buf.push(b'\n');
+    csv_push_path_smart_quoted(buf, path);
+    buf.push(b'\n');
 }
 
-/// Optimized binary row writer using buffer reuse
-fn write_row_bin_optimized(buffers: &mut WorkerBuffers, path: &Path, r: &Row, no_atime: bool) {
-    // Get path bytes into our reusable buffer
-    buffers.path_buf.clear();
+// ----- BIN writing -----
+fn write_row_bin(buf: &mut Vec<u8>, path: &Path, r: &Row, no_atime: bool) {
     
     #[cfg(unix)]
-    {
-        buffers.path_buf.extend_from_slice(path.as_os_str().as_bytes());
-    }
-    
-    #[cfg(not(unix))]
-    {
-        buffers.string_buf.clear();
-        buffers.string_buf.push_str(&path.to_string_lossy());
-        buffers.path_buf.extend_from_slice(buffers.string_buf.as_bytes());
-    }
+    let path_bytes: &[u8] = path.as_os_str().as_bytes();
 
-    let path_len = buffers.path_buf.len() as u32;
+    #[cfg(not(unix))]
+    let path_lossy = path.to_string_lossy();     // keep the Cow alive
+    #[cfg(not(unix))]
+    let path_bytes: &[u8] = path_lossy.as_bytes(); // borrow from it safely
+
+    let path_len = path_bytes.len() as u32;
     let atime = if no_atime { 0i64 } else { r.atime };
     let disk = r.blocks * 512;
     
-    // Pre-allocate space for this record
-    let record_size = 4 + buffers.path_buf.len() + 64; // Conservative estimate
-    buffers.output_buf.reserve(record_size);
-    
-    // Write binary data - we can borrow output_buf mutably here since path processing is done
-    buffers.output_buf.extend_from_slice(&path_len.to_le_bytes());
-    buffers.output_buf.extend_from_slice(&buffers.path_buf);
-    buffers.output_buf.extend_from_slice(&r.dev.to_le_bytes());
-    buffers.output_buf.extend_from_slice(&r.ino.to_le_bytes());
-    buffers.output_buf.extend_from_slice(&atime.to_le_bytes());
-    buffers.output_buf.extend_from_slice(&r.mtime.to_le_bytes());
-    buffers.output_buf.extend_from_slice(&r.uid.to_le_bytes());
-    buffers.output_buf.extend_from_slice(&r.gid.to_le_bytes());
-    buffers.output_buf.extend_from_slice(&r.mode.to_le_bytes());
-    buffers.output_buf.extend_from_slice(&r.size.to_le_bytes());
-    buffers.output_buf.extend_from_slice(&disk.to_le_bytes());
-}
-
-/// Optimized path quoting with buffer reuse
-fn csv_push_path_optimized(
-    output: &mut Vec<u8>, 
-    path_buf: &mut Vec<u8>, 
-    string_buf: &mut String,
-    path: &Path
-) {
-    path_buf.clear();
-    string_buf.clear();
-
-    #[cfg(unix)]
-    {
-        path_buf.extend_from_slice(path.as_os_str().as_bytes());
-    }
-    
-    #[cfg(not(unix))]
-    {
-        // Convert to string using our reusable buffer
-        string_buf.push_str(&path.to_string_lossy());
-        path_buf.extend_from_slice(string_buf.as_bytes());
-    }
-
-    // Fast check if quoting is needed (most paths don't need it)
-    let needs_quoting = path_buf.iter().any(|&b| b == b',' || b == b'"' || b == b'\n' || b == b'\r');
-    
-    if !needs_quoting {
-        // Fast path: just copy the bytes
-        output.extend_from_slice(path_buf);
-        return;
-    }
-    
-    // Slow path: need to quote and escape
-    output.push(b'"');
-    for &byte in path_buf.iter() {
-        if byte == b'"' {
-            output.push(b'"');
-            output.push(b'"');
-        } else {
-            output.push(byte);
-        }
-    }
-    output.push(b'"');
+    //buf.reserve(64 + 2 * r.path.as_os_str().len());
+    buf.reserve(80 + path_bytes.len()); // cheap pre-reserve
+    buf.extend_from_slice(&path_len.to_le_bytes());
+    buf.extend_from_slice(path_bytes);
+    buf.extend_from_slice(&r.dev.to_le_bytes());
+    buf.extend_from_slice(&r.ino.to_le_bytes());
+    buf.extend_from_slice(&atime.to_le_bytes());
+    buf.extend_from_slice(&r.mtime.to_le_bytes());
+    buf.extend_from_slice(&r.uid.to_le_bytes());
+    buf.extend_from_slice(&r.gid.to_le_bytes());
+    buf.extend_from_slice(&r.mode.to_le_bytes());
+    buf.extend_from_slice(&r.size.to_le_bytes());
+    buf.extend_from_slice(&disk.to_le_bytes());
 }
 
 // ---- Merge shards (CSV or BIN) ----
 fn merge_shards(
     out_dir: &Path, 
     final_path: &Path, 
-    workers: usize, 
+    threads: usize, 
     out_fmt: OutputFormat,
     sort_csv: bool,
     pid: u32,
-) -> Result<()> {
+) -> std::io::Result<()> {
     let mut out = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&final_path)?);
 
     match out_fmt {
-        OutputFormat::Csv => merge_shards_csv(out_dir, &mut out, workers, sort_csv, pid),
-        OutputFormat::Bin => merge_shards_bin(out_dir, &mut out, workers, pid),
+        OutputFormat::Csv => merge_shards_csv(out_dir, &mut out, threads, sort_csv, pid),
+        OutputFormat::Bin => merge_shards_bin(out_dir, &mut out, threads, pid),
     }?;
 
     out.flush()?;
     Ok(())
 }
 
-fn merge_shards_csv(
-    out_dir: &Path, 
-    out: &mut BufWriter<File>,
-    workers: usize, 
-    sort_csv: bool, 
-    pid: u32
-) -> Result<()> {
+fn merge_shards_csv(out_dir: &Path, out: &mut BufWriter<File>, threads: usize, sort_csv: bool, pid: u32) -> std::io::Result<()> {
     out.write_all(b"INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH\n")?;
     let hostname = get_hostname();
 
     if !sort_csv {
         // Old behavior: stream in shard order
-        for tid in 0..workers {
-            // Find all shard files for this worker thread (may have different thread IDs)
-            let pattern = format!("shard_{}_{}_{}", hostname, pid, tid);
-            let shard_files: Vec<_> = fs::read_dir(out_dir)?
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| {
-                    entry.file_name()
-                        .to_string_lossy()
-                        .starts_with(&pattern)
-                })
-                .collect();
+        for tid in 0..threads {
+            let shard = out_dir.join(format!("shard_{hostname}_{pid}_{tid}.tmp"));
+            if !shard.exists() { continue; }
+            let f = File::open(&shard)?;
+            let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
 
-            for entry in shard_files {
-                let shard_path = entry.path();
-                let f = File::open(&shard_path)?;
-                let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
+            // // Skip shard header line
+            // let mut first_line = Vec::<u8>::with_capacity(128);
+            // reader.read_until(b'\n', &mut first_line)?; // discard header
 
-                // Skip shard header line
-                //let mut first_line = Vec::<u8>::with_capacity(128);
-                //reader.read_until(b'\n', &mut first_line)?; // discard header
-
-                io::copy(&mut reader, out)?;
-                let _ = fs::remove_file(shard_path);
-            }
+            io::copy(&mut reader, out)?;
+            let _ = fs::remove_file(shard);
         }
         return Ok(());
     }
@@ -757,42 +603,31 @@ fn merge_shards_csv(
     // Sorted mode (only used when --skip-atime and CSV)
     let mut lines: Vec<String> = Vec::new();
 
-    for tid in 0..workers {
-        // Find all shard files for this worker thread
-        let pattern = format!("shard_{}_{}_{}", hostname, pid, tid);
-        let shard_files: Vec<_> = fs::read_dir(out_dir)?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry.file_name()
-                    .to_string_lossy()
-                    .starts_with(&pattern)
-            })
-            .collect();
+    for tid in 0..threads {
+        let shard = out_dir.join(format!("shard_{hostname}_{pid}_{tid}.tmp"));
+        if !shard.exists() { continue; }
 
-        for entry in shard_files {
-            let shard_path = entry.path();
-            let f = File::open(&shard_path)?;
-            let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
+        let f = File::open(&shard)?;
+        let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
 
-            // Skip shard header
-            //let mut throwaway = Vec::<u8>::with_capacity(128);
-            //reader.read_until(b'\n', &mut throwaway)?;
+        // // Skip shard header
+        // let mut throwaway = Vec::<u8>::with_capacity(128);
+        // reader.read_until(b'\n', &mut throwaway)?;
 
-            // Read remainder into buffer and split into lines
-            let mut buf = String::new();
-            reader.read_to_string(&mut buf)?;
-            for line in buf.split_inclusive('\n') {
-                // retain only non-empty rows
-                if line.trim().is_empty() { continue; }
-                // store without trailing newline; we'll add our own
-                let ln = line.strip_suffix('\n').unwrap_or(line).to_string();
-                if !ln.is_empty() {
-                    lines.push(ln);
-                }
+        // Read remainder into buffer and split into lines
+        let mut buf = String::new();
+        reader.read_to_string(&mut buf)?;
+        for line in buf.split_inclusive('\n') {
+            // retain only non-empty rows
+            if line.trim().is_empty() { continue; }
+            // store without trailing newline; we'll add our own
+            let ln = line.strip_suffix('\n').unwrap_or(line).to_string();
+            if !ln.is_empty() {
+                lines.push(ln);
             }
-
-            let _ = fs::remove_file(shard_path);
         }
+
+        let _ = fs::remove_file(shard);
     }
 
     // Full-line lexicographic sort (deterministic; ATIME is zeroed in the rows)
@@ -810,29 +645,17 @@ fn merge_shards_csv(
 fn merge_shards_bin(
     out_dir: &Path, 
     out: &mut BufWriter<File>, 
-    workers: usize,
+    threads: usize, 
     pid: u32,
-) -> Result<()> {
+) -> std::io::Result<()> {
     let hostname = get_hostname();
-    for tid in 0..workers {
-        // Find all shard files for this worker thread
-        let pattern = format!("shard_{}_{}_{}", hostname, pid, tid);
-        let shard_files: Vec<_> = fs::read_dir(out_dir)?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry.file_name()
-                    .to_string_lossy()
-                    .starts_with(&pattern)
-            })
-            .collect();
-
-        for entry in shard_files {
-            let shard_path = entry.path();
-            let f = File::open(&shard_path)?;
-            let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
-            io::copy(&mut reader, out)?;
-            let _ = fs::remove_file(shard_path);
-        }
+    for tid in 0..threads {
+        let shard = out_dir.join(format!("shard_{hostname}_{pid}_{tid}.tmp"));
+        if !shard.exists() { continue; }
+        let f = File::open(&shard)?;
+        let mut reader = BufReader::with_capacity(READ_BUF_SIZE, f);
+        io::copy(&mut reader, out)?;
+        let _ = fs::remove_file(shard);
     }
 
     Ok(())
@@ -965,48 +788,6 @@ mod tests {
         assert_eq!(lines.remove(0), "INODE,ATIME,MTIME,UID,GID,MODE,SIZE,DISK,PATH");
         assert_eq!(lines, vec!["a", "b"]);
         Ok(())
-    }
-
-    #[test]
-    fn test_buffer_reuse() {
-        let mut buffers = WorkerBuffers::new();
-        
-        // Fill buffers
-        buffers.output_buf.extend_from_slice(b"test data");
-        buffers.path_buf.extend_from_slice(b"/test/path");
-        
-        // Verify capacity before reset
-        let output_cap = buffers.output_buf.capacity();
-        let path_cap = buffers.path_buf.capacity();
-        
-        // Reset should clear but preserve capacity
-        buffers.reset();
-        
-        assert_eq!(buffers.output_buf.len(), 0);
-        assert_eq!(buffers.path_buf.len(), 0);
-        assert_eq!(buffers.output_buf.capacity(), output_cap);
-        assert_eq!(buffers.path_buf.capacity(), path_cap);
-    }
-    
-    #[test]
-    fn test_number_formatting() {
-        let mut buffers = WorkerBuffers::new();
-        
-        // Test the write functions instead
-        buffers.write_u64(12345);
-        let result = String::from_utf8(buffers.output_buf.clone()).unwrap();
-        assert!(result.contains("12345"));
-        
-        buffers.reset();
-        buffers.write_i64(-6789);
-        let result2 = String::from_utf8(buffers.output_buf.clone()).unwrap();
-        assert!(result2.contains("-6789"));
-        
-        // Test single digit optimization
-        buffers.reset();
-        buffers.write_u32(7);
-        let result3 = String::from_utf8(buffers.output_buf.clone()).unwrap();
-        assert_eq!(result3, "7");
     }
 }
 
